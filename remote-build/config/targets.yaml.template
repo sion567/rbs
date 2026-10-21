@@ -1,0 +1,18 @@
+# 执行目标（首次启动默认只有 local，此文件为参考模板）
+targets:
+  build-server-01:
+    name: build-server-01
+    target_type:
+      ssh:
+        host: 192.168.1.100
+        port: 22
+        user: builder
+        auth:
+          key:
+            path: C:\Users\dev\.ssh\id_ed25519
+    work_root: /opt/builds
+    env: {}
+
+  local:
+    name: local
+    target_type: local

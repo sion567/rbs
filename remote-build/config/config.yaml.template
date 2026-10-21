@@ -1,0 +1,10 @@
+# 全局配置（首次启动自动生成，此文件为参考模板）
+default_timeout: 600
+max_concurrent_jobs: 3
+log_retention_days: 30
+workspace_root: ~/.remote-build/projects
+auto_update_tools: false
+theme: dark
+putty:
+  use_builtin: true
+  custom_path: null    # 指定自定义 PuTTY 目录，如 "C:/MyTools/PuTTY"

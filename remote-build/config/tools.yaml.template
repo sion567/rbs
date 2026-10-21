@@ -1,0 +1,19 @@
+# 工具链（首次启动探测自动生成，此文件为参考模板）
+tools:
+  java:
+    name: java
+    tool_type: system
+    command: java
+    version: "17.0.2"
+    version_check: "java -version"
+    detected_from: JAVA_HOME
+    env:
+      JAVA_HOME: "C:/Program Files/Java/jdk-17.0.2"
+
+  putty:
+    # putty 条目由探测自动生成，仅供 UI 展示与版本核对；
+    # PuttyTransport 实际路径以 detect_putty_tools() 为准（见设计文档 §3.4 / §5.3）
+    name: putty
+    tool_type: custom
+    command: ~/.remote-build/tools/putty/pscp.exe
+    detected_from: builtin
