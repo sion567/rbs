@@ -37,7 +37,7 @@ prod 目标：192.168.38.198（密码在凭据管理器，键名 prod）。
 - 执行引擎：步骤链、exec / wait / **upload（多行映射，微服务多 jar）** / **pack（内置 zip 打包，§5.8）** /
   k8s-apply（P0 退化为本地 kubectl）、超时 / 重试 / 取消（broadcast + kill）、
   `workspace/.env` 变量传递约定
-- 🎯 目标管理：SSH / Kubernetes / 本地目标增删改（targets.yaml）、SSH 连接测试；
+- 🎯 目标管理：SSH / Kubernetes / 本地目标增删改（随项目走，存 project.yaml）、SSH 连接测试；
   SSH 密码存 Windows Credential Manager（不落 YAML）；host key 指纹固定（TOFU，
   首次测试失败输出指纹 → 填入 host_key 字段即信任）；upload/exec 经 pscp/plink 使用
 - 传输层：本地 `cmd /C` + PuTTY（plink / pscp，禁止 `-pw`，cd 路径单引号转义）

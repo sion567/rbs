@@ -97,7 +97,6 @@ pub struct MainState {
     pub workspace_root: std::path::PathBuf,
     pub global: crate::models::GlobalConfig,
     pub tools: std::collections::HashMap<String, crate::models::Tool>,
-    pub targets: std::collections::HashMap<String, crate::models::Target>,
     pub projects: Vec<ProjectEntry>,
     pub selected_project: Option<usize>,
     pub selected_job: Option<usize>,
@@ -135,7 +134,6 @@ impl MainState {
             workspace_root: crate::config::projects_dir(),
             global: Default::default(),
             tools: Default::default(),
-            targets: Default::default(),
             projects: Vec::new(),
             selected_project: None,
             selected_job: None,
@@ -164,19 +162,12 @@ impl MainState {
             std::path::PathBuf::from(&self.global.workspace_root)
         };
         self.workspace_root = root;
-        // 配置解析失败不再静默：直接提示，避免"工具/目标莫名消失"
+        // 配置解析失败不再静默：直接提示，避免"工具莫名消失"
         let mut warnings = Vec::new();
         self.tools = match crate::config::load_tools() {
             Ok(t) => t.tools,
             Err(e) => {
                 warnings.push(format!("tools.yaml 解析失败: {e:#}"));
-                Default::default()
-            }
-        };
-        self.targets = match crate::config::load_targets() {
-            Ok(t) => t.targets,
-            Err(e) => {
-                warnings.push(format!("targets.yaml 解析失败: {e:#}"));
                 Default::default()
             }
         };
@@ -270,7 +261,8 @@ impl MainState {
 
         // ── 控制台（底部）────────────────────────────────────────────
         let running = self.run_active();
-        ui::console::show(&mut self.console, ctx, running);
+        let console_dark = !matches!(self.global.theme, crate::models::Theme::Light);
+        ui::console::show(&mut self.console, ctx, running, console_dark);
 
         // ── 左侧项目树 ──────────────────────────────────────────────
         egui::SidePanel::left("project_tree")
@@ -346,8 +338,7 @@ impl MainState {
         let project = self.projects[pi].project.clone();
         let job = self.projects[pi].jobs[ji].job.clone();
         // §3.5：项目级目标覆盖全局 targets.yaml（键相同项目优先），并回填凭据键
-        let effective = crate::config::effective_targets(&project, &self.targets);
-        let target = job.target.as_ref().and_then(|n| effective.get(n).cloned());
+        let effective = crate::config::effective_targets(&project);
         let mut label = format!("{}/{}", project.name, job.name);
         if only_step.is_some() {
             label.push_str(&format!(" · 仅 Step {}", from_step + 1));
@@ -364,7 +355,6 @@ impl MainState {
         let input = crate::engine::RunInput {
             project: project.clone(),
             job,
-            target,
             tools: self.tools.clone(),
             all_targets: effective,
             from_step,
@@ -412,7 +402,7 @@ impl MainState {
 
         self.console.push_line(
             format!("==== 启动作业 {label} ===="),
-            crate::ui::console::palette::INFO,
+            crate::ui::console::Role::Info,
         );
         self.status_msg = Some(format!("运行中: {label}"));
         self.run = Some(RunHandle { cancel_tx, events: std_rx, join, finished: None });

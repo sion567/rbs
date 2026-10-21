@@ -26,7 +26,6 @@ pub fn app_root() -> PathBuf {
 
 pub fn config_path() -> PathBuf { app_root().join("config.yaml") }
 pub fn tools_path() -> PathBuf { app_root().join("tools.yaml") }
-pub fn targets_path() -> PathBuf { app_root().join("targets.yaml") }
 pub fn projects_dir() -> PathBuf { app_root().join("projects") }
 pub fn logs_dir() -> PathBuf { app_root().join("logs") }
 
@@ -75,23 +74,12 @@ pub fn save_tools(tools: &ToolsFile) -> Result<()> {
     crate::storage::files::save_yaml(&tools_path(), tools)
 }
 
-pub fn load_targets() -> Result<TargetsFile> {
-    let p = targets_path();
-    if !p.exists() {
-        return Ok(TargetsFile::default());
-    }
-    crate::storage::files::load_yaml(&p)
-}
-
-pub fn save_targets(t: &TargetsFile) -> Result<()> {
-    crate::storage::files::save_yaml(&targets_path(), t)
-}
-
 // ---------------------------------------------------------------------------
 // 首次启动生成（§7.1 / §17.3）
 // ---------------------------------------------------------------------------
 
-/// 根据探测结果生成 tools.yaml / targets.yaml / config.yaml / 示例项目
+/// 根据探测结果生成 tools.yaml / config.yaml / 示例项目
+/// （v0.4 调整：目标随项目走，不再生成全局 targets.yaml）
 pub fn first_run_generate(report: &DetectionReport) -> Result<()> {
     ensure_layout().context("创建目录结构失败")?;
 
@@ -133,13 +121,6 @@ pub fn first_run_generate(report: &DetectionReport) -> Result<()> {
         );
     }
     save_tools(&tools)?;
-
-    // targets.yaml：默认只有 local
-    let targets = TargetsFile {
-        targets: [local_target()].into_iter().map(|t| (t.name.clone(), t)).collect(),
-    };
-    save_targets(&targets)?;
-
     // config.yaml
     if !config_path().exists() {
         save_global(&default_global())?;
@@ -160,20 +141,11 @@ pub fn local_target() -> Target {
     }
 }
 
-/// 项目级目标 + 全局 targets.yaml 合并（键相同**项目覆盖全局**）。
-/// 同时回填 Target.name = 键名、凭据键（{项目}/{目标} 或 global/{目标}）——
+/// 项目级目标的规范化（§3.5）：回填 Target.name = 键名、凭据键 = {项目}/{目标}——
 /// 不同项目的同名目标（如各自的 prod）密码互不干扰（§14）。
-pub fn effective_targets(
-    project: &Project,
-    global: &HashMap<String, Target>,
-) -> HashMap<String, Target> {
+/// v0.4 调整：目标仅定义在 project.yaml，不再有全局 targets.yaml。
+pub fn effective_targets(project: &Project) -> HashMap<String, Target> {
     let mut out = HashMap::new();
-    for (k, t) in global {
-        let mut t = t.clone();
-        t.name = k.clone();
-        t.cred_key = Some(format!("global/{k}"));
-        out.insert(k.clone(), t);
-    }
     for (k, t) in &project.targets {
         let mut t = t.clone();
         t.name = k.clone();

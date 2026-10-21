@@ -455,11 +455,11 @@ tools:
 
 ### 3.5 Target
 
-> **项目级目标（v0.4 实施调整）**：目标定义可直接写在 project.yaml 的 `targets:` 表
-> （键 = 目标名），**与全局 targets.yaml 合并时项目同名覆盖全局**——
+> **项目级目标（v0.4 最终形态）**：目标定义**只**写在 project.yaml 的 `targets:` 表
+> （键 = 目标名）。不再有全局 targets.yaml——
 > 不同项目的 `prod` 各指各的服务器。SSH 密码按 `{项目}/{目标}` 为键存入
-> Windows Credential Manager（全局目标为 `global/{目标}`），互不干扰。
-> 🎯 目标管理窗口提供「全局 / 本项目」双作用域编辑与连接测试。
+> Windows Credential Manager（键 = `{项目}/{目标}`），互不干扰。
+> 🎯 目标管理窗口提供本项目的目标增删改与连接测试。
 
 ```rust
 #[derive(Debug, Clone, Serialize, Deserialize)]

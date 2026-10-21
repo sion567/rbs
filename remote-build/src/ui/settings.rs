@@ -786,6 +786,6 @@ fn global_section(
         });
     ui.weak(
         "提示：config.yaml 中 putty.custom_path 可指定自定义 PuTTY 目录；\
-         tools.yaml 的 putty 条目由探测自动生成，仅供展示。控制台固定深色底（日志配色按深底调校）。",
+         tools.yaml 的 putty 条目由探测自动生成，仅供展示。控制台配色跟随主题（深浅两套色板各自调校）。",
     );
 }

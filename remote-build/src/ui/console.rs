@@ -4,35 +4,62 @@ use crate::models::{JobStatus, LogEvent};
 use eframe::egui;
 use egui::{Color32, RichText};
 
+/// 日志行的语义角色：渲染时按当前主题映射为具体颜色（切换主题全量重新着色）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    StepStart,
+    Stdout,
+    Stderr,
+    Ok,
+    Fail,
+    Error,
+    Info,
+    Cancelled,
+}
+
+/// 控制台配色：两套色板各自为深底/浅底调校——
+/// 深底 = One Dark；浅底 ≈ VS Code Light+ 终端色。色相按语义分离，一眼可辨类型。
+pub mod palette {
+    use super::Role;
+    use egui::Color32;
+
+    pub fn color_for(role: Role, dark: bool) -> Color32 {
+        use Role::*;
+        match (role, dark) {
+            // 步骤标题：青
+            (StepStart, true) => Color32::from_rgb(86, 182, 194),
+            (StepStart, false) => Color32::from_rgb(5, 152, 188),
+            // 普通输出：柔灰 / 深灰
+            (Stdout, true) => Color32::from_rgb(171, 178, 191),
+            (Stdout, false) => Color32::from_rgb(59, 59, 59),
+            // stderr：黄
+            (Stderr, true) => Color32::from_rgb(229, 192, 123),
+            (Stderr, false) => Color32::from_rgb(163, 134, 27),
+            // 成功：绿
+            (Ok, true) => Color32::from_rgb(152, 195, 121),
+            (Ok, false) => Color32::from_rgb(13, 188, 121),
+            // 失败：红
+            (Fail, true) => Color32::from_rgb(224, 108, 117),
+            (Fail, false) => Color32::from_rgb(205, 49, 49),
+            // 引擎级错误：亮红 / 深红
+            (Error, true) => Color32::from_rgb(241, 76, 76),
+            (Error, false) => Color32::from_rgb(139, 26, 26),
+            // 系统提示：蓝
+            (Info, true) => Color32::from_rgb(97, 175, 239),
+            (Info, false) => Color32::from_rgb(4, 81, 165),
+            // 取消：中性灰黄 / 中灰
+            (Cancelled, true) => Color32::from_rgb(200, 200, 150),
+            (Cancelled, false) => Color32::from_rgb(119, 119, 119),
+        }
+    }
+}
+
+const MAX_LINES: usize = 5000;
+
 #[derive(Debug, Clone)]
 pub struct ConsoleLine {
     pub text: String,
-    pub color: Color32,
-}
-
-/// 控制台行数上限，防止长任务撑爆内存
-const MAX_LINES: usize = 5000;
-
-/// 控制台配色（One Dark 色板，为深色背景调校；色相按语义分离，一眼可辨类型）
-pub mod palette {
-    use egui::Color32;
-
-    /// 步骤标题（── Step N ──）：青
-    pub const STEP_START: Color32 = Color32::from_rgb(86, 182, 194);
-    /// 普通输出：柔灰（大批量内容不刺眼，与背景对比约 7.5:1）
-    pub const STDOUT: Color32 = Color32::from_rgb(171, 178, 191);
-    /// stderr 输出：黄
-    pub const STDERR: Color32 = Color32::from_rgb(229, 192, 123);
-    /// 成功：绿
-    pub const OK: Color32 = Color32::from_rgb(152, 195, 121);
-    /// 失败：红
-    pub const FAIL: Color32 = Color32::from_rgb(224, 108, 117);
-    /// 引擎级错误：亮红（比步骤失败更醒目）
-    pub const ERROR: Color32 = Color32::from_rgb(241, 76, 76);
-    /// 系统提示（启动作业等）：蓝
-    pub const INFO: Color32 = Color32::from_rgb(97, 175, 239);
-    /// 取消：中性灰黄
-    pub const CANCELLED: Color32 = Color32::from_rgb(200, 200, 150);
+    pub role: Role,
 }
 
 pub struct ConsoleState {
@@ -53,49 +80,49 @@ impl ConsoleState {
             LogEvent::StepStart { step_index, name } => {
                 self.push(
                     format!("── Step {} ── {name}", step_index + 1),
-                    palette::STEP_START,
+                    Role::StepStart,
                 );
             }
             LogEvent::Stdout { line, .. } => {
-                self.push(line.clone(), palette::STDOUT);
+                self.push(line.clone(), Role::Stdout);
             }
             LogEvent::Stderr { line, .. } => {
-                self.push(line.clone(), palette::STDERR);
+                self.push(line.clone(), Role::Stderr);
             }
             LogEvent::StepEnd { step_index, exit_code, duration_ms } => {
-                let (text, color) = if *exit_code == 0 {
+                let (text, role) = if *exit_code == 0 {
                     (
                         format!("✅ Step {} 完成 ({duration_ms}ms)", step_index + 1),
-                        palette::OK,
+                        Role::Ok,
                     )
                 } else {
                     (
                         format!("❌ Step {} 失败，退出码 {exit_code} ({duration_ms}ms)", step_index + 1),
-                        palette::FAIL,
+                        Role::Fail,
                     )
                 };
-                self.push(text, color);
+                self.push(text, role);
             }
             LogEvent::JobEnd { status, total_duration_ms, .. } => {
-                let color = match status {
-                    JobStatus::Success => palette::OK,
-                    JobStatus::Cancelled => palette::CANCELLED,
-                    JobStatus::Timeout => palette::ERROR,
-                    _ => palette::FAIL,
+                let role = match status {
+                    JobStatus::Success => Role::Ok,
+                    JobStatus::Cancelled => Role::Cancelled,
+                    JobStatus::Timeout => Role::Error,
+                    _ => Role::Fail,
                 };
                 self.push(
                     format!("==== Job 结束: {} ({total_duration_ms}ms) ====", job_label(status)),
-                    color,
+                    role,
                 );
             }
             LogEvent::Error { message } => {
-                self.push(format!("⚠ {message}"), palette::ERROR);
+                self.push(format!("⚠ {message}"), Role::Error);
             }
         }
     }
 
-    fn push(&mut self, text: String, color: Color32) {
-        self.lines.push(ConsoleLine { text, color });
+    fn push(&mut self, text: String, role: Role) {
+        self.lines.push(ConsoleLine { text, role });
         if self.lines.len() > MAX_LINES {
             let drop = self.lines.len() - MAX_LINES;
             self.lines.drain(0..drop);
@@ -103,8 +130,8 @@ impl ConsoleState {
     }
 
     /// 非引擎事件的普通提示行
-    pub fn push_line(&mut self, text: impl Into<String>, color: Color32) {
-        self.push(text.into(), color);
+    pub fn push_line(&mut self, text: impl Into<String>, role: Role) {
+        self.push(text.into(), role);
     }
 
     pub fn all_text(&self) -> String {
@@ -122,12 +149,19 @@ fn job_label(status: &JobStatus) -> String {
     }
 }
 
-pub fn show(console: &mut ConsoleState, ctx: &egui::Context, running: bool) {
-    // 控制台固定深色底：日志配色按深底调校（One Dark），明亮主题下也保持可读
+/// dark = 当前主题是否为暗色（由调用方按全局主题传入）
+pub fn show(console: &mut ConsoleState, ctx: &egui::Context, running: bool, dark: bool) {
+    // 控制台背景跟随主题，但两种主题下都保持"终端感"：
+    // 深色主题深底、明亮主题浅底，日志配色各自调校
+    let bg = if dark {
+        Color32::from_rgb(27, 27, 27)
+    } else {
+        Color32::from_rgb(250, 250, 250)
+    };
     egui::TopBottomPanel::bottom("console_panel")
         .frame(
             egui::Frame::default()
-                .fill(Color32::from_rgb(27, 27, 27))
+                .fill(bg)
                 .inner_margin(egui::Margin::same(6.0)),
         )
         .resizable(true)
@@ -162,9 +196,10 @@ pub fn show(console: &mut ConsoleState, ctx: &egui::Context, running: bool) {
                     // 紧凑行距；左对齐（不能用 add_sized——它会把文字在整行里居中）
                     ui.spacing_mut().item_spacing.y = 2.0;
                     for line in &console.lines {
+                        let color = palette::color_for(line.role, dark);
                         ui.add(
                             egui::Label::new(
-                                RichText::new(&line.text).monospace().color(line.color),
+                                RichText::new(&line.text).monospace().color(color),
                             )
                             .wrap(true),
                         );

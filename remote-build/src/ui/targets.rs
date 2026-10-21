@@ -1,15 +1,11 @@
-//! 🎯 目标管理：目标定义的双作用域编辑（§3.5）+ SSH 连接测试。
+//! 🎯 目标管理：本项目目标定义的增删改（project.yaml 的 `targets:` 表）+ SSH 连接测试。
 //!
-//! - 🌐 全局（targets.yaml）：共享目标池（如 local、公共跳板）
-//! - 📦 本项目（project.yaml 的 targets 表）：项目自己的目标，**键相同覆盖全局**——
-//!   不同项目的 prod 可以是不同服务器，密码也按 `{项目}/{目标}` 分键存储（§14）
-//!
-//! 流程的「目标」下拉读取两者的合并结果（项目优先）。
+//! v0.4 调整：目标**跟项目走**（§3.5）——不再有全局 targets.yaml；
+//! 不同项目的 prod 可以是不同服务器。SSH 密码按 `{项目}/{目标}` 为键存入
+//! Windows Credential Manager（§14），不落 YAML。
 
 use crate::app::MainState;
-use crate::models::{AuthMethod, Target, TargetType, TargetsFile};
-use crate::ui::settings::{tab_row, ToolScope};
-use anyhow::anyhow;
+use crate::models::{AuthMethod, Target, TargetType};
 use eframe::egui;
 use egui::Color32;
 
@@ -19,11 +15,7 @@ const AUTHS: [&str; 4] = ["key（私钥文件）", "password（密码）", "agen
 #[derive(Default)]
 pub struct TargetEditorState {
     pub open: bool,
-    /// 作用域：全局 targets.yaml / 本项目 project.yaml
-    pub scope: ToolScope,
-    /// Project 作用域绑定的项目名（切换项目时重置编辑状态）
-    pub bound_project: Option<String>,
-    /// 当前选中目标（作用域内的键）
+    /// 当前选中目标（project.yaml targets 表的键）
     pub selected: Option<String>,
     /// 名称输入缓冲（重命名用）
     pub name_buf: String,
@@ -48,51 +40,29 @@ pub struct TargetEditorState {
     pub unsaved: bool,
 }
 
-fn reset_editor(main: &mut MainState) {
-    main.target_editor.selected = None;
-    main.target_editor.name_buf.clear();
-    main.target_editor.password_buf.clear();
-    main.target_editor.test_result = None;
-    main.target_editor.unsaved = false;
-}
-
-/// 当前作用域对应的工具/目标表（可变）
+/// 当前项目的目标表（可变）；未选项目返回 None
 fn scope_map_mut(
     main: &mut MainState,
 ) -> Option<&mut std::collections::HashMap<String, Target>> {
-    match main.target_editor.scope {
-        ToolScope::Global => Some(&mut main.targets),
-        ToolScope::Project => {
-            let pi = main.selected_project?;
-            Some(&mut main.projects[pi].project.targets)
-        }
-    }
+    let pi = main.selected_project?;
+    Some(&mut main.projects[pi].project.targets)
 }
 
-/// 当前作用域对应的工具/目标表（只读）
+/// 当前项目的目标表（只读）
 fn scope_map_ref(main: &MainState) -> Option<&std::collections::HashMap<String, Target>> {
-    match main.target_editor.scope {
-        ToolScope::Global => Some(&main.targets),
-        ToolScope::Project => main
-            .selected_project
-            .and_then(|pi| main.projects.get(pi))
-            .map(|p| &p.project.targets),
-    }
+    main.selected_project
+        .and_then(|pi| main.projects.get(pi))
+        .map(|p| &p.project.targets)
 }
 
-/// 当前作用域下的凭据键：{项目}/{目标} 或 global/{目标}（§14）
+/// 凭据键：{项目名}/{目标名}（§14，不同项目的同名目标密码互不干扰）
 fn cred_key_for(main: &MainState, name: &str) -> String {
-    match main.target_editor.scope {
-        ToolScope::Global => format!("global/{name}"),
-        ToolScope::Project => {
-            let pname = main
-                .selected_project
-                .and_then(|pi| main.projects.get(pi))
-                .map(|p| p.project.name.clone())
-                .unwrap_or_default();
-            format!("{pname}/{name}")
-        }
-    }
+    let pname = main
+        .selected_project
+        .and_then(|pi| main.projects.get(pi))
+        .map(|p| p.project.name.clone())
+        .unwrap_or_default();
+    format!("{pname}/{name}")
 }
 
 pub fn show(ctx: &egui::Context, main: &mut MainState) {
@@ -114,17 +84,7 @@ pub fn show(ctx: &egui::Context, main: &mut MainState) {
         }
     }
 
-    // Project 作用域：切换了所选项目则重置编辑状态
-    if main.target_editor.scope == ToolScope::Project {
-        let current = main
-            .selected_project
-            .and_then(|pi| main.projects.get(pi))
-            .map(|p| p.project.name.clone());
-        if main.target_editor.bound_project != current {
-            main.target_editor.bound_project = current;
-            reset_editor(main);
-        }
-    }
+    let has_project = main.selected_project.is_some();
 
     let mut open = main.target_editor.open;
     egui::Window::new("🎯 目标管理")
@@ -132,35 +92,24 @@ pub fn show(ctx: &egui::Context, main: &mut MainState) {
         .default_width(720.0)
         .default_height(560.0)
         .show(ctx, |ui| {
-            ui.heading("执行目标");
-            // ── 作用域 tab：全局 / 本项目 ──
-            let has_project = main.selected_project.is_some();
-            let scope_idx = match main.target_editor.scope {
-                ToolScope::Global => 0,
-                ToolScope::Project => 1,
-            };
-            let scope_tabs = vec![
-                "🌐 全局 (targets.yaml)".to_string(),
-                "📦 本项目 (project.yaml)".to_string(),
-            ];
-            if let Some(i) = tab_row(ui, &scope_tabs, scope_idx, &[true, has_project]) {
-                let new_scope = if i == 0 { ToolScope::Global } else { ToolScope::Project };
-                if new_scope != main.target_editor.scope {
-                    main.target_editor.scope = new_scope;
-                    reset_editor(main);
-                }
-            }
-            ui.weak(match main.target_editor.scope {
-                ToolScope::Global => {
-                    "共享目标池（如 local、公共机器）；项目里同名目标会覆盖这里的选择。"
-                }
-                ToolScope::Project => {
-                    "本项目专属目标：不同项目的 prod 可以是不同服务器；\
-                     键相同覆盖全局。保存写入当前项目的 project.yaml。"
-                }
-            });
+            ui.heading("执行目标（随项目走）");
+            ui.colored_label(
+                Color32::from_rgb(230, 180, 80),
+                "⚠ 本窗口编辑的是内存副本：如果你手动修改过 project.yaml，\
+                 请先点工具栏 ⟳ 重新加载再打开本窗口，否则「保存」会用旧内容覆盖你的手改。",
+            );
+            ui.weak(
+                "目标 = 命令在哪台机器执行：SSH（远端 Linux）、Kubernetes（本地 kubectl + kubeconfig）\
+                 或本地。定义保存在**当前项目**的 project.yaml 里——不同项目的 prod 可以是不同服务器；\
+                 流程的「目标」下拉读取本项目这份配置。",
+            );
             ui.add_space(4.0);
-            target_list_and_form(ui, main);
+
+            if has_project {
+                target_list_and_form(ui, main);
+            } else {
+                ui.weak("请先在左侧选择一个项目。");
+            }
         });
     main.target_editor.open = open;
 
@@ -208,7 +157,6 @@ fn target_list_and_form(ui: &mut egui::Ui, main: &mut MainState) {
 
     ui.add_space(6.0);
     ui.horizontal(|ui| {
-        let scope = main.target_editor.scope;
         if ui.button("＋ 添加").clicked() {
             let mut n = 1;
             let mut name = format!("new-target-{n}");
@@ -250,25 +198,16 @@ fn target_list_and_form(ui: &mut egui::Ui, main: &mut MainState) {
         if ui.button("🔌 连接测试").clicked() {
             start_test(main);
         }
-        let save_label = match scope {
-            ToolScope::Global => "💾 保存 targets.yaml",
-            ToolScope::Project => "💾 保存 project.yaml",
-        };
-        if ui.button(save_label).clicked() {
-            let result = match scope {
-                ToolScope::Global => crate::config::save_targets(&TargetsFile {
-                    targets: main.targets.clone(),
-                }),
-                ToolScope::Project => match main.selected_project {
-                    Some(pi) => {
-                        let entry = &main.projects[pi];
-                        crate::storage::files::save_yaml(
-                            &entry.dir.join("project.yaml"),
-                            &entry.project,
-                        )
-                    }
-                    None => Err(anyhow!("项目作用域需要先在左侧选择项目")),
-                },
+        if ui.button("💾 保存 project.yaml").clicked() {
+            let result = match main.selected_project {
+                Some(pi) => {
+                    let entry = &main.projects[pi];
+                    crate::storage::files::save_yaml(
+                        &entry.dir.join("project.yaml"),
+                        &entry.project,
+                    )
+                }
+                None => Err(anyhow::anyhow!("需要先在左侧选择项目")),
             };
             match result {
                 Ok(()) => {
@@ -307,10 +246,11 @@ fn edit_form(ui: &mut egui::Ui, main: &mut MainState) {
         return;
     }
 
-    // 重命名放在取 map 可变借用之后会失效，这里先收集、表单结束后统一应用
-    let mut rename_to: Option<String> = None;
     // 凭据键提前计算（grid 内的密码保存要用，而 target 的可变借用会持续整个 grid）
     let cred_key = cred_key_for(main, &selected);
+
+    // 重命名放在取 map 可变借用之后会失效，这里先收集、表单结束后统一应用
+    let mut rename_to: Option<String> = None;
 
     egui::Grid::new("target_form_grid")
         .num_columns(2)
@@ -336,13 +276,10 @@ fn edit_form(ui: &mut egui::Ui, main: &mut MainState) {
 
             // 按作用域取目标的可变借用：match 内联以保持字段级借用，
             // 避免辅助函数把整个 &mut MainState 的生命周期带进来
-            let target = match main.target_editor.scope {
-                ToolScope::Global => main.targets.get_mut(&selected),
-                ToolScope::Project => main
-                    .selected_project
-                    .and_then(|pi| main.projects.get_mut(pi))
-                    .and_then(|p| p.project.targets.get_mut(&selected)),
-            };
+            let target = main
+                .selected_project
+                .and_then(|pi| main.projects.get_mut(pi))
+                .and_then(|p| p.project.targets.get_mut(&selected));
             let Some(target) = target else {
                 return;
             };
@@ -368,9 +305,8 @@ fn edit_form(ui: &mut egui::Ui, main: &mut MainState) {
             }
             ui.end_row();
 
-            // 按类型渲染字段（对作用域表中该目标就地编辑）
             match &mut target.target_type {
-                TargetType::Ssh { host, port, user, auth, host_key } => {
+                TargetType::Ssh { host, port, user, auth, .. } => {
                     ui.label("主机:");
                     if text_row(ui, host, 220.0) {
                         main.target_editor.unsaved = true;
@@ -526,14 +462,12 @@ fn edit_form(ui: &mut egui::Ui, main: &mut MainState) {
             target.name = new.clone();
             map.insert(new.clone(), target);
         }
-        // 项目级目标重命名后同步凭据键
-        if main.target_editor.scope == ToolScope::Project {
-            let old_key = cred_key_for(main, &selected);
-            let new_key = cred_key_for(main, &new);
-            if let Some(pwd) = crate::secrets::get_password(&old_key) {
-                let _ = crate::secrets::set_password(&new_key, &pwd);
-                crate::secrets::delete_password(&old_key);
-            }
+        // 重命名后同步凭据键
+        let old_key = cred_key_for(main, &selected);
+        let new_key = cred_key_for(main, &new);
+        if let Some(pwd) = crate::secrets::get_password(&old_key) {
+            let _ = crate::secrets::set_password(&new_key, &pwd);
+            crate::secrets::delete_password(&old_key);
         }
         main.target_editor.selected = Some(new);
         main.target_editor.unsaved = true;
@@ -657,7 +591,7 @@ fn load_buffers(main: &mut MainState, name: &str) {
 }
 
 /// 后台线程做 SSH 连接测试（复用 putty::test_connection，5 秒超时）；
-/// 按当前作用域回填凭据键，保证密码取自正确的条目
+/// 回填凭据键，保证密码取自本项目的条目
 fn start_test(main: &mut MainState) {
     let Some(name) = main.target_editor.selected.clone() else {
         return;

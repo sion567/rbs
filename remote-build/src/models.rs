@@ -151,6 +151,10 @@ pub struct Step {
     pub condition: Option<String>,
     /// step_type=k8s-apply 时有效（P1.5 生效）
     pub k8s_watch: Option<Vec<K8sWatchTarget>>,
+    /// 步骤级目标（§3.3）：覆盖流程级默认目标——混合流程的关键。
+    /// 例：下载/编译用 local，上传/发布用 prod。None = 跟随流程的 job.target。
+    #[serde(default)]
+    pub target: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -498,12 +502,6 @@ impl<'de> Deserialize<'de> for AuthMethod {
     }
 }
 
-/// targets.yaml 的文件根结构
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct TargetsFile {
-    pub targets: HashMap<String, Target>,
-}
-
 // ---------------------------------------------------------------------------
 // 全局配置（§3.6）
 // ---------------------------------------------------------------------------
@@ -767,8 +765,11 @@ steps:
 
     #[test]
     fn target_yaml_all_variants() {
-        // §3.5 示例：ssh / kubernetes / local 三种形态
+        // §3.5 示例（v0.4 调整：目标定义内嵌 project.yaml，不再有全局 targets.yaml）：
+        // project.yaml 的 targets 表 —— ssh / kubernetes / local 三种形态
         let yaml = r#"
+name: demo
+local_path: D:\ws\demo
 targets:
   build-server-01:
     name: build-server-01
@@ -796,8 +797,9 @@ targets:
     name: local
     target_type: local
 "#;
-        let t: TargetsFile = serde_yaml::from_str(yaml).unwrap();
-        let ssh = &t.targets["build-server-01"];
+        let p: Project = serde_yaml::from_str(yaml).unwrap();
+        let targets = &p.targets;
+        let ssh = &targets["build-server-01"];
         match &ssh.target_type {
             TargetType::Ssh { host, port, user, auth, .. } => {
                 assert_eq!(host, "192.168.1.100");
@@ -813,10 +815,10 @@ targets:
             other => panic!("expect ssh, got {other:?}"),
         }
         assert!(matches!(
-            t.targets["staging-k8s"].target_type,
+            targets["staging-k8s"].target_type,
             TargetType::Kubernetes { .. }
         ));
-        assert!(matches!(t.targets["local"].target_type, TargetType::Local));
+        assert!(matches!(targets["local"].target_type, TargetType::Local));
 
         // unit variant 序列化为字符串 local
         let s = serde_yaml::to_string(&TargetType::Local).unwrap();

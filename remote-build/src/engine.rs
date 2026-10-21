@@ -20,7 +20,6 @@ pub const DEFAULT_STEP_TIMEOUT: u64 = 300;
 pub struct RunInput {
     pub project: Project,
     pub job: Job,
-    pub target: Option<Target>,
     pub tools: HashMap<String, Tool>,
     /// 全部 targets（供 ${{ targets.x.y }} 解析）
     pub all_targets: HashMap<String, Target>,
@@ -48,23 +47,6 @@ impl Engine {
         // 工作目录解析（§4.5）
         let workspace = PathBuf::from(&input.project.local_path);
         let job_wd = resolve_job_working_dir(&input.job, &workspace);
-
-        // 按 target 类型构造传输实现
-        let transport = match transport::make_transport(input.target.as_ref()) {
-            Ok(t) => t,
-            Err(e) => {
-                let _ = log_tx
-                    .send(LogEvent::Error { message: e.to_string() })
-                    .await;
-                return JobStatus::Failed { step_index: 0, reason: e.to_string() };
-            }
-        };
-        // 远端工作目录：P0 取 target.work_root（本地 vs 远端目录映射待确认，§19 问题 1）
-        let remote_wd = input
-            .target
-            .as_ref()
-            .and_then(|t| t.work_root.clone())
-            .unwrap_or_default();
 
         // 整个 job 的取消信号由本任务独享消费：步骤间也检查
         let mut cancelled = false;
@@ -147,97 +129,134 @@ impl Engine {
 
             let _ = log_tx.send(LogEvent::StepStart { step_index: index, name: step_name }).await;
 
-            // 变量替换（§6.3 执行前一次性替换）：命令 / 工作目录 / 步骤 env
-            let mut command = resolve(&step.command, &ctx);
-
-            // 自动 corepack（§6.5）：仅本地步骤、仅命令以 pnpm/yarn 开头时包装
-            if pinned_frontend
-                && corepack_ok
-                && matches!(step.step_type, StepType::Exec | StepType::K8sApply)
-                && !is_remote(input.target.as_ref())
-            {
-                let wrapped = auto_corepack_wrap(&command);
-                if wrapped != command {
-                    let _ = log_tx
-                        .send(LogEvent::Stdout {
-                            step_index: index,
-                            line: "[corepack] 检测到 package.json 的 packageManager 钉版，\
-                                   pnpm/yarn 命令自动经 corepack 执行"
-                                .to_string(),
-                        })
-                        .await;
-                    command = wrapped;
-                }
-            }
-            let step_local_wd = resolve_step_working_dir(step, &job_wd);
-            let remote_dir = match &step.working_dir {
-                Some(wd) => {
-                    if remote_wd.is_empty() {
-                        wd.clone()
-                    } else {
-                        format!("{remote_wd}/{}", wd.trim_matches('/'))
+            // ── 有效目标（§3.3）：步骤级 target 覆盖流程级默认 ──
+            // 混合流程的关键：下载/编译用 local，上传/发布用 prod，各步各选
+            let step_ctx: Result<
+                (Option<Target>, Arc<dyn transport::RemoteTransport>, String),
+                String,
+            > = (|| {
+                let eff_name = step.target.clone().or_else(|| input.job.target.clone());
+                let eff_target = match eff_name.as_deref() {
+                    Some(n) => {
+                        let t = input.all_targets.get(n).ok_or_else(|| {
+                            format!(
+                                "目标「{n}」未定义（请在 project.yaml 的 targets 表或 🎯 目标管理 中配置）"
+                            )
+                        })?;
+                        let mut t = t.clone();
+                        if t.name.is_empty() {
+                            t.name = n.to_string();
+                        }
+                        Some(t)
                     }
-                }
-                None => remote_wd.clone(),
-            };
+                    None => None,
+                };
+                let transport = transport::make_transport(eff_target.as_ref())
+                    .map_err(|e| e.to_string())?;
+                // 远端根目录随有效目标走（上传相对路径 / 远端 cd 的基准）
+                let remote_base = eff_target
+                    .as_ref()
+                    .and_then(|t| t.work_root.clone())
+                    .unwrap_or_default();
+                Ok((eff_target, transport, remote_base))
+            })();
 
-            // §6.1 优先级：步骤级 env > 工具 env > target env
-            let mut env_map: HashMap<String, String> = input
-                .target
-                .as_ref()
-                .map(|t| t.env.clone())
-                .unwrap_or_default();
-            if let Some(tool) = merged_tools.get(&step.tool) {
-                env_map.extend(tool.env.clone());
-            }
-            for (k, v) in &step.env {
-                env_map.insert(k.clone(), resolve(v, &ctx));
-            }
+            let result = match step_ctx {
+                Err(reason) => StepResult::Failed { exit_code: -1, duration_ms: 0, reason },
+                Ok((eff_target, transport, remote_base)) => {
+                    // 变量替换（§6.3 执行前一次性替换）：命令 / 工作目录 / 步骤 env
+                    let mut command = resolve(&step.command, &ctx);
 
-            // 工具地址落地：tools.yaml / 项目级 tools 的 command 若是完整路径，
-            // 把其所在目录前置到步骤 PATH——命令里的裸名（mvn/node/git…）
-            // 优先解析到这份映射，而不是系统 PATH 里的任意版本（§6.5）
-            if let Some(tool) = merged_tools.get(&step.tool) {
-                let is_path_like = tool.command.contains('\\') || tool.command.contains('/');
-                if is_path_like {
-                    if let Some(parent) = Path::new(&tool.command).parent() {
-                        if parent.exists() {
-                            env_map = crate::transport::with_path_prepended(env_map, parent);
+                    // 自动 corepack（§6.5）：仅本地步骤、仅命令以 pnpm/yarn 开头时包装
+                    if pinned_frontend
+                        && corepack_ok
+                        && matches!(step.step_type, StepType::Exec | StepType::K8sApply)
+                        && !is_remote(eff_target.as_ref())
+                    {
+                        let wrapped = auto_corepack_wrap(&command);
+                        if wrapped != command {
+                            let _ = log_tx
+                                .send(LogEvent::Stdout {
+                                    step_index: index,
+                                    line: "[corepack] 检测到 package.json 的 packageManager 钉版，\
+                                           pnpm/yarn 命令自动经 corepack 执行"
+                                        .to_string(),
+                                })
+                                .await;
+                            command = wrapped;
                         }
                     }
+                    let step_local_wd = resolve_step_working_dir(step, &job_wd);
+                    let remote_dir = match &step.working_dir {
+                        Some(wd) if !remote_base.is_empty() => {
+                            format!("{remote_base}/{}", wd.trim_matches('/'))
+                        }
+                        Some(wd) => wd.clone(),
+                        None => remote_base,
+                    };
+
+                    // §6.1 优先级：步骤级 env > 工具 env > target env
+                    let mut env_map: HashMap<String, String> = eff_target
+                        .as_ref()
+                        .map(|t| t.env.clone())
+                        .unwrap_or_default();
+                    if let Some(tool) = merged_tools.get(&step.tool) {
+                        env_map.extend(tool.env.clone());
+                    }
+                    for (k, v) in &step.env {
+                        env_map.insert(k.clone(), resolve(v, &ctx));
+                    }
+
+                    // 工具地址落地：tools.yaml / 项目级 tools 的 command 若是完整路径，
+                    // 把其所在目录前置到步骤 PATH——命令里的裸名（mvn/node/git…）
+                    // 优先解析到这份映射，而不是系统 PATH 里的任意版本（§6.5）
+                    if let Some(tool) = merged_tools.get(&step.tool) {
+                        let is_path_like =
+                            tool.command.contains('\\') || tool.command.contains('/');
+                        if is_path_like {
+                            if let Some(parent) = Path::new(&tool.command).parent() {
+                                if parent.exists() {
+                                    env_map = crate::transport::with_path_prepended(
+                                        env_map, parent,
+                                    );
+                                }
+                            }
+                        }
+                    }
+
+                    // 前端工程：node_modules/.bin 前置（vite/jest/tsc 等工程内命令零配置可用）；
+                    // 放在工具目录之后，保证工程内命令优先于全局安装
+                    let project_bin = workspace.join("node_modules").join(".bin");
+                    if project_bin.exists() {
+                        env_map = crate::transport::with_path_prepended(env_map, &project_bin);
+                    }
+
+                    // k8s target：注入 KUBECONFIG（§8.4 走本地 kubectl）
+                    if let Some(TargetType::Kubernetes { kubeconfig, .. }) =
+                        eff_target.as_ref().map(|t| &t.target_type)
+                    {
+                        env_map.insert("KUBECONFIG".to_string(), kubeconfig.clone());
+                    }
+
+                    let step_timeout =
+                        Duration::from_secs(step.timeout.unwrap_or(DEFAULT_STEP_TIMEOUT));
+                    run_step_with_retry(
+                        &transport,
+                        eff_target.as_ref(),
+                        step,
+                        &command,
+                        &step_local_wd,
+                        &remote_dir,
+                        &env_map,
+                        &workspace,
+                        step_timeout,
+                        &mut cancel_rx,
+                        &log_tx,
+                        index,
+                    )
+                    .await
                 }
-            }
-
-            // 前端工程：node_modules/.bin 前置（vite/jest/tsc 等工程内命令零配置可用）；
-            // 放在工具目录之后，保证工程内命令优先于全局安装
-            let project_bin = workspace.join("node_modules").join(".bin");
-            if project_bin.exists() {
-                env_map = crate::transport::with_path_prepended(env_map, &project_bin);
-            }
-
-            // k8s target：注入 KUBECONFIG（§8.4 走本地 kubectl）
-            if let Some(TargetType::Kubernetes { kubeconfig, .. }) =
-                input.target.as_ref().map(|t| &t.target_type)
-            {
-                env_map.insert("KUBECONFIG".to_string(), kubeconfig.clone());
-            }
-
-            let step_timeout = Duration::from_secs(step.timeout.unwrap_or(DEFAULT_STEP_TIMEOUT));
-            let result = run_step_with_retry(
-                &transport,
-                input.target.as_ref(),
-                step,
-                &command,
-                &step_local_wd,
-                &remote_dir,
-                &env_map,
-                &workspace,
-                step_timeout,
-                &mut cancel_rx,
-                &log_tx,
-                index,
-            )
-            .await;
+            };
 
             match result {
                 StepResult::Success { exit_code, duration_ms, output_vars } => {
@@ -736,7 +755,6 @@ mod tests {
                 steps,
                 ..Default::default()
             },
-            target: None,
             tools: HashMap::new(),
             all_targets: HashMap::new(),
             from_step: 0,
@@ -973,6 +991,89 @@ mod tests {
                 e, LogEvent::Stdout { line, .. } if line.contains("step0_out") || line.contains("step2_out")
             )));
         }
+    }
+
+    #[test]
+    fn step_target_overrides_job_target() {
+        // §3.3 步骤级目标：未设置 → 跟随流程；设置 → 覆盖；未定义 → 步骤失败
+        let rt = runtime();
+        let (_cancel_tx, cancel_rx) = broadcast::channel(4);
+        let engine = Engine;
+
+        let mut all_targets = HashMap::new();
+        all_targets.insert(
+            "remote".to_string(),
+            Target {
+                name: "remote".to_string(),
+                target_type: TargetType::Ssh {
+                    host: "10.9.9.9".to_string(),
+                    port: 22,
+                    user: "u".to_string(),
+                    auth: crate::models::AuthMethod::None,
+                    host_key: None,
+                },
+                ..Default::default()
+            },
+        );
+
+        let mut input = simple_job(vec![
+            exec_step("echo S0_local"),
+            {
+                let mut s = exec_step("echo S1_local2");
+                s.target = Some("local2".to_string());
+                s
+            },
+            {
+                let mut s = exec_step("echo S2_never");
+                s.target = Some("no-such-target".to_string());
+                s
+            },
+            exec_step("echo S3_never"),
+        ]);
+        input.all_targets.insert(
+            "local2".to_string(),
+            Target {
+                name: "local2".to_string(),
+                target_type: TargetType::Local,
+                ..Default::default()
+            },
+        );
+
+        let (tx, mut rx) = mpsc::channel(1024);
+        let status = rt.block_on(engine.run_job(input, cancel_rx, tx));
+        // 第 3 步目标未定义 → on_failure=stop → 整个 job 失败于 step 2（0 起）
+        assert!(matches!(status, JobStatus::Failed { step_index: 2, .. }));
+
+        // 单独验证前两步的执行：只跑到第 2 步（from_step/only 无关，直接裁剪步骤）
+        let mut input2 = simple_job(vec![
+            exec_step("echo S0_local"),
+            {
+                let mut s = exec_step("echo S1_local2");
+                s.target = Some("local2".to_string());
+                s
+            },
+        ]);
+        all_targets.insert(
+            "local2".to_string(),
+            Target {
+                name: "local2".to_string(),
+                target_type: TargetType::Local,
+                ..Default::default()
+            },
+        );
+        input2.all_targets = all_targets;
+        let (tx2, mut rx2) = mpsc::channel(1024);
+        let (_c2, c2) = broadcast::channel(4);
+        let status2 = rt.block_on(engine.run_job(input2, c2, tx2));
+        assert!(status2.ok(), "status2: {status2:?}");
+        let mut events = Vec::new();
+        while let Ok(ev) = rx2.try_recv() {
+            events.push(ev);
+        }
+        assert!(events.iter().any(|e| matches!(
+            e,
+            LogEvent::Stdout { line, .. } if line.contains("S1_local2")
+        )));
     }
 
     #[test]

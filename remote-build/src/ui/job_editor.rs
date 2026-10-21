@@ -149,15 +149,11 @@ pub fn show(main: &mut MainState, ui: &mut egui::Ui) {
         }
     });
     let env_names: Vec<String> = project.variables.keys().cloned().collect();
-    // 目标下拉 = 项目级目标定义（project.yaml targets 表）优先 + 全局 targets.yaml 补充
+    // 目标下拉 = 本项目 project.yaml 的 targets 表（§3.5 目标随项目走）
     let mut target_names: Vec<String> = project.targets.keys().cloned().collect();
     target_names.sort();
-    for name in main.targets.keys() {
-        if !target_names.contains(name) {
-            target_names.push(name.clone());
-        }
-    }
-
+    // 流程默认目标的展示文本（步骤「跟随流程」时显示它）
+    let job_target_display = job.target.clone().unwrap_or_else(|| "无".to_string());
     // ── 第 2 行：环境 / 目标 / 失败策略（悬停可见说明）──
     ui.horizontal(|ui| {
         ui.label("环境:").on_hover_text(
@@ -176,10 +172,11 @@ pub fn show(main: &mut MainState, ui: &mut egui::Ui) {
             });
 
         ui.separator();
-        ui.label("目标:").on_hover_text(
-            "命令在哪台机器执行（取自 targets.yaml）：\n\
-             local = 本机 cmd 执行；SSH 目标 = 远端 Linux（exec 经 plink、upload 经 pscp，\n\
-             远端相对路径自动拼目标的 work_root）；k8s = 本地 kubectl + 注入 KUBECONFIG。",
+        ui.label("默认目标:").on_hover_text(
+            "流程的默认执行机器（取自本项目 project.yaml 的 targets 表）。\n\
+             每个步骤可用自己的「目标」覆盖它——混合流程示例：\n\
+             下载(local) → 编译(local) → 上传(prod) → 发布(prod)。\n\
+             local = 本机 cmd 执行；SSH 目标 = 远端 Linux（exec 经 plink、upload 经 pscp）。",
         );
         egui::ComboBox::from_id_source("target_combo")
             .selected_text(job.target.clone().unwrap_or_else(|| "无".to_string()))
@@ -260,7 +257,7 @@ pub fn show(main: &mut MainState, ui: &mut egui::Ui) {
         .auto_shrink([false, false])
         .show(ui, |ui| {
             for si in 0..job.steps.len() {
-                actions.push(edit_step(ui, job, si, &tool_menu, running));
+                actions.push(edit_step(ui, job, si, &tool_menu, running, &target_names, job_target_display.as_str()));
             }
 
             ui.add_space(4.0);
@@ -561,12 +558,15 @@ fn delete_current_job(main: &mut MainState) {
 /// 渲染单个步骤卡片，返回本帧用户对该步骤的操作请求。
 /// 下拉分组展示「本项目 / 全局」，选中后以徽标标注来源、悬停显示解析到的实际地址。
 /// running = 有作业在跑（此时单步运行按钮禁用）。
+/// target_names = 本项目可用的目标名；job_target_display = 流程默认目标的展示文本。
 fn edit_step(
     ui: &mut egui::Ui,
     job: &mut Job,
     si: usize,
     tool_menu: &ToolMenu,
     running: bool,
+    target_names: &[String],
+    job_target_display: &str,
 ) -> StepAction {
     let mut action = StepAction::None;
 
@@ -703,6 +703,26 @@ fn edit_step(
         );
 
         ui.horizontal(|ui| {
+            // 步骤级目标（§3.3）：覆盖流程默认——混合流程的关键
+            ui.label("目标:");
+            let sel_text = match &step.target {
+                Some(t) => t.clone(),
+                None => format!("跟随流程（{job_target_display}）"),
+            };
+            egui::ComboBox::from_id_source(format!("steptarget_{si}"))
+                .selected_text(sel_text)
+                .width(150.0)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut step.target,
+                        None,
+                        format!("跟随流程（{job_target_display}）"),
+                    );
+                    for name in target_names {
+                        ui.selectable_value(&mut step.target, Some(name.clone()), name);
+                    }
+                });
+
             ui.checkbox(&mut step.continue_on_error, "失败继续");
             // 重试配置（upload 未配置时引擎默认重试 1 次；显式配置覆盖之）
             match &mut step.retry {

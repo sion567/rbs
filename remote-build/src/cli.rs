@@ -65,35 +65,23 @@ fn test_conn(args: &[String]) {
         std::process::exit(2);
     };
 
-    // 查找顺序：全局 targets.yaml → 各项目的项目级 targets（§3.5 项目覆盖全局）
+    // 查找顺序：遍历各项目的项目级 targets（§3.5 目标随项目走）
     let mut found: Option<(String, Target)> = None;
-    let mut source = String::new();
 
-    let global = config::load_targets().unwrap_or_default();
-    if let Some(t) = global.targets.get(name) {
-        let mut t = t.clone();
-        t.name = name.clone();
-        t.cred_key = Some(format!("global/{name}"));
-        found = Some((String::new(), t));
-        source = "全局 targets.yaml".to_string();
-    }
-    if found.is_none() {
-        let (projects, _) =
-            crate::storage::files::discover_with_errors(&config::projects_dir());
-        for p in projects {
-            if let Some(t) = p.project.targets.get(name) {
-                let mut t = t.clone();
-                t.name = name.clone();
-                t.cred_key = Some(format!("{}/{name}", p.project.name));
-                found = Some((p.project.name.clone(), t));
-                source = format!("项目 {}", p.project.name);
-                break;
-            }
+    let (projects, _) =
+        crate::storage::files::discover_with_errors(&config::projects_dir());
+    for p in projects {
+        if let Some(t) = p.project.targets.get(name) {
+            let mut t = t.clone();
+            t.name = name.clone();
+            t.cred_key = Some(format!("{}/{name}", p.project.name));
+            found = Some((p.project.name.clone(), t));
+            break;
         }
     }
 
     let Some((owner, t)) = found else {
-        eprintln!("❌ 未找到目标: {name}（全局与所有项目均已查找）");
+        eprintln!("❌ 未找到目标: {name}（所有项目均已查找）");
         std::process::exit(2);
     };
     if matches!(t.target_type, TargetType::Local) {
@@ -146,8 +134,7 @@ fn run(args: &[String]) {
     };
 
     let tools = config::load_tools().map(|t| t.tools).unwrap_or_default();
-    let all_targets = config::load_targets().map(|t| t.targets).unwrap_or_default();
-    let target = je.job.target.as_ref().and_then(|n| all_targets.get(n).cloned());
+    let all_targets = config::effective_targets(&entry.project);
 
     let rt = tokio::runtime::Runtime::new().expect("创建 tokio runtime 失败");
     let (tx, mut rx) = mpsc::channel(8192);
@@ -173,7 +160,6 @@ fn run(args: &[String]) {
     let input = RunInput {
         project: entry.project.clone(),
         job: je.job.clone(),
-        target,
         tools,
         all_targets,
         from_step: 0,
