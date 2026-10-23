@@ -615,7 +615,12 @@ fn parse_upload_mappings(command: &str) -> anyhow::Result<Vec<(String, String)>>
         let Some((l, r)) = line.split_once("->") else {
             anyhow::bail!("upload 映射格式应为: <本地路径> -> <远端路径>，实际行: {line}");
         };
-        out.push((l.trim().to_string(), r.trim().to_string()));
+        let (l, r) = (l.trim(), r.trim());
+        // 空映射行（UI 编辑器加行的 "-> " 占位）与空白行一样跳过
+        if l.is_empty() && r.is_empty() {
+            continue;
+        }
+        out.push((l.to_string(), r.to_string()));
     }
     if out.is_empty() {
         anyhow::bail!("upload 命令为空；每行一条映射：<本地路径> -> <远端路径>");

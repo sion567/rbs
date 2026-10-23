@@ -154,12 +154,13 @@ pub fn show(main: &mut MainState, ui: &mut egui::Ui) {
     target_names.sort();
     // 流程默认目标的展示文本（步骤「跟随流程」时显示它）
     let job_target_display = job.target.clone().unwrap_or_else(|| "无".to_string());
-    // ── 第 2 行：环境 / 目标 / 失败策略（悬停可见说明）──
+    // ── 第 2 行：变量组 / 目标 / 失败策略（悬停可见说明）──
     ui.horizontal(|ui| {
-        ui.label("环境:").on_hover_text(
-            "决定 ${{ variables.X }} 从哪张变量表取值（project.yaml 的 variables.<环境名>）。\n\
-             例：environment=prod 时 ${{ variables.DEPLOY_DIR }} 取 variables.prod.DEPLOY_DIR，\n\
-             同一条流程换环境即换一套变量（私服地址 / 部署目录等）。",
+        ui.label("变量组:").on_hover_text(
+            "决定 ${{ variables.X }} 从哪张变量表取值（project.yaml 的 variables.<组名>）。\n\
+             例：变量组=prod 时 ${{ variables.DEPLOY_DIR }} 取 variables.prod.DEPLOY_DIR，\n\
+             同一条流程换变量组即换一套参数（私服地址 / 部署目录等）。\n\
+             注意：它不是 Spring profile 那样的运行环境；执行机器由「目标」决定。",
         );
         egui::ComboBox::from_id_source("env_combo")
             .selected_text(job.environment.clone().unwrap_or_else(|| "无".to_string()))
@@ -491,8 +492,8 @@ pub fn show_var_help_window(ctx: &egui::Context, main: &mut MainState) {
                     let rows: Vec<(String, &str, &str)> = vec![
                         (
                             "${{ variables.X }}".into(),
-                            "project.yaml 的 variables.<环境>（「环境」下拉选中的表）",
-                            "选 prod 时 ${{ variables.DEPLOY_DIR }} → /opt/yudao/prod",
+                            "project.yaml 的 variables.<组名>（「变量组」下拉选中的表）",
+                            "选 prod 组时 ${{ variables.DEPLOY_DIR }} → /opt/yudao/prod",
                         ),
                         (
                             "${{ env.X }}".into(),
@@ -641,6 +642,7 @@ fn edit_step(
             }
 
             ui.separator();
+            let old_type = step.step_type;
             let mut st_idx = step_type_index(&step.step_type);
             egui::ComboBox::from_id_source(format!("st_{si}"))
                 .selected_text(step_type_label(&step.step_type))
@@ -651,6 +653,10 @@ fn edit_step(
                     }
                 });
             step.step_type = step_type_from_index(st_idx);
+            // 类型切换后命令语义完全不同（exec 的 echo、upload 的映射互不通用），清空遗留内容
+            if step.step_type != old_type {
+                step.command.clear();
+            }
 
             ui.separator();
             match &mut step.timeout {
@@ -696,19 +702,20 @@ fn edit_step(
         });
 
         ui.add_space(2.0);
-        ui.add(
-            egui::TextEdit::multiline(&mut step.command)
-                .desired_rows(2)
-                .desired_width(f32::INFINITY)
-                .font(egui::TextStyle::Monospace)
-                .hint_text(match step.step_type {
-                    StepType::Upload => {
-                        "每行一条映射：本地路径 -> 远端路径（可多行，# 开头为注释）"
-                    }
-                    StepType::Pack => "目录或通配 -> 目标.zip，如 target/ -> dist/app.zip",
-                    _ => "命令，支持 ${{ variables.X }} / ${{ env.X }} / ${VAR}",
-                }),
-        );
+        if matches!(step.step_type, StepType::Upload) {
+            edit_upload_mappings(ui, step);
+        } else {
+            ui.add(
+                egui::TextEdit::multiline(&mut step.command)
+                    .desired_rows(2)
+                    .desired_width(f32::INFINITY)
+                    .font(egui::TextStyle::Monospace)
+                    .hint_text(match step.step_type {
+                        StepType::Pack => "目录或通配 -> 目标.zip，如 target/ -> dist/app.zip",
+                        _ => "命令，支持 ${{ variables.X }} / ${{ env.X }} / ${VAR}",
+                    }),
+            );
+        }
 
         ui.horizontal(|ui| {
             // 步骤级目标（§3.3）：覆盖流程默认——混合流程的关键
@@ -778,4 +785,121 @@ fn edit_step(
     });
 
     action
+}
+
+// ---------------------------------------------------------------------------
+// upload 映射的结构化编辑：from/to 输入框 + 加/减行。
+// 落盘仍是引擎 parse_upload_mappings 的行格式（每行 `<本地> -> <远端>`），
+// 旧 YAML / 手写配置零迁移。
+// ---------------------------------------------------------------------------
+
+/// upload 命令 → 编辑行。与引擎同一格式：按行 split 首个 "->" 并 trim；
+/// 没有 "->" 的行放进 from 槽等待补全；空命令给一行空行起步。
+fn upload_rows(command: &str) -> Vec<(String, String)> {
+    let mut rows = Vec::new();
+    for line in command.lines() {
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        match t.split_once("->") {
+            Some((l, r)) => rows.push((l.trim().to_string(), r.trim().to_string())),
+            None => rows.push((t.to_string(), String::new())),
+        }
+    }
+    if rows.is_empty() {
+        rows.push((String::new(), String::new()));
+    }
+    rows
+}
+
+/// 编辑行 → upload 命令。空行序列化为 "->" 占位：能原样解析回空行（否则
+/// "＋ 添加映射" 的空行会在写回时被过滤掉、看起来没反应），引擎把空映射当空行跳过。
+fn upload_command(rows: &[(String, String)]) -> String {
+    rows.iter()
+        .map(|(l, r)| format!("{} -> {}", l.trim(), r.trim()).trim().to_string())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn edit_upload_mappings(ui: &mut egui::Ui, step: &mut Step) {
+    let mut rows = upload_rows(&step.command);
+
+    let mut del: Option<usize> = None;
+    for (ri, (l, r)) in rows.iter_mut().enumerate() {
+        ui.horizontal(|ui| {
+            if ui
+                .small_button("−")
+                .on_hover_text("删除此映射")
+                .clicked()
+            {
+                del = Some(ri);
+            }
+            let from_w = ((ui.available_width() - 150.0) * 0.5).max(140.0);
+            ui.add(
+                egui::TextEdit::singleline(l)
+                    .desired_width(from_w)
+                    .hint_text("本地路径：相对项目目录或绝对路径；具体文件或目录（不支持通配）"),
+            );
+            ui.label("→");
+            // to 框吃掉剩余全部宽度：行总宽与 exec 文本框一致，切换类型卡片不跳宽
+            ui.add(
+                egui::TextEdit::singleline(r)
+                    .desired_width(ui.available_width())
+                    .hint_text("远端路径：/ 开头为绝对路径；相对 = 目标的 work_root"),
+            );
+        });
+    }
+    if let Some(ri) = del {
+        rows.remove(ri);
+    }
+    if ui
+        .small_button("＋ 添加映射")
+        .on_hover_text("再添加一条 本地 → 远端 映射（微服务多 jar 场景）")
+        .clicked()
+    {
+        rows.push((String::new(), String::new()));
+    }
+    step.command = upload_command(&rows);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn upload_mappings_roundtrip() {
+        // 旧格式（含注释行/空行）→ 结构化行：空行吸收；注释行保留显示（引擎按注释忽略）
+        let rows = upload_rows(
+            "target/a.jar -> /opt/app/a.jar\n\n# 备注\ntarget/b.jar -> /opt/app/b.jar",
+        );
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0], ("target/a.jar".into(), "/opt/app/a.jar".into()));
+        assert_eq!(rows[1], ("# 备注".into(), "".into()));
+        assert_eq!(rows[2], ("target/b.jar".into(), "/opt/app/b.jar".into()));
+
+        // 序列化仍是引擎 parse_upload_mappings 的行格式；"# ... ->" 依旧以 # 开头 = 仍是注释
+        let cmd = upload_command(&rows);
+        assert_eq!(
+            cmd,
+            "target/a.jar -> /opt/app/a.jar\n# 备注 ->\ntarget/b.jar -> /opt/app/b.jar"
+        );
+
+        // 无 "->" 的残留行放进 from 槽等待补全，不丢内容
+        let rows = upload_rows("只有一半的行");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "只有一半的行");
+
+        // 无 "->" 的残留行放进 from 槽等待补全，不丢内容
+        let rows = upload_rows("只有一半的行");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "只有一半的行");
+
+        // 空行序列化为 "->" 占位（保证 "＋ 添加映射" 的空行能稳定往返），
+        // 且解析回来还是空行；引擎 parse_upload_mappings 会把空映射当空行跳过
+        let cmd = upload_command(&[("".into(), "".into()), ("a".into(), "".into())]);
+        assert_eq!(cmd, "->\na ->");
+        let back = upload_rows(&cmd);
+        assert_eq!(back, vec![("".to_string(), "".to_string()), ("a".to_string(), String::new())]);
+    }
 }
