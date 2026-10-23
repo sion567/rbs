@@ -439,7 +439,55 @@ pub fn remote_sha256(target: &Target, remote_path: &str) -> anyhow::Result<Strin
         .find_map(parse_sha256sum_output)
         .ok_or_else(|| anyhow::anyhow!("远端 sha256sum 输出无法解析: {out}"))
 }
-pub fn test_connection(target: &Target) -> Result<String, String> {
+// ---------------------------------------------------------------------------
+// 连接测试 + 服务器体检
+// ---------------------------------------------------------------------------
+
+/// 服务器基础信息（probe_server 采集；字段缺失 = 远端命令未产出，展示时跳过）
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ServerInfo {
+    pub hostname: String,
+    pub os: String,
+    pub cores: String,
+    /// 1/5/15 分钟负载（/proc/loadavg 前三列）
+    pub load: String,
+    /// 已用 / 总量，MB（MemTotal - MemAvailable / MemTotal）
+    pub mem_used_mb: u64,
+    pub mem_total_mb: u64,
+    pub uptime: String,
+    pub disks: Vec<DiskMount>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DiskMount {
+    pub mount: String,
+    pub total_gb: f64,
+    pub used_gb: f64,
+    /// 使用率文本（如 "71%"）
+    pub percent: String,
+}
+
+/// 远端采集命令：分号串联的单行、无引号嵌套（busybox 亦兼容），逐项 echo key=…；
+/// 单项命令失败不影响其余项。解析全部在本地（parse_server_info），远端保持最朴素。
+pub const PROBE_CMD: &str = concat!(
+    "echo __RBS_BEGIN__; ",
+    "echo os=$(uname -sr); ",
+    "echo host=$(hostname || uname -n); ",
+    "echo cores=$(nproc || grep -c ^processor /proc/cpuinfo); ",
+    "echo load=$(cat /proc/loadavg); ",
+    "echo uptimesec=$(cat /proc/uptime); ",
+    "echo meminfo=; ",
+    "grep ^MemTotal: /proc/meminfo; ",
+    "grep ^MemAvailable: /proc/meminfo; ",
+    "echo disks=; ",
+    "df -lP; ",
+    "echo __RBS_END__",
+);
+
+/// 连接测试 + 服务器体检：一次 plink 往返同时验证 SSH 可达（网络/端口/认证）
+/// 并采集 CPU / 内存 / 磁盘等基础信息。超时 8s（df 比单条 echo 慢）。
+/// 成功返回 (ServerInfo, 耗时毫秒)；失败语义与原 test_connection 一致（含指纹引导）。
+pub fn probe_server(target: &Target) -> Result<(ServerInfo, u128), String> {
     let d = detect_putty_tools();
     if !d.found {
         return Err("未找到 plink（PuTTY），请安装或将套件放入内置目录".to_string());
@@ -447,12 +495,13 @@ pub fn test_connection(target: &Target) -> Result<String, String> {
     let (dest, mut args) =
         PuttyTransport::build_ssh_args(target).map_err(|e| e.to_string())?;
     args.push(dest);
-    args.push("echo __RBS_OK__".to_string());
+    args.push(PROBE_CMD.to_string());
 
     use std::io::Read;
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
 
+    let started = Instant::now();
     let mut cmd = Command::new(&d.plink);
     cmd.args(&args).stdout(Stdio::piped()).stderr(Stdio::piped());
     #[cfg(windows)]
@@ -461,7 +510,7 @@ pub fn test_connection(target: &Target) -> Result<String, String> {
         cmd.creation_flags(0x0800_0000);
     }
     let mut child = cmd.spawn().map_err(|e| format!("启动 plink 失败: {e}"))?;
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = started + Duration::from_secs(8);
 
     let status = loop {
         match child.try_wait() {
@@ -485,12 +534,13 @@ pub fn test_connection(target: &Target) -> Result<String, String> {
     if let Some(mut e) = child.stderr.take() {
         let _ = e.read_to_string(&mut err);
     }
+    let elapsed_ms = started.elapsed().as_millis();
 
     match status {
-        Some(st) if st.success() => Ok(format!(
-            "连接成功（{}）",
-            out.lines().next().unwrap_or("ok").trim()
-        )),
+        Some(st) if st.success() => {
+            let info = parse_server_info(&out);
+            Ok((info, elapsed_ms))
+        }
         Some(st) => {
             let text = format!("{err}{out}");
             let tail: Vec<&str> = text.lines().rev().take(4).collect();
@@ -510,7 +560,176 @@ pub fn test_connection(target: &Target) -> Result<String, String> {
             }
             Err(msg)
         }
-        None => Err("连接超时（5s）——请检查网络 / 防火墙 / 主机地址".to_string()),
+        None => Err("连接超时（8s）——请检查网络 / 防火墙 / 主机地址".to_string()),
+    }
+}
+
+/// 解析 plink 输出：只认 __RBS_BEGIN__ / __RBS_END__ 之间带键前缀的行
+/// （登录横幅 MOTD 会被自动忽略）。远端命令失败时对应键缺失，字段留空。
+pub fn parse_server_info(output: &str) -> ServerInfo {
+    let mut info = ServerInfo::default();
+    let mut mem_total_kb: Option<u64> = None;
+    let mut mem_avail_kb: Option<u64> = None;
+    // in_disks = 正在读 df -lP 输出段
+    let mut in_disks = false;
+
+    for line in output.lines() {
+        match line.trim() {
+            "__RBS_BEGIN__" => continue,
+            "__RBS_END__" => break,
+            "meminfo=" => {
+                in_disks = false;
+                continue;
+            }
+            "disks=" => {
+                in_disks = true;
+                continue;
+            }
+            _ => {}
+        }
+
+        if in_disks {
+            if let Some(d) = parse_df_row(line) {
+                info.disks.push(d);
+            }
+            continue;
+        }
+
+        // meminfo 段：行形如 "MemTotal:  16384000 kB"（无 = 前缀，须在键值匹配前处理）
+        if line.starts_with("MemTotal:") {
+            mem_total_kb = parse_meminfo_kb(line);
+            continue;
+        }
+        if line.starts_with("MemAvailable:") {
+            mem_avail_kb = parse_meminfo_kb(line);
+            continue;
+        }
+
+        if let Some((key, value)) = line.split_once('=') {
+            match key.trim() {
+                "os" => info.os = value.trim().to_string(),
+                "host" => info.hostname = value.trim().to_string(),
+                "cores" => info.cores = value.trim().to_string(),
+                // /proc/loadavg: "0.52 0.58 0.59 1/850 12345" → 取前三列
+                "load" => {
+                    info.load = value.split_whitespace().take(3).collect::<Vec<_>>().join(" ");
+                }
+                "uptimesec" => {
+                    if let Some(secs) = value.split_whitespace().next().and_then(|s| s.parse::<f64>().ok()) {
+                        info.uptime = format_uptime(secs);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if let (Some(total), Some(avail)) = (mem_total_kb, mem_avail_kb) {
+        info.mem_total_mb = total / 1024;
+        info.mem_used_mb = total.saturating_sub(avail) / 1024;
+    }
+    info
+}
+
+/// /proc/meminfo 行："MemTotal:       16384000 kB" → 16384000
+fn parse_meminfo_kb(line: &str) -> Option<u64> {
+    let value = line.split_once(':')?.1.trim();
+    value.split_whitespace().next()?.parse().ok()
+}
+
+/// df -lP 行："/dev/sda1 82045436 54893204 22969804 71% /" → DiskMount。
+/// 过滤 tmpfs/devtmpfs/overlay 等伪文件系统与表头；列数不足或非数字的行忽略。
+fn parse_df_row(line: &str) -> Option<DiskMount> {
+    let cols: Vec<&str> = line.split_whitespace().collect();
+    if cols.len() < 6 || cols[1].parse::<u64>().is_err() {
+        return None;
+    }
+    let fs = cols[0];
+    const PSEUDO: &[&str] = &["tmpfs", "devtmpfs", "udev", "overlay", "shm", "none", "cgroup", "squashfs"];
+    if PSEUDO.contains(&fs) {
+        return None;
+    }
+    // 表头（Filesystem ...）的容量列不是数字，已被上方 parse 拦截
+    let total_kb: u64 = cols[1].parse().ok()?;
+    let used_kb: u64 = cols[2].parse().ok()?;
+    let kb_to_gb = |kb: u64| kb as f64 / (1024.0 * 1024.0);
+    Some(DiskMount {
+        mount: cols[5].to_string(),
+        total_gb: kb_to_gb(total_kb),
+        used_gb: kb_to_gb(used_kb),
+        percent: cols[4].to_string(),
+    })
+}
+
+/// 秒 → "3天 2小时 15分" / "2小时 15分" / "15分"
+fn format_uptime(secs: f64) -> String {
+    let mins = (secs / 60.0) as u64;
+    let d = mins / 1440;
+    let h = (mins % 1440) / 60;
+    let m = mins % 60;
+    if d > 0 {
+        format!("{d}天 {h}小时 {m}分")
+    } else if h > 0 {
+        format!("{h}小时 {m}分")
+    } else {
+        format!("{m}分")
+    }
+}
+
+/// KB → GB 文本：≥100 取整，否则 1 位小数
+fn gb_text(gb: f64) -> String {
+    if gb >= 100.0 {
+        format!("{:.0}", gb)
+    } else {
+        format!("{gb:.1}")
+    }
+}
+
+impl ServerInfo {
+    /// 供 CLI 与 UI 共用的展示格式（多行；info.0 首行含连接耗时）
+    pub fn display(&self, elapsed_ms: u128) -> String {
+        let mut lines = Vec::new();
+        let os = if self.os.is_empty() { "未知系统" } else { &self.os };
+        lines.push(format!("连接成功（{:.1}s）· {os}", elapsed_ms as f64 / 1000.0));
+
+        let mut row = Vec::new();
+        if !self.hostname.is_empty() {
+            row.push(format!("主机: {}", self.hostname));
+        }
+        if !self.cores.is_empty() {
+            row.push(format!("CPU: {} 核", self.cores));
+        }
+        if !self.load.is_empty() {
+            row.push(format!("负载: {}", self.load));
+        }
+        if !row.is_empty() {
+            lines.push(row.join("   "));
+        }
+
+        if self.mem_total_mb > 0 {
+            let pct = (self.mem_used_mb as f64 / self.mem_total_mb as f64 * 100.0).round() as u64;
+            lines.push(format!(
+                "内存: {:.1} / {:.1} GB（{pct}%）",
+                self.mem_used_mb as f64 / 1024.0,
+                self.mem_total_mb as f64 / 1024.0
+            ));
+        }
+        if !self.uptime.is_empty() {
+            lines.push(format!("运行: {}", self.uptime));
+        }
+        if !self.disks.is_empty() {
+            lines.push("磁盘:".to_string());
+            for d in &self.disks {
+                lines.push(format!(
+                    "  {:<14} {:>6}G  已用 {:>6}G  {}",
+                    d.mount,
+                    gb_text(d.total_gb),
+                    gb_text(d.used_gb),
+                    d.percent
+                ));
+            }
+        }
+        lines.join("\n")
     }
 }
 
@@ -523,7 +742,6 @@ fn extract_fingerprint(text: &str) -> Option<String> {
         .unwrap_or(rest.len());
     Some(rest[..end].trim().to_string())
 }
-
 
 // ---------------------------------------------------------------------------
 // 测试
@@ -663,5 +881,84 @@ mod tests {
         if d.source != "custom" {
             assert_eq!(d.source, "builtin");
         }
+    }
+
+    // -- 服务器体检（probe_server 输出解析）---------------------------------
+
+    #[test]
+    fn parse_server_info_ignores_motd_and_parses_fields() {
+        // MOTD 横幅在 __RBS_BEGIN__ 之前，必须被忽略；键行只认已知键
+        let out = "\
+Welcome to Ubuntu 22.04 LTS (GNU/Linux 5.15.0-91-generic x86_64)\n\
+\n\
+ * Documentation:  https://help.ubuntu.com\n\
+__RBS_BEGIN__\n\
+os=Linux 5.15.0-91-generic\n\
+host=prod-web-01\n\
+cores=8\n\
+load=0.52 0.58 0.59 1/850 12345\n\
+uptimesec=271935.28 1081423.06\n\
+meminfo=\n\
+MemTotal:       16384000 kB\n\
+MemAvailable:   11468800 kB\n\
+disks=\n\
+Filesystem 1024-blocks Used Available Capacity Mounted on\n\
+/dev/sda1 81779200 54525952 23085568 71% /\n\
+tmpfs 8192000 0 8192000 0% /dev/shm\n\
+/dev/sdb1 524288000 125829120 398458880 24% /data\n\
+/dev/sda1 81779200 54525952 23085568 71% /boot\n\
+__RBS_END__\n";
+        let info = parse_server_info(out);
+        assert_eq!(info.os, "Linux 5.15.0-91-generic");
+        assert_eq!(info.hostname, "prod-web-01");
+        assert_eq!(info.cores, "8");
+        assert_eq!(info.load, "0.52 0.58 0.59", "loadavg 只取前三列");
+        assert_eq!(info.uptime, "3天 3小时 32分");
+        assert_eq!(info.mem_total_mb, 16000);
+        assert_eq!(info.mem_used_mb, 4800);
+        // tmpfs 过滤；/boot 与 / 同设备但挂载点不同，各自保留
+        assert_eq!(info.disks.len(), 3);
+        assert_eq!(info.disks[0].mount, "/");
+        assert_eq!(info.disks[0].percent, "71%");
+        assert!((info.disks[0].total_gb - 78.0).abs() < 0.1);
+        assert_eq!(info.disks[1].mount, "/data");
+        assert!((info.disks[1].used_gb - 120.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn parse_server_info_tolerates_missing_sections() {
+        // 迷你系统（部分命令缺失）输出残缺 → 字段留空而非 panic
+        let out = "__RBS_BEGIN__\nhost=barebox\ndisks=\n__RBS_END__";
+        let info = parse_server_info(out);
+        assert_eq!(info.hostname, "barebox");
+        assert_eq!(info.os, "");
+        assert!(info.disks.is_empty());
+        assert_eq!(info.mem_total_mb, 0);
+        // 完全没输出（非 Linux / 命令全失败）→ 全空结构
+        assert_eq!(parse_server_info("garbage\nmore garbage"), ServerInfo::default());
+    }
+
+    #[test]
+    fn server_info_display_readable() {
+        let info = ServerInfo {
+            hostname: "prod-web-01".into(),
+            os: "Linux 5.15.0-91-generic".into(),
+            cores: "8".into(),
+            load: "0.52 0.58 0.59".into(),
+            mem_used_mb: 5325,
+            mem_total_mb: 16000,
+            uptime: "3天 3小时 45分".into(),
+            disks: vec![DiskMount {
+                mount: "/".into(),
+                total_gb: 78.0,
+                used_gb: 52.0,
+                percent: "71%".into(),
+            }],
+        };
+        let text = info.display(2345);
+        assert!(text.contains("连接成功（2.3s）"), "首行含耗时: {text}");
+        assert!(text.contains("prod-web-01"));
+        assert!(text.contains("内存: 5.2 / 15.6 GB（33%）"), "内存行: {text}");
+        assert!(text.contains("71%"));
     }
 }

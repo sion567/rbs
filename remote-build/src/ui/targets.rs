@@ -199,7 +199,11 @@ fn target_list_and_form(ui: &mut egui::Ui, main: &mut MainState) {
                 main.target_editor.unsaved = true;
             }
         }
-        if ui.button("🔌 连接测试").clicked() {
+        if ui
+            .button("🔌 连接测试")
+            .on_hover_text("SSH 连接测试 + 服务器体检：CPU / 内存 / 磁盘 / 负载（8 秒超时）")
+            .clicked()
+        {
             start_test(main);
         }
         if ui.button("💾 保存 project.yaml").clicked() {
@@ -233,7 +237,11 @@ fn target_list_and_form(ui: &mut egui::Ui, main: &mut MainState) {
             Color32::from_rgb(230, 110, 110)
         };
         let icon = if *ok { "✅" } else { "❌" };
-        ui.colored_label(color, format!("{icon} {msg}"));
+        // 等宽字体：磁盘/内存列对齐（体检信息为多行）
+        ui.colored_label(
+            color,
+            egui::RichText::new(format!("{icon} {msg}")).monospace(),
+        );
         if !ok && msg.contains("host key") {
             ui.weak("提示：把连接测试输出中的 SHA256 指纹填入「主机键指纹」字段即可信任（TOFU）。");
         }
@@ -594,7 +602,7 @@ fn load_buffers(main: &mut MainState, name: &str) {
     main.target_editor.password_saved = crate::secrets::get_password(&key).is_some();
 }
 
-/// 后台线程做 SSH 连接测试（复用 putty::test_connection，5 秒超时）；
+/// 后台线程做 SSH 连接测试 + 服务器体检（复用 putty::probe_server，8 秒超时）；
 /// 回填凭据键，保证密码取自本项目的条目
 fn start_test(main: &mut MainState) {
     let Some(name) = main.target_editor.selected.clone() else {
@@ -618,6 +626,8 @@ fn start_test(main: &mut MainState) {
     let (tx, rx) = std::sync::mpsc::channel();
     main.target_editor.test_rx = Some(rx);
     std::thread::spawn(move || {
-        let _ = tx.send(crate::transport::putty::test_connection(&t));
+        let res = crate::transport::putty::probe_server(&t)
+            .map(|(info, elapsed)| info.display(elapsed));
+        let _ = tx.send(res);
     });
 }

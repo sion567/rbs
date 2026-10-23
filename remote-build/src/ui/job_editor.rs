@@ -518,7 +518,7 @@ pub fn show_var_help_window(ctx: &egui::Context, main: &mut MainState) {
             ui.weak("可用于步骤命令、步骤 env、工作目录、条件字段。执行前一次性替换；未解析的占位符原样保留。");
             ui.add_space(6.0);
 
-            ui.strong("一、四种取值形态");
+            ui.strong("一、取值形态");
             egui::Grid::new("var_help_grid")
                 .num_columns(3)
                 .spacing([12.0, 4.0])
@@ -543,6 +543,21 @@ pub fn show_var_help_window(ctx: &egui::Context, main: &mut MainState) {
                             "${{ targets.名.字段 }}".into(),
                             "targets.yaml 目标字段（host/port/user/kubeconfig/context/namespace/registry/work_root）",
                             "${{ targets.prod.host }} → 192.168.40.198",
+                        ),
+                        (
+                            "${{ now }}".into(),
+                            "运行启动时刻（引擎侧生成，一次运行所有步骤同值，备份后缀场景）",
+                            "cp app.jar app.jar.${{ now }} → app.jar.20261023153045",
+                        ),
+                        (
+                            "${{ now.date }} / ${{ now.time }} / ${{ now.iso }}".into(),
+                            "同上的日期 / 时间 / 可读格式",
+                            "20261023 · 153045 · 2026-10-23 15:30:45",
+                        ),
+                        (
+                            "${{ run.id }}".into(),
+                            "本次运行唯一标识（与控制台日志文件同名）",
+                            "echo ${{ run.id }} >> /opt/release.log",
                         ),
                         (
                             "${VAR}".into(),

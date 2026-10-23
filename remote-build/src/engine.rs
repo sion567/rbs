@@ -28,6 +28,8 @@ pub struct RunInput {
     pub from_step: usize,
     /// 只执行这一步（调试用；None = 按顺序执行）
     pub only_step: Option<usize>,
+    /// 本次运行唯一标识（与日志文件同名），供 ${{ run.id }}；空串 = 未设置
+    pub run_id: String,
 }
 
 pub struct Engine;
@@ -315,6 +317,9 @@ fn build_var_context(input: &RunInput) -> VarContext {
         variables,
         env: HashMap::new(),
         targets: input.all_targets.clone(),
+        run_id: (!input.run_id.is_empty()).then(|| input.run_id.clone()),
+        // 内置时间变量在此冻结：一次运行所有步骤同值（备份后缀等场景）
+        now: crate::variables::BuiltinNow::generate(),
     }
 }
 
@@ -787,6 +792,7 @@ mod tests {
             all_targets: HashMap::new(),
             from_step: 0,
             only_step: None,
+            run_id: "test-run".into(),
         }
     }
 

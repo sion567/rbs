@@ -395,15 +395,64 @@ fn run_clone(
     progress: Arc<Mutex<String>>,
     password: &str,
 ) -> Result<String, String> {
+    let mut args: Vec<&str> = vec!["clone", "--progress"];
+    if !branch.is_empty() {
+        args.push("--branch");
+        args.push(branch);
+    }
+    args.push(url);
+    args.push(target);
+    run_git(
+        git_cmd,
+        &args,
+        None,
+        Some(progress),
+        None,
+        password,
+        "无输出（请检查网络 / 地址 / 账号密码）",
+    )
+}
+
+/// 对已有仓库目录执行 git pull --ff-only：远端历史分叉或本地冲突时直接失败，
+/// 不产生意外 merge、不覆盖本地未提交修改（设计文档 §10.2 的顾虑）。
+/// 输出行经 line_tx 流式送出（进度在 stderr）。凭据用仓库里已存的 origin 配置，
+/// 不再要账号密码。返回 Ok(完整输出) / Err(错误详情)。
+pub(crate) fn run_pull(
+    git_cmd: &str,
+    dir: &Path,
+    line_tx: std::sync::mpsc::Sender<String>,
+) -> Result<String, String> {
+    run_git(
+        git_cmd,
+        &["pull", "--ff-only", "--progress"],
+        Some(dir),
+        None,
+        Some(line_tx),
+        "",
+        "无输出（请检查网络与远端仓库状态）",
+    )
+}
+
+/// 执行 git 子命令：stderr 逐行脱敏后写入 progress（尾部 8 行，弹窗进度条用）
+/// 和/或 line_tx（逐行流式，控制台用）；stdout 同步排空防子进程阻塞。
+/// 返回 Ok(stderr 完整输出) / Err(子命令名 + 退出码 + stderr 尾部)。
+pub(crate) fn run_git(
+    git_cmd: &str,
+    args: &[&str],
+    cwd: Option<&Path>,
+    progress: Option<Arc<Mutex<String>>>,
+    line_tx: Option<std::sync::mpsc::Sender<String>>,
+    password: &str,
+    no_output_hint: &str,
+) -> Result<String, String> {
     use std::io::{BufRead, BufReader};
     use std::process::{Command, Stdio};
 
     let mut cmd = Command::new(git_cmd);
-    cmd.arg("clone").arg("--progress");
-    if !branch.is_empty() {
-        cmd.arg("--branch").arg(branch);
+    cmd.args(args);
+    if let Some(dir) = cwd {
+        cmd.current_dir(dir);
     }
-    cmd.arg(url).arg(target);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     #[cfg(windows)]
     {
@@ -415,10 +464,9 @@ fn run_clone(
         .spawn()
         .map_err(|e| format!("git 启动失败: {e}（{git_cmd}）"))?;
 
-    // git clone 的进度输出在 stderr；同步追加到进度条与完整输出
+    // git 的进度输出在 stderr；逐行脱敏后送往两个可选出口，并留完整输出供错误展示
     let stderr = child.stderr.take();
     let pw = password.to_string();
-    let prog = progress.clone();
     let reader = std::thread::spawn(move || {
         let mut all = String::new();
         if let Some(stderr) = stderr {
@@ -426,14 +474,19 @@ fn run_clone(
                 let masked = mask_secret(&line, &pw);
                 all.push_str(&masked);
                 all.push('\n');
-                if let Ok(mut p) = prog.lock() {
-                    let mut lines: Vec<&str> = p.lines().collect();
-                    lines.push(masked.trim_end());
-                    let n = lines.len();
-                    if n > 8 {
-                        lines.drain(0..n - 8);
+                if let Some(tx) = &line_tx {
+                    let _ = tx.send(masked.trim_end().to_string());
+                }
+                if let Some(prog) = &progress {
+                    if let Ok(mut p) = prog.lock() {
+                        let mut lines: Vec<&str> = p.lines().collect();
+                        lines.push(masked.trim_end());
+                        let n = lines.len();
+                        if n > 8 {
+                            lines.drain(0..n - 8);
+                        }
+                        *p = lines.join("\n");
                     }
-                    *p = lines.join("\n");
                 }
             }
         }
@@ -453,15 +506,16 @@ fn run_clone(
     let output = reader.join().unwrap_or_default();
 
     if status.success() {
-        Ok(String::new())
+        Ok(output)
     } else {
         let tail: Vec<&str> = output.lines().rev().take(8).collect();
         let tail = tail.into_iter().rev().collect::<Vec<_>>().join("\n");
         Err(format!(
-            "git clone 失败（退出码 {}）:\n{}",
+            "git {} 失败（退出码 {}）:\n{}",
+            args.first().copied().unwrap_or("?"),
             status.code().unwrap_or(-1),
             if tail.is_empty() {
-                "无输出（请检查网络 / 地址 / 账号密码）".to_string()
+                no_output_hint.to_string()
             } else {
                 tail
             }
@@ -607,6 +661,77 @@ mod tests {
             "",
         );
         assert!(res.is_err());
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn run_pull_picks_up_new_commits_and_rejects_diverged() {
+        // 本机无 git 时跳过
+        if std::process::Command::new("git").arg("--version").output().is_err() {
+            return;
+        }
+        let base = std::env::temp_dir().join(format!("rbs_pull_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+
+        // 构造源仓库
+        let src = base.join("src-repo");
+        std::fs::create_dir_all(&src).unwrap();
+        let git = |args: &[&str], cwd: &Path| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?} 失败: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-b", "main"], &src);
+        std::fs::write(src.join("a.txt"), "1").unwrap();
+        git(&["add", "."], &src);
+        git(&["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-m", "init"], &src);
+
+        // clone 到工作目录
+        let work = base.join("work");
+        let res = run_clone(
+            "git",
+            src.to_str().unwrap(),
+            work.to_str().unwrap(),
+            "main",
+            Arc::new(Mutex::new(String::new())),
+            "",
+        );
+        assert!(res.is_ok(), "clone 应成功: {res:?}");
+
+        // 远端新提交 → pull 拿到（fast-forward，无需 merge 身份配置）
+        std::fs::write(src.join("b.txt"), "2").unwrap();
+        git(&["add", "."], &src);
+        git(&["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-m", "second"], &src);
+        let (line_tx, line_rx) = std::sync::mpsc::channel();
+        let res = run_pull("git", &work, line_tx);
+        assert!(res.is_ok(), "pull 应成功: {res:?}");
+        assert!(work.join("b.txt").exists());
+        assert!(line_rx.try_recv().is_ok(), "pull 应有流式输出行");
+
+        // 非仓库目录 → pull 失败
+        let not_repo = base.join("not-repo");
+        std::fs::create_dir_all(&not_repo).unwrap();
+        let res = run_pull("git", &not_repo, std::sync::mpsc::channel().0);
+        assert!(res.is_err());
+
+        // 本地有分叉提交时 --ff-only 必须拒绝（不产生意外 merge）
+        std::fs::write(work.join("local.txt"), "x").unwrap();
+        git(&["add", "."], &work);
+        git(&["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-m", "local"], &work);
+        std::fs::write(src.join("c.txt"), "3").unwrap();
+        git(&["add", "."], &src);
+        git(&["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-m", "upstream"], &src);
+        let res = run_pull("git", &work, std::sync::mpsc::channel().0);
+        assert!(res.is_err(), "分叉时 --ff-only 应失败: {res:?}");
 
         let _ = std::fs::remove_dir_all(&base);
     }

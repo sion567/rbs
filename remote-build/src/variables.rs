@@ -4,13 +4,43 @@
 //! - `${{ variables.X }}`  → project.variables[environment] 的环境变量表
 //! - `${{ env.X }}`        → 步骤产出 / Target / Tool / Step 注入的全局 env
 //! - `${{ targets.<名>.<字段> }}` → target 配置字段（host/port/user/...）
+//! - `${{ now }}` 等内置变量 → 引擎侧生成的运行时刻（一次运行所有步骤同值）
+//! - `${{ run.id }}`       → 本次运行唯一标识（与控制台日志文件同名）
 //! - `${VAR}`              → 合并变量表后兜底到系统环境变量（兼容 shell 习惯）
 //!
 //! 解析时机：执行前一次性替换（§6.3），命令字符串可预览、可日志、可审计。
 //! 未解析到的占位符原样保留，便于用户发现拼写错误。
 
 use crate::models::Target;
+use chrono::Local;
 use std::collections::HashMap;
+
+/// 内置时间变量：运行启动时生成一次，整个运行期间所有步骤同值
+/// （备份后缀等场景要求同一次发版里各步骤引用一致）。
+#[derive(Debug, Clone, Default)]
+pub struct BuiltinNow {
+    /// ${{ now }} → 20261023153045
+    pub full: String,
+    /// ${{ now.date }} → 20261023
+    pub date: String,
+    /// ${{ now.time }} → 153045
+    pub time: String,
+    /// ${{ now.iso }} → 2026-10-23 15:30:45
+    pub iso: String,
+}
+
+impl BuiltinNow {
+    /// 以当前本地时刻生成（时区 = 发版机；要以服务器时间为准请在远端命令里用 $(date …)）
+    pub fn generate() -> Self {
+        let n = Local::now();
+        Self {
+            full: n.format("%Y%m%d%H%M%S").to_string(),
+            date: n.format("%Y%m%d").to_string(),
+            time: n.format("%H%M%S").to_string(),
+            iso: n.format("%Y-%m-%d %H:%M:%S").to_string(),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct VarContext {
@@ -20,6 +50,10 @@ pub struct VarContext {
     pub env: HashMap<String, String>,
     /// ${{ targets.<name>.<field> }}
     pub targets: HashMap<String, Target>,
+    /// 本次运行唯一标识（与日志文件同名）— ${{ run.id }}；None 时占位符原样保留
+    pub run_id: Option<String>,
+    /// 内置时间变量（引擎构建上下文时生成一次）
+    pub now: BuiltinNow,
 }
 
 /// 一次性替换输入串中的所有占位符
@@ -62,6 +96,12 @@ fn lookup_double(expr: &str, ctx: &VarContext) -> Option<String> {
         ["variables", key] => ctx.variables.get(*key).cloned(),
         ["env", key] => ctx.env.get(*key).cloned(),
         ["targets", name, field] => lookup_target_field(name, field, ctx),
+        // 内置变量：运行启动时刻（VarContext 构建时冻结，整个运行期间一致）
+        ["now"] => Some(ctx.now.full.clone()),
+        ["now", "date"] => Some(ctx.now.date.clone()),
+        ["now", "time"] => Some(ctx.now.time.clone()),
+        ["now", "iso"] => Some(ctx.now.iso.clone()),
+        ["run", "id"] => ctx.run_id.clone(),
         _ => None,
     }
 }
@@ -220,7 +260,33 @@ mod tests {
                 cred_key: None,
             },
         );
-        VarContext { variables, env, targets }
+        VarContext { variables, env, targets, run_id: None, now: BuiltinNow::generate() }
+    }
+
+    #[test]
+    fn builtin_now_formats() {
+        let c = ctx();
+        assert_eq!(resolve("${{ now }}", &c).len(), 14, "now 应为 yyyyMMddHHmmss");
+        assert!(resolve("${{ now }}", &c).chars().all(|ch| ch.is_ascii_digit()));
+        assert_eq!(resolve("${{ now.date }}", &c).len(), 8);
+        assert_eq!(resolve("${{ now.time }}", &c).len(), 6);
+        let iso = resolve("${{ now.iso }}", &c);
+        assert_eq!(iso.len(), 19);
+        assert!(chrono::NaiveDateTime::parse_from_str(&iso, "%Y-%m-%d %H:%M:%S").is_ok());
+        // 同一上下文内多次取值一致（冻结语义）
+        assert_eq!(resolve("${{ now }}", &c), resolve("${{ now }}", &c));
+        // 未知子字段原样保留
+        assert_eq!(resolve("${{ now.typo }}", &c), "${{ now.typo }}");
+    }
+
+    #[test]
+    fn builtin_run_id() {
+        let mut c = ctx();
+        assert_eq!(resolve("${{ run.id }}", &c), "${{ run.id }}", "未设置时原样保留");
+        c.run_id = Some("payment-service-20261023-153045".to_string());
+        assert_eq!(resolve("echo ${{ run.id }}", &c), "echo payment-service-20261023-153045");
+        // 与条件表达式兼容（非空检查）
+        assert_eq!(eval_condition("${{ run.id != '' }}", &c), Some(true));
     }
 
     #[test]

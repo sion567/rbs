@@ -113,6 +113,20 @@ pub fn show(main: &mut MainState, ui: &mut egui::Ui) {
                                 main.start_run(0, None);
                                 ui.close();
                             }
+                            if ui
+                                .add_enabled(
+                                    !main.run_active() && main.pull_done.is_none(),
+                                    egui::Button::new("⟳ 更新代码"),
+                                )
+                                .on_hover_text(
+                                    "对项目代码目录执行 git pull --ff-only\n\
+                                     （远端分叉 / 本地冲突会报错，不覆盖本地修改）",
+                                )
+                                .clicked()
+                            {
+                                main.pull_project_code(pi);
+                                ui.close();
+                            }
                             if ui.button("✏ 改名").clicked() {
                                 main.tree_rename_buf = label.clone();
                                 main.tree_rename = Some(TreeRenameTarget::Job(pi, ji));

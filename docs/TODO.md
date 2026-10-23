@@ -34,3 +34,54 @@
   上传 / 下载更合理的是**空闲超时**（N 秒无任何输出 / 进度才判失败），而非总时长。
 - 短期缓解（不改代码）：容易慢的步骤在 build.yaml 显式配大 `timeout:`（如 1800）；
   `wait` 步骤受同一总时长管，轮询探测别配太长的总时限。
+
+## Ansible 功能参考（待规划）
+
+> 背景：项目形态与 Ansible 同构——build.yaml ≈ playbook、targets ≈ inventory、
+> ${{ }} 变量 ≈ Jinja2、exec/upload/pack 步骤 ≈ 模块。以下按性价比排序，
+> 只抄单人桌面场景用得上的，不抄集群编排（forks 并行、roles/collection 生态、期望状态模块体系）。
+
+### 1. 条件跳过：`when` / `creates`（优先，成本低，收益最大）
+
+- 现状：步骤纯命令式，一条流程重跑就是全部重来。
+- `creates:`：步骤声明一个本地/远端路径，路径已存在则跳过。
+  例：「拉依赖」creates `node_modules`、「编译」creates `target/*.jar`，重跑时秒过。
+- `when:`：条件表达式为假则跳过。例：`when: ${{ variables.ENV }} == prod`，
+  生产专属步骤与通用流程合到一个 job，不必拆两份 build.yaml。
+- 改动点集中在 `engine.rs` 执行循环（步骤执行前判断）。
+
+### 2. check mode 干跑预览
+
+- 参照 `ansible-playbook --check --diff`：只展示将要做什么，不真执行。
+- GUI 加「预览」按钮：展示变量全量解析后的最终命令、待上传文件列表、将跳过的步骤。
+- 变量系统已全量解析，实现只是"把执行换成展示"；顺带当变量拼错检查器用。
+
+### 3. handlers + notify（变更才触发）
+
+- 参照 Ansible「改了配置才 notify 重启服务」：play 结尾统一执行被通知到的 handler。
+- 映射到本项目：**只有这次真的传了新 artifact，才执行远端重启脚本**——
+  artifact 没变就跳过重启，避免每次跑流程都打断线上服务。
+
+### 4. block / rescue / always（try-catch-finally）
+
+- 一组步骤声明"失败走 rescue 分支，无论成败 always 都执行"。
+- 映射到本项目：上传前备份旧包、失败回滚、无论如何删远端临时目录等**清理步骤**。
+- 与 P1 已排的 job 级 `on_failure` 是一家人，适合一起设计；
+  前置依赖：先解决上面"问题 1"孤儿进程问题。
+
+### 5. 步骤 tags 子集执行
+
+- 参照 `--tags deploy` 只跑带标签的步骤；job 越长（build→pack→upload→远端发布），
+  "只重跑后半段"越是高频需求。与 `creates` 粒度互补（tags 粗、按段；creates 细、按状态）。
+
+### 6. 变量默认值语法
+
+- 参照 Jinja2 `{{ var | default('x') }}`；现在 ${{ variables.X }} 未定义直接报错。
+- 加 `${{ variables.X || 默认值 }}` 之类语法，共享 build.yaml 模板跨项目复用性更好。
+- 改动点：`variables.rs` 解析器。
+
+### 7. facts 缓存（优先级低）
+
+- 参照 gather_facts + fact cache：对 target 探测远端信息（java 版本、磁盘剩余），
+  缓存后供变量与条件引用，如 `when: disk_free > 1G` 的部署前守卫。
+- 本机首启环境探测已有，此项是其远端版。

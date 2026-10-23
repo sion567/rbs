@@ -136,6 +136,10 @@ pub struct MainState {
     pub run_job: Option<(String, String)>,
     /// 运行作业各步骤是否为 wait 类型（轮询期间该步骤显示黄色等待态）
     pub run_step_wait: Vec<bool>,
+    /// 「⟳ 更新代码」任务的流式输出（git 进度行，后台线程 → UI 控制台）
+    pub pull_lines: Option<std_mpsc::Receiver<String>>,
+    /// 「⟳ 更新代码」任务完成信号（Ok = 项目名，Err = 错误详情）
+    pub pull_done: Option<std_mpsc::Receiver<Result<String, String>>>,
 }
 
 pub struct RunHandle {
@@ -175,6 +179,8 @@ impl MainState {
             run_steps: Vec::new(),
             run_job: None,
             run_step_wait: Vec::new(),
+            pull_lines: None,
+            pull_done: None,
         };
         s.reload();
         s
@@ -244,6 +250,7 @@ impl MainState {
             self.theme_applied = true;
         }
         self.drain_events();
+        self.drain_pull();
 
         // ── 工具栏 ──────────────────────────────────────────────────
         egui::Panel::top("toolbar").show(ui, |ui| {
@@ -317,9 +324,103 @@ impl MainState {
         ui::job_editor::show_new_job_window(&ctx, self);
         ui::job_editor::show_var_help_window(&ctx, self);
 
-        // 运行中保持帧率：日志流畅上屏 + 蓝黄光圈 1Hz 呼吸动画
+        // 运行中保持帧率：日志流畅上屏 + 蓝黄光圈 1Hz 呼吸动画；更新代码中保持进度上屏
         if running {
             ctx.request_repaint_after(Duration::from_millis(50));
+        } else if self.pull_done.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(150));
+        }
+    }
+
+    /// 项目树「⟳ 更新代码」：对项目代码目录（local_path）后台执行 git pull --ff-only，
+    /// 输出流式进控制台。与作业运行互斥；本地目录模式 / 缺 .git 的项目直接提示不可用。
+    pub fn pull_project_code(&mut self, pi: usize) {
+        if self.pull_done.is_some() {
+            self.status_msg = Some("⚠ 已有更新任务进行中".to_string());
+            return;
+        }
+        if self.run_active() {
+            self.status_msg = Some("⚠ 有作业运行中，先 ⏹ Stop 再更新代码".to_string());
+            return;
+        }
+        let Some(entry) = self.projects.get(pi) else { return };
+        let name = entry.project.name.clone();
+        let dir = entry.project.local_path.trim().to_string();
+        let dir_path = std::path::PathBuf::from(&dir);
+        if dir.is_empty() {
+            self.status_msg = Some(format!("⚠ 项目「{name}」未配置代码目录（项目目录）"));
+            return;
+        }
+        if !dir_path.is_dir() {
+            self.status_msg = Some(format!("⚠ 代码目录不存在: {dir}"));
+            return;
+        }
+        if !dir_path.join(".git").exists() {
+            self.status_msg =
+                Some(format!("⚠ {dir} 不是 Git 仓库（本地目录模式），无法自动更新"));
+            return;
+        }
+        // git 优先用 tools.yaml 里探测到的，否则回退 PATH（与 clone 同一策略）
+        let git_cmd = self
+            .tools
+            .get("git")
+            .map(|t| t.command.clone())
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "git".to_string());
+
+        let (line_tx, line_rx) = std_mpsc::channel::<String>();
+        let (done_tx, done_rx) = std_mpsc::channel::<Result<String, String>>();
+        self.pull_lines = Some(line_rx);
+        self.pull_done = Some(done_rx);
+        self.console.push_line(
+            format!("==== 更新代码: {name} ({dir}) ===="),
+            crate::ui::console::Role::Info,
+        );
+        self.status_msg = Some(format!("正在更新代码: {name}…"));
+
+        std::thread::spawn(move || {
+            let res = crate::ui::new_project::run_pull(&git_cmd, &dir_path, line_tx);
+            let _ = done_tx.send(res.map(|_| name));
+        });
+    }
+
+    /// 「⟳ 更新代码」后台输出 → 控制台；完成信号 → 控制台收尾行 + 状态栏
+    fn drain_pull(&mut self) {
+        if let Some(rx) = &self.pull_lines {
+            while let Ok(line) = rx.try_recv() {
+                self.console.push_line(line, crate::ui::console::Role::Stdout);
+            }
+        }
+        let mut finished = None;
+        if let Some(rx) = &self.pull_done {
+            match rx.try_recv() {
+                Ok(res) => finished = Some(res),
+                Err(std_mpsc::TryRecvError::Disconnected) => {
+                    finished = Some(Err("更新任务异常终止".to_string()));
+                }
+                Err(std_mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        if let Some(res) = finished {
+            self.pull_lines = None;
+            self.pull_done = None;
+            match res {
+                Ok(name) => {
+                    self.console.push_line(
+                        format!("==== 「{name}」代码已更新 ✔ ===="),
+                        crate::ui::console::Role::Ok,
+                    );
+                    self.status_msg = Some(format!("「{name}」代码已更新 ✔"));
+                }
+                Err(e) => {
+                    for line in e.lines() {
+                        self.console
+                            .push_line(line.to_string(), crate::ui::console::Role::Error);
+                    }
+                    let first = e.lines().next().unwrap_or("").to_string();
+                    self.status_msg = Some(format!("更新代码失败 ❌ {first}"));
+                }
+            }
         }
     }
 
@@ -418,6 +519,11 @@ impl MainState {
         if self.run_active() {
             return;
         }
+        // 与「⟳ 更新代码」互斥：git 改文件期间跑作业会读到半新半旧的代码
+        if self.pull_done.is_some() {
+            self.status_msg = Some("⚠ 正在更新代码，请稍候再运行".to_string());
+            return;
+        }
         let (pi, ji) = match (self.selected_project, self.selected_job) {
             (Some(a), Some(b)) => (a, b),
             _ => return,
@@ -453,6 +559,9 @@ impl MainState {
         let (std_tx, std_rx) = std_mpsc::channel();
 
         let engine = crate::engine::Engine;
+        // 运行唯一标识：与日志文件同名，引擎经 ${{ run.id }} 透出给步骤命令
+        let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+        let run_id = format!("{}-{}", project.name, stamp);
         let input = crate::engine::RunInput {
             project: project.clone(),
             job,
@@ -460,13 +569,12 @@ impl MainState {
             all_targets: effective,
             from_step,
             only_step,
+            run_id: run_id.clone(),
         };
 
         // 日志文件（§11：日志原文落文件，SQLite 只存路径——P1）
         let log_dir = crate::config::logs_dir().join(&project.name);
         let _ = std::fs::create_dir_all(&log_dir);
-        let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
-        let run_id = format!("{}-{}", project.name, stamp);
         let log_path = log_dir.join(format!("{run_id}.log"));
 
         let started = Instant::now();

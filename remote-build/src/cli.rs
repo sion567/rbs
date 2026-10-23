@@ -94,8 +94,8 @@ fn test_conn(args: &[String]) {
         format!("（{owner}）")
     };
     println!("测试连接 {name}{owner_note} ...");
-    match crate::transport::putty::test_connection(&t) {
-        Ok(msg) => println!("✅ {msg}"),
+    match crate::transport::putty::probe_server(&t) {
+        Ok((info, elapsed)) => println!("✅ {}", info.display(elapsed)),
         Err(e) => {
             eprintln!("❌ {e}");
             std::process::exit(1);
@@ -159,6 +159,11 @@ fn run(args: &[String]) {
 
     let (_cancel_tx, cancel_rx) = broadcast::channel(4);
     let engine = Engine;
+    let run_id = format!(
+        "{}-{}",
+        entry.project.name,
+        chrono::Local::now().format("%Y%m%d-%H%M%S")
+    );
     let input = RunInput {
         project: entry.project.clone(),
         job: je.job.clone(),
@@ -166,6 +171,7 @@ fn run(args: &[String]) {
         all_targets,
         from_step: 0,
         only_step: None,
+        run_id,
     };
 
     let status = rt.block_on(engine.run_job(input, cancel_rx, tx));
