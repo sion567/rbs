@@ -26,7 +26,8 @@ impl FirstRunPage {
     }
 
     /// 渲染引导页；用户点击「初始化并进入」后 confirmed() 变为 true
-    pub fn show(&mut self, ctx: &egui::Context) {
+    pub fn show(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
         // 接收后台探测结果
         if let Some(rx) = &self.report_rx {
             match rx.try_recv() {
@@ -41,7 +42,7 @@ impl FirstRunPage {
             }
         }
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| {
             ui.add_space(24.0);
             ui.vertical_centered(|ui| {
                 ui.heading("Remote Build System — 首次启动");

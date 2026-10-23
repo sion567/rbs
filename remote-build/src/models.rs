@@ -9,7 +9,7 @@ use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashMap;
 
-/// serde_yaml 0.9 对 derive 枚举会输出 YAML tag（如 `!exec`），而文档约定 YAML 使用
+/// yaml_serde（serde_yaml 后继，YAML 官方组织维护）对 derive 枚举会输出 YAML tag（如 `!exec`），而文档约定 YAML 使用
 /// 纯字符串值（`step_type: exec`）。此宏生成与 `#[serde(rename_all = "kebab-case")]`
 /// 等价的手写实现：序列化为字符串、从字符串解析，字面量即 kebab-case 值。
 macro_rules! kebab_string_enum {
@@ -269,7 +269,7 @@ pub enum TargetType {
     /// YAML 双形态：
     ///   target_type: { ssh: { host: ..., port: ..., user: ..., auth: ... } }
     ///   target_type: local
-    /// serde_yaml 0.9 的 derive 枚举会输出 `!ssh` tag，与文档格式不符，故手写实现。
+    /// yaml_serde 的 derive 枚举会输出 `!ssh` tag，与文档格式不符，故手写实现。
     Ssh {
         host: String,
         port: u16,
@@ -366,15 +366,15 @@ impl serde::Serialize for TargetType {
 
 impl<'de> Deserialize<'de> for TargetType {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let value = serde_yaml::Value::deserialize(deserializer)?;
+        let value = yaml_serde::Value::deserialize(deserializer)?;
         match value {
-            serde_yaml::Value::String(s) => match s.as_str() {
+            yaml_serde::Value::String(s) => match s.as_str() {
                 "local" => Ok(TargetType::Local),
                 other => Err(serde::de::Error::custom(format!(
                     "未知 target_type: {other}（期望 ssh / kubernetes / local）"
                 ))),
             },
-            serde_yaml::Value::Mapping(m) => {
+            yaml_serde::Value::Mapping(m) => {
                 if m.len() != 1 {
                     return Err(serde::de::Error::custom(
                         "target_type 映射只允许一个键（ssh / kubernetes）",
@@ -387,7 +387,7 @@ impl<'de> Deserialize<'de> for TargetType {
                 match key {
                     "ssh" => {
                         let f: SshTargetFields =
-                            serde_yaml::from_value(v).map_err(serde::de::Error::custom)?;
+                            yaml_serde::from_value(v).map_err(serde::de::Error::custom)?;
                         Ok(TargetType::Ssh {
                             host: f.host,
                             port: f.port,
@@ -398,7 +398,7 @@ impl<'de> Deserialize<'de> for TargetType {
                     }
                     "kubernetes" => {
                         let f: KubernetesTargetFields =
-                            serde_yaml::from_value(v).map_err(serde::de::Error::custom)?;
+                            yaml_serde::from_value(v).map_err(serde::de::Error::custom)?;
                         Ok(TargetType::Kubernetes {
                             kubeconfig: f.kubeconfig,
                             context: f.context,
@@ -460,10 +460,10 @@ impl serde::Serialize for AuthMethod {
 
 impl<'de> Deserialize<'de> for AuthMethod {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let value = serde_yaml::Value::deserialize(deserializer)?;
+        let value = yaml_serde::Value::deserialize(deserializer)?;
         match value {
-            serde_yaml::Value::Null => Ok(AuthMethod::None),
-            serde_yaml::Value::String(s) => match s.as_str() {
+            yaml_serde::Value::Null => Ok(AuthMethod::None),
+            yaml_serde::Value::String(s) => match s.as_str() {
                 // password 简写合法：密码值存 Credential Manager（按目标名），YAML 里不带值
                 "agent" => Ok(AuthMethod::Agent),
                 "none" => Ok(AuthMethod::None),
@@ -472,7 +472,7 @@ impl<'de> Deserialize<'de> for AuthMethod {
                     "未知 auth: {other}（期望 key / password / agent / none）"
                 ))),
             },
-            serde_yaml::Value::Mapping(m) => {
+            yaml_serde::Value::Mapping(m) => {
                 if m.len() != 1 {
                     return Err(serde::de::Error::custom("auth 映射只允许一个键（key / password）"));
                 }
@@ -482,12 +482,12 @@ impl<'de> Deserialize<'de> for AuthMethod {
                     .ok_or_else(|| serde::de::Error::custom("auth 键必须是字符串"))?;
                 match key {
                     "key" => {
-                        let f: KeyAuthFields = serde_yaml::from_value(v).map_err(serde::de::Error::custom)?;
+                        let f: KeyAuthFields = yaml_serde::from_value(v).map_err(serde::de::Error::custom)?;
                         Ok(AuthMethod::Key { path: f.path })
                     }
                     "password" => {
                         let f: PasswordAuthFields =
-                            serde_yaml::from_value(v).map_err(serde::de::Error::custom)?;
+                            yaml_serde::from_value(v).map_err(serde::de::Error::custom)?;
                         Ok(AuthMethod::Password { encrypted: f.encrypted })
                     }
                     other => Err(serde::de::Error::custom(format!(
@@ -686,7 +686,7 @@ targets:
         auth: password
 env_file: null
 "#;
-        let p: Project = serde_yaml::from_str(yaml).unwrap();
+        let p: Project = yaml_serde::from_str(yaml).unwrap();
         assert_eq!(p.name, "payment-service");
         assert_eq!(
             p.variables["staging"].vars["REGISTRY"],
@@ -695,23 +695,23 @@ env_file: null
         assert_eq!(p.variables["prod"].vars["NAMESPACE"], "production");
 
         // 反序列化后再序列化仍是无 vars 包装层的形态
-        let out = serde_yaml::to_string(&p).unwrap();
+        let out = yaml_serde::to_string(&p).unwrap();
         assert!(!out.contains("vars:"), "flatten 后不应出现 vars: 包装层");
     }
 
     #[test]
     fn step_type_kebab_case() {
         // K8sApply ↔ k8s-apply（v0.4 §3.3）
-        let s: StepType = serde_yaml::from_str("k8s-apply").unwrap();
+        let s: StepType = yaml_serde::from_str("k8s-apply").unwrap();
         assert!(matches!(s, StepType::K8sApply));
-        assert_eq!(serde_yaml::to_string(&s).unwrap().trim(), "k8s-apply");
+        assert_eq!(yaml_serde::to_string(&s).unwrap().trim(), "k8s-apply");
 
         for (raw, expected) in [
             ("exec", StepType::Exec),
             ("wait", StepType::Wait),
             ("upload", StepType::Upload),
         ] {
-            let s: StepType = serde_yaml::from_str(raw).unwrap();
+            let s: StepType = yaml_serde::from_str(raw).unwrap();
             assert!(std::mem::discriminant(&s) == std::mem::discriminant(&expected));
         }
 
@@ -720,20 +720,20 @@ env_file: null
         struct Wrap {
             step_type: StepType,
         }
-        let yaml = serde_yaml::to_string(&Wrap { step_type: StepType::Exec }).unwrap();
+        let yaml = yaml_serde::to_string(&Wrap { step_type: StepType::Exec }).unwrap();
         assert_eq!(yaml.trim(), "step_type: exec");
     }
 
     #[test]
     fn failure_action_kebab_case() {
-        let f: FailureAction = serde_yaml::from_str("stop").unwrap();
+        let f: FailureAction = yaml_serde::from_str("stop").unwrap();
         assert!(matches!(f, FailureAction::Stop));
-        let f: FailureAction = serde_yaml::from_str("continue").unwrap();
+        let f: FailureAction = yaml_serde::from_str("continue").unwrap();
         assert!(matches!(f, FailureAction::Continue));
-        assert_eq!(serde_yaml::to_string(&FailureAction::Retry).unwrap().trim(), "retry");
+        assert_eq!(yaml_serde::to_string(&FailureAction::Retry).unwrap().trim(), "retry");
 
         // 未知值给出可读错误
-        let err = serde_yaml::from_str::<FailureAction>("halt").unwrap_err();
+        let err = yaml_serde::from_str::<FailureAction>("halt").unwrap_err();
         assert!(err.to_string().contains("halt"));
     }
 
@@ -756,7 +756,7 @@ steps:
     step_type: exec
     enabled: true
 "#;
-        let j: Job = serde_yaml::from_str(yaml).unwrap();
+        let j: Job = yaml_serde::from_str(yaml).unwrap();
         assert_eq!(j.steps.len(), 1);
         assert!(matches!(j.steps[0].step_type, StepType::Exec));
         assert!(j.steps[0].enabled);
@@ -797,7 +797,7 @@ targets:
     name: local
     target_type: local
 "#;
-        let p: Project = serde_yaml::from_str(yaml).unwrap();
+        let p: Project = yaml_serde::from_str(yaml).unwrap();
         let targets = &p.targets;
         let ssh = &targets["build-server-01"];
         match &ssh.target_type {
@@ -821,11 +821,11 @@ targets:
         assert!(matches!(targets["local"].target_type, TargetType::Local));
 
         // unit variant 序列化为字符串 local
-        let s = serde_yaml::to_string(&TargetType::Local).unwrap();
+        let s = yaml_serde::to_string(&TargetType::Local).unwrap();
         assert_eq!(s.trim(), "local");
 
         // ssh 变体序列化回映射形态（无 YAML tag）
-        let yaml = serde_yaml::to_string(&ssh.target_type).unwrap();
+        let yaml = yaml_serde::to_string(&ssh.target_type).unwrap();
         assert!(yaml.contains("ssh:"), "应序列化为 ssh 键映射，实际: {yaml}");
         assert!(!yaml.contains('!'), "不应出现 YAML tag，实际: {yaml}");
     }
@@ -833,12 +833,12 @@ targets:
     #[test]
     fn global_config_defaults_and_roundtrip() {
         let yaml = "theme: dark";
-        let g: GlobalConfig = serde_yaml::from_str(yaml).unwrap();
+        let g: GlobalConfig = yaml_serde::from_str(yaml).unwrap();
         assert!(matches!(g.theme, Theme::Dark));
         assert!(g.putty.use_builtin, "默认用内置 putty");
 
         // 缺字段时用 Default
-        let g: GlobalConfig = serde_yaml::from_str("{}").unwrap();
+        let g: GlobalConfig = yaml_serde::from_str("{}").unwrap();
         assert_eq!(g.max_concurrent_jobs, 3);
     }
 

@@ -92,6 +92,7 @@ pub fn show(ctx: &egui::Context, main: &mut MainState) {
 
     egui::Window::new("＋ 新建项目")
         .open(&mut open)
+        .order(egui::Order::Tooltip)
         .default_width(600.0)
         .show(ctx, |ui| {
             // 来源选择
@@ -157,7 +158,7 @@ pub fn show(ctx: &egui::Context, main: &mut MainState) {
                     if !text.is_empty() {
                         ui.add_space(4.0);
                         egui::ScrollArea::vertical()
-                            .id_source("clone_progress")
+                            .id_salt("clone_progress")
                             .max_height(80.0)
                             .stick_to_bottom(true)
                             .show(ui, |ui| {
@@ -167,7 +168,6 @@ pub fn show(ctx: &egui::Context, main: &mut MainState) {
                 }
             }
         });
-    crate::ui::raise_above_backdrop(ctx, "＋ 新建项目");
     main.new_project.open = open;
 
     if busy {

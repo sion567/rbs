@@ -10,14 +10,15 @@ resources = ["tools/", "config/"]
 [dependencies]
 # wgpu 渲染后端：glow 在 RDP/远程会话下只有 GDI OpenGL 1.1，无法满足 GL2 要求；
 # wgpu 走 DX12/Vulkan，远程桌面可用
-eframe = { version = "0.27", default-features = false, features = [
+eframe = { version = "0.37", default-features = false, features = [
     "accesskit",
     "default_fonts",
     "wgpu",
 ] }
-egui = "0.27"
+egui = { version = "0.37", features = ["monochrome_emoji_fonts"] }  # 0.37 起 emoji 字体（图标字符）默认不打包，需显式开启
+egui-wgpu = "0.37"               # 与 eframe 内部同版本；用于锁定渲染后端（见 main.rs）
 serde = { version = "1.0", features = ["derive"] }
-serde_yaml = "0.9"
+yaml_serde = "0.10"                      # serde_yaml 的正统后继（YAML 官方组织维护）；serde_yml 已废弃勿用
 tokio = { version = "1", features = ["full"] }
 async-trait = "0.1"
 thiserror = "1.0"

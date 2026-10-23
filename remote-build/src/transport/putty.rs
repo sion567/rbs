@@ -658,6 +658,10 @@ mod tests {
         }
         let d = detect_putty_tools();
         assert!(d.found, "捆绑了 PuTTY 时必须能探测到");
-        assert_eq!(d.source, "builtin");
+        // config.yaml 配了 putty.custom_path 时自定义目录按设计优先（source=custom）；
+        // 未配置时必须命中内置目录
+        if d.source != "custom" {
+            assert_eq!(d.source, "builtin");
+        }
     }
 }

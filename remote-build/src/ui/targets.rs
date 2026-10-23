@@ -92,6 +92,7 @@ pub fn show(ctx: &egui::Context, main: &mut MainState) {
     }
     egui::Window::new("🎯 目标管理")
         .open(&mut open)
+        .order(egui::Order::Tooltip)
         .default_width(720.0)
         .default_height(560.0)
         .show(ctx, |ui| {
@@ -114,7 +115,6 @@ pub fn show(ctx: &egui::Context, main: &mut MainState) {
                 ui.weak("请先在左侧选择一个项目。");
             }
         });
-    crate::ui::raise_above_backdrop(ctx, "🎯 目标管理");
     main.target_editor.open = open;
 
     if main.target_editor.test_rx.is_some() {
@@ -135,7 +135,7 @@ fn target_list_and_form(ui: &mut egui::Ui, main: &mut MainState) {
     ui.columns(2, |columns| {
         columns[0].set_min_width(170.0);
         egui::ScrollArea::vertical()
-            .id_source("target_list")
+            .id_salt("target_list")
             .max_height(280.0)
             .show(&mut columns[0], |ui| {
                 for name in &names {
@@ -152,7 +152,7 @@ fn target_list_and_form(ui: &mut egui::Ui, main: &mut MainState) {
             });
 
         egui::ScrollArea::vertical()
-            .id_source("target_form")
+            .id_salt("target_form")
             .max_height(280.0)
             .show(&mut columns[1], |ui| {
                 edit_form(ui, main);
@@ -291,7 +291,7 @@ fn edit_form(ui: &mut egui::Ui, main: &mut MainState) {
             ui.label("类型:");
             let k_idx = main.target_editor.kind_idx;
             let mut new_k = k_idx;
-            egui::ComboBox::from_id_source("target_kind_combo")
+            egui::ComboBox::from_id_salt("target_kind_combo")
                 .selected_text(KINDS[k_idx])
                 .width(220.0)
                 .show_ui(ui, |ui| {
@@ -318,7 +318,7 @@ fn edit_form(ui: &mut egui::Ui, main: &mut MainState) {
                     ui.end_row();
 
                     ui.label("端口:");
-                    if ui.add(egui::DragValue::new(port).clamp_range(1..=65535)).changed() {
+                    if ui.add(egui::DragValue::new(port).range(1..=65535)).changed() {
                         main.target_editor.unsaved = true;
                     }
                     ui.end_row();
@@ -332,7 +332,7 @@ fn edit_form(ui: &mut egui::Ui, main: &mut MainState) {
                     ui.label("认证:");
                     let a_idx = main.target_editor.auth_idx;
                     let mut new_a = a_idx;
-                    egui::ComboBox::from_id_source("auth_combo")
+                    egui::ComboBox::from_id_salt("auth_combo")
                         .selected_text(AUTHS[a_idx])
                         .width(200.0)
                         .show_ui(ui, |ui| {

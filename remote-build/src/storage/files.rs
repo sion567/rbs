@@ -9,14 +9,14 @@ use std::path::{Path, PathBuf};
 pub fn load_yaml<T: DeserializeOwned>(path: &Path) -> Result<T> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("读取失败: {}", path.display()))?;
-    serde_yaml::from_str(&text).with_context(|| format!("YAML 解析失败: {}", path.display()))
+    yaml_serde::from_str(&text).with_context(|| format!("YAML 解析失败: {}", path.display()))
 }
 
 pub fn save_yaml<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let text = serde_yaml::to_string(value)?;
+    let text = yaml_serde::to_string(value)?;
     // 先写临时文件再改名，避免写一半崩溃留下残缺配置
     let tmp = path.with_extension("yaml.tmp");
     std::fs::write(&tmp, text)?;

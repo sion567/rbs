@@ -128,14 +128,14 @@ pub(crate) fn tab_row(ui: &mut egui::Ui, tabs: &[String], selected: usize, enabl
             } else {
                 text.color(ui.visuals().weak_text_color())
             };
-            let frame = egui::Frame::none()
+            let frame = egui::Frame::new()
                 .fill(if active {
                     ui.visuals().selection.bg_fill
                 } else {
                     egui::Color32::TRANSPARENT
                 })
-                .rounding(egui::Rounding { nw: 6.0, ne: 6.0, sw: 0.0, se: 0.0 })
-                .inner_margin(egui::Margin::symmetric(10.0, 4.0));
+                .corner_radius(egui::CornerRadius { nw: 6, ne: 6, sw: 0, se: 0 })
+                .inner_margin(egui::Margin::symmetric(10, 4));
             let inner = frame.show(ui, |ui| {
                 let r = if enabled[i] {
                     ui.add(egui::Label::new(text).sense(egui::Sense::click()))
@@ -194,6 +194,7 @@ pub fn show(ctx: &egui::Context, main: &mut MainState) {
     }
     egui::Window::new("⚙ 设置")
         .open(&mut open)
+        .order(egui::Order::Tooltip)
         .default_width(780.0)
         .default_height(560.0)
         .show(ctx, |ui| {
@@ -283,7 +284,6 @@ pub fn show(ctx: &egui::Context, main: &mut MainState) {
             }
         });
     // 每帧把窗口抬回遮罩之上（遮罩被点击/首帧会在这带内置顶）
-    crate::ui::raise_above_backdrop(ctx, "⚙ 设置");
     main.show_settings = open;
 
     if main.tool_editor.verify_rx.is_some() {
@@ -319,7 +319,7 @@ fn tool_editor(ui: &mut egui::Ui, main: &mut MainState) {
     ui.columns(2, |columns| {
         columns[0].set_min_width(160.0);
         egui::ScrollArea::vertical()
-            .id_source("tool_list")
+            .id_salt("tool_list")
             .max_height(240.0)
             .show(&mut columns[0], |ui| {
                 for name in &names {
@@ -337,7 +337,7 @@ fn tool_editor(ui: &mut egui::Ui, main: &mut MainState) {
             });
 
         egui::ScrollArea::vertical()
-            .id_source("tool_form")
+            .id_salt("tool_form")
             .max_height(240.0)
             .show(&mut columns[1], |ui| {
                 edit_form(ui, main);
@@ -367,7 +367,7 @@ fn tool_editor(ui: &mut egui::Ui, main: &mut MainState) {
         }
 
         // 常用工具预设：一键添加，免手写条目
-        egui::ComboBox::from_id_source("tool_preset_combo")
+        egui::ComboBox::from_id_salt("tool_preset_combo")
             .selected_text("＋ 常用工具…")
             .width(140.0)
             .show_ui(ui, |ui| {
@@ -379,9 +379,7 @@ fn tool_editor(ui: &mut egui::Ui, main: &mut MainState) {
                     } else {
                         egui::RichText::new(*name)
                     };
-                    if ui.add_enabled(!exists, egui::SelectableLabel::new(false, label)).clicked()
-                        && !exists
-                    {
+                    if ui.selectable_label(!exists, label).clicked() && !exists {
                         if let Some(map) = scope_map_mut(main) {
                             map.insert(
                                 name.to_string(),
@@ -532,7 +530,7 @@ fn edit_form(ui: &mut egui::Ui, main: &mut MainState) {
             ui.label("类型:");
             let t_idx = tool_type_index(&tool.tool_type);
             let mut new_idx = t_idx;
-            egui::ComboBox::from_id_source("tool_type_combo")
+            egui::ComboBox::from_id_salt("tool_type_combo")
                 .selected_text(TOOL_TYPES[t_idx])
                 .width(180.0)
                 .show_ui(ui, |ui| {
@@ -778,7 +776,7 @@ fn global_section(
                 crate::models::Theme::Dark => 1,
                 crate::models::Theme::System => 2,
             };
-            egui::ComboBox::from_id_source("theme_combo")
+            egui::ComboBox::from_id_salt("theme_combo")
                 .selected_text(theme_names[idx.min(1)])
                 .width(120.0)
                 .show_ui(ui, |ui| {

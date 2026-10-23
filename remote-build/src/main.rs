@@ -35,15 +35,23 @@ fn main() -> eframe::Result<()> {
             .expect("创建 tokio runtime 失败"),
     );
 
+    // 锁定 DX12 渲染后端：RDP 远程桌面（间接显示适配器）+ Intel 驱动下，
+    // wgpu 默认优先的 Vulkan 会延迟段错误（0.37 升级实测，DX12 原生/远程均稳定）
+    let mut wgpu_setup = egui_wgpu::WgpuSetupCreateNew::without_display_handle();
+    wgpu_setup.instance_descriptor.backends = egui_wgpu::wgpu::Backends::DX12;
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([1280.0, 800.0]),
+        wgpu_options: egui_wgpu::WgpuConfiguration {
+            wgpu_setup: egui_wgpu::WgpuSetup::CreateNew(wgpu_setup),
+            ..Default::default()
+        },
         ..Default::default()
     };
 
     eframe::run_native(
         "Remote Build System",
         options,
-        Box::new(move |cc| Box::new(app::RemoteBuildApp::new(cc, runtime.clone()))),
+        Box::new(move |cc| Ok(Box::new(app::RemoteBuildApp::new(cc, runtime.clone())))),
     )
 }
 

@@ -150,7 +150,7 @@ fn job_label(status: &JobStatus) -> String {
 }
 
 /// dark = 当前主题是否为暗色（由调用方按全局主题传入）
-pub fn show(console: &mut ConsoleState, ctx: &egui::Context, running: bool, dark: bool) {
+pub fn show(console: &mut ConsoleState, ui: &mut egui::Ui, running: bool, dark: bool) {
     // 控制台背景跟随主题，但两种主题下都保持"终端感"：
     // 深色主题深底、明亮主题浅底，日志配色各自调校
     let bg = if dark {
@@ -158,16 +158,16 @@ pub fn show(console: &mut ConsoleState, ctx: &egui::Context, running: bool, dark
     } else {
         Color32::from_rgb(250, 250, 250)
     };
-    egui::TopBottomPanel::bottom("console_panel")
+    egui::Panel::bottom("console_panel")
         .frame(
             egui::Frame::default()
                 .fill(bg)
-                .inner_margin(egui::Margin::same(6.0)),
+                .inner_margin(egui::Margin::same(6)),
         )
         .resizable(true)
-        .default_height(280.0)
-        .min_height(120.0)
-        .show(ctx, |ui| {
+        .default_size(280.0)
+        .min_size(120.0)
+        .show(ui, |ui| {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 ui.strong("控制台输出");
@@ -182,14 +182,14 @@ pub fn show(console: &mut ConsoleState, ctx: &egui::Context, running: bool, dark
                     }
                     if ui.button("📋 复制").clicked() {
                         let text = console.all_text();
-                        ui.output_mut(|o| o.copied_text = text);
+                        ui.ctx().copy_text(text);
                     }
                 });
             });
             ui.separator();
 
             egui::ScrollArea::vertical()
-                .id_source("console_scroll")
+                .id_salt("console_scroll")
                 .auto_shrink([false, false])
                 .stick_to_bottom(console.auto_scroll)
                 .show(ui, |ui| {
@@ -201,7 +201,7 @@ pub fn show(console: &mut ConsoleState, ctx: &egui::Context, running: bool, dark
                             egui::Label::new(
                                 RichText::new(&line.text).monospace().color(color),
                             )
-                            .wrap(true),
+                            .wrap(),
                         );
                     }
                 });

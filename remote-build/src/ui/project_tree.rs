@@ -92,16 +92,16 @@ pub fn show(main: &mut MainState, ui: &mut egui::Ui) {
                                 main.selected_project = Some(pi);
                                 main.selected_job = Some(ji);
                                 main.start_run(0, None);
-                                ui.close_menu();
+                                ui.close();
                             }
                             if ui.button("✏ 改名").clicked() {
                                 main.tree_rename_buf = label.clone();
                                 main.tree_rename = Some(TreeRenameTarget::Job(pi, ji));
-                                ui.close_menu();
+                                ui.close();
                             }
                             if ui.button("🗑 删除").clicked() {
                                 main.tree_delete = Some(TreeDeleteTarget::Job(pi, ji));
-                                ui.close_menu();
+                                ui.close();
                             }
                         });
                     }
@@ -119,11 +119,11 @@ pub fn show(main: &mut MainState, ui: &mut egui::Ui) {
                 if ui.button("✏ 改名").clicked() {
                     main.tree_rename_buf = main.projects[pi].project.name.clone();
                     main.tree_rename = Some(TreeRenameTarget::Project(pi));
-                    ui.close_menu();
+                    ui.close();
                 }
                 if ui.button("🗑 删除").clicked() {
                     main.tree_delete = Some(TreeDeleteTarget::Project(pi));
-                    ui.close_menu();
+                    ui.close();
                 }
             });
         }
@@ -144,6 +144,7 @@ fn confirm_delete_window(ctx: &egui::Context, main: &mut MainState) {
     let mut open = true;
     egui::Window::new("⚠ 确认删除")
         .open(&mut open)
+        .order(egui::Order::Tooltip)
         .collapsible(false)
         .resizable(false)
         .default_width(480.0)
@@ -194,7 +195,6 @@ fn confirm_delete_window(ctx: &egui::Context, main: &mut MainState) {
     if !open {
         main.tree_delete = None;
     }
-    crate::ui::raise_above_backdrop(ctx, "⚠ 确认删除");
 }
 
 // ---------------------------------------------------------------------------
@@ -209,6 +209,7 @@ fn rename_window(ctx: &egui::Context, main: &mut MainState) {
     let mut do_rename = false;
     egui::Window::new("✏ 改名")
         .open(&mut open)
+        .order(egui::Order::Tooltip)
         .collapsible(false)
         .resizable(false)
         .default_width(420.0)
@@ -243,7 +244,6 @@ fn rename_window(ctx: &egui::Context, main: &mut MainState) {
     if !open {
         main.tree_rename = None;
     }
-    crate::ui::raise_above_backdrop(ctx, "✏ 改名");
 }
 
 // ---------------------------------------------------------------------------

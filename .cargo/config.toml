@@ -1,0 +1,10 @@
+# 国内网络环境下使用 USTC 镜像加速 crates.io 下载
+# 如需恢复官方源，删除本文件即可
+[source.crates-io]
+replace-with = 'ustc'
+
+[source.ustc]
+registry = "sparse+https://mirrors.ustc.edu.cn/crates.io-index/"
+
+[net]
+git-fetch-with-cli = true

@@ -28,7 +28,10 @@ pub enum Page {
 
 impl RemoteBuildApp {
     pub fn new(cc: &eframe::CreationContext<'_>, runtime: Arc<tokio::runtime::Runtime>) -> Self {
-        load_cjk_font(&cc.egui_ctx);
+        // 排查开关：RBS_NO_CJK=1 跳过 CJK 字体加载（隔离字体/渲染层问题用）
+        if std::env::var("RBS_NO_CJK").unwrap_or_default() != "1" {
+            load_cjk_font(&cc.egui_ctx);
+        }
         if crate::config::is_first_run() {
             let page = Page::FirstRun(ui::first_run::FirstRunPage::new());
             Self { runtime, page }
@@ -40,10 +43,10 @@ impl RemoteBuildApp {
 }
 
 impl eframe::App for RemoteBuildApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         match &mut self.page {
             Page::FirstRun(page) => {
-                page.show(ctx);
+                page.show(ui);
                 if page.confirmed() {
                     if let Some(report) = page.report.clone() {
                         match crate::config::first_run_generate(&report) {
@@ -55,23 +58,27 @@ impl eframe::App for RemoteBuildApp {
                     }
                 }
             }
-            Page::Main(main) => main.show(ctx),
+            Page::Main(main) => main.show(ui),
         }
     }
 }
 
 /// 中文字体：egui 默认字体无 CJK 字形，加载微软雅黑（缺失时回退默认）
 fn load_cjk_font(ctx: &egui::Context) {
+    // 非 TTC 的 .ttf 优先：egui 0.37 新字体引擎解析 msyh.ttc 等 TrueType Collection
+    // 会直接段错误（升级实测），TTC 仅作最后兜底
     const CANDIDATES: &[&str] = &[
-        "C:/Windows/Fonts/msyh.ttc",
         "C:/Windows/Fonts/msyh.ttf",
+        "C:/Windows/Fonts/Deng.ttf",   // 等线，Win10/11 标配
         "C:/Windows/Fonts/simhei.ttf",
+        "C:/Windows/Fonts/DENG.TTF",
+        "C:/Windows/Fonts/msyh.ttc",
         "C:/Windows/Fonts/simsun.ttc",
     ];
     for path in CANDIDATES {
         if let Ok(bytes) = std::fs::read(path) {
             let mut fonts = egui::FontDefinitions::default();
-            fonts.font_data.insert("cjk".to_string(), egui::FontData::from_owned(bytes));
+            fonts.font_data.insert("cjk".to_string(), Arc::new(egui::FontData::from_owned(bytes)));
             fonts
                 .families
                 .entry(egui::FontFamily::Proportional)
@@ -218,16 +225,17 @@ impl MainState {
         };
     }
 
-    pub fn show(&mut self, ctx: &egui::Context) {
+    pub fn show(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
         // 主题首帧应用（此后设置页切换时即时应用）
         if !self.theme_applied {
-            apply_theme(ctx, &self.global.theme);
+            apply_theme(&ctx, &self.global.theme);
             self.theme_applied = true;
         }
         self.drain_events();
 
         // ── 工具栏 ──────────────────────────────────────────────────
-        egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
+        egui::Panel::top("toolbar").show(ui, |ui| {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 let running = self.run_active();
@@ -270,32 +278,32 @@ impl MainState {
         // ── 控制台（底部）────────────────────────────────────────────
         let running = self.run_active();
         let console_dark = !matches!(self.global.theme, crate::models::Theme::Light);
-        ui::console::show(&mut self.console, ctx, running, console_dark);
+        ui::console::show(&mut self.console, ui, running, console_dark);
 
         // ── 左侧项目树 ──────────────────────────────────────────────
-        egui::SidePanel::left("project_tree")
+        egui::Panel::left("project_tree")
             .resizable(true)
-            .default_width(220.0)
-            .show(ctx, |ui| {
+            .default_size(220.0)
+            .show(ui, |ui| {
                 ui.add_space(8.0);
                 ui::project_tree::show(self, ui);
             });
 
         // ── 中央步骤编辑器 ──────────────────────────────────────────
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| {
             ui::job_editor::show(self, ui);
         });
 
         if self.show_settings {
-            ui::settings::show(ctx, self);
+            ui::settings::show(&ctx, self);
         }
         if self.target_editor.open {
-            ui::targets::show(ctx, self);
+            ui::targets::show(&ctx, self);
         }
 
-        ui::new_project::show(ctx, self);
-        ui::job_editor::show_new_job_window(ctx, self);
-        ui::job_editor::show_var_help_window(ctx, self);
+        ui::new_project::show(&ctx, self);
+        ui::job_editor::show_new_job_window(&ctx, self);
+        ui::job_editor::show_var_help_window(&ctx, self);
 
         // 运行中保持帧率，让日志事件流畅上屏
         if running {

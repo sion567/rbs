@@ -162,7 +162,7 @@ pub fn show(main: &mut MainState, ui: &mut egui::Ui) {
              同一条流程换变量组即换一套参数（私服地址 / 部署目录等）。\n\
              注意：它不是 Spring profile 那样的运行环境；执行机器由「目标」决定。",
         );
-        egui::ComboBox::from_id_source("env_combo")
+        egui::ComboBox::from_id_salt("env_combo")
             .selected_text(job.environment.clone().unwrap_or_else(|| "无".to_string()))
             .width(140.0)
             .show_ui(ui, |ui| {
@@ -179,7 +179,7 @@ pub fn show(main: &mut MainState, ui: &mut egui::Ui) {
              下载(local) → 编译(local) → 上传(prod) → 发布(prod)。\n\
              local = 本机 cmd 执行；SSH 目标 = 远端 Linux（exec 经 plink、upload 经 pscp）。",
         );
-        egui::ComboBox::from_id_source("target_combo")
+        egui::ComboBox::from_id_salt("target_combo")
             .selected_text(job.target.clone().unwrap_or_else(|| "无".to_string()))
             .width(160.0)
             .show_ui(ui, |ui| {
@@ -200,7 +200,7 @@ pub fn show(main: &mut MainState, ui: &mut egui::Ui) {
             FailureAction::Continue => "continue",
             FailureAction::Retry => "retry",
         };
-        egui::ComboBox::from_id_source("on_failure_combo")
+        egui::ComboBox::from_id_salt("on_failure_combo")
             .selected_text(on_failure_label)
             .width(110.0)
             .show_ui(ui, |ui| {
@@ -254,7 +254,7 @@ pub fn show(main: &mut MainState, ui: &mut egui::Ui) {
     // ── 步骤列表 ─────────────────────────────────────────────────────
     let mut actions: Vec<StepAction> = Vec::new();
     egui::ScrollArea::vertical()
-        .id_source("steps_scroll")
+        .id_salt("steps_scroll")
         .auto_shrink([false, false])
         .show(ui, |ui| {
             for si in 0..job.steps.len() {
@@ -338,6 +338,7 @@ pub fn show_new_job_window(ctx: &egui::Context, main: &mut MainState) {
     }
     egui::Window::new("＋ 新建流程")
         .open(&mut open)
+        .order(egui::Order::Tooltip)
         .default_width(520.0)
         .show(ctx, |ui| {
             let Some(pi) = main.selected_project else {
@@ -384,7 +385,6 @@ pub fn show_new_job_window(ctx: &egui::Context, main: &mut MainState) {
                 }
             });
         });
-    crate::ui::raise_above_backdrop(ctx, "＋ 新建流程");
     main.new_job.open = open;
 }
 
@@ -473,6 +473,7 @@ pub fn show_var_help_window(ctx: &egui::Context, main: &mut MainState) {
     }
     egui::Window::new("？ 变量语法速查")
         .open(&mut open)
+        .order(egui::Order::Tooltip)
         .default_width(720.0)
         .default_height(520.0)
         .show(ctx, |ui| {
@@ -537,7 +538,6 @@ pub fn show_var_help_window(ctx: &egui::Context, main: &mut MainState) {
             ui.add_space(8.0);
             ui.weak("完整说明见 docs/变量速查.md（设计文档 §6）。");
         });
-    crate::ui::raise_above_backdrop(ctx, "？ 变量语法速查");
     main.show_var_help = open;
 }
 
@@ -594,7 +594,7 @@ fn edit_step(
 
             ui.separator();
             ui.label("工具:");
-            egui::ComboBox::from_id_source(format!("tool_{si}"))
+            egui::ComboBox::from_id_salt(format!("tool_{si}"))
                 .selected_text(if step.tool.is_empty() {
                     "（无）".to_string()
                 } else {
@@ -644,7 +644,7 @@ fn edit_step(
             ui.separator();
             let old_type = step.step_type;
             let mut st_idx = step_type_index(&step.step_type);
-            egui::ComboBox::from_id_source(format!("st_{si}"))
+            egui::ComboBox::from_id_salt(format!("st_{si}"))
                 .selected_text(step_type_label(&step.step_type))
                 .width(150.0)
                 .show_ui(ui, |ui| {
@@ -724,7 +724,7 @@ fn edit_step(
                 Some(t) => t.clone(),
                 None => format!("跟随流程（{job_target_display}）"),
             };
-            egui::ComboBox::from_id_source(format!("steptarget_{si}"))
+            egui::ComboBox::from_id_salt(format!("steptarget_{si}"))
                 .selected_text(sel_text)
                 .width(150.0)
                 .show_ui(ui, |ui| {
@@ -746,13 +746,13 @@ fn edit_step(
                     ui.add(
                         egui::DragValue::new(&mut r.max_attempts)
                             .suffix("次")
-                            .clamp_range(1..=10),
+                            .range(1..=10),
                     );
                     ui.label("间隔");
                     ui.add(
                         egui::DragValue::new(&mut r.backoff_seconds)
                             .suffix("s")
-                            .clamp_range(0..=300),
+                            .range(0..=300),
                     );
                     if ui.small_button("×").clicked() {
                         step.retry = None;
