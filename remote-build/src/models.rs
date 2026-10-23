@@ -579,10 +579,14 @@ pub struct VariablesFile {
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum LogEvent {
-    StepStart { step_index: usize, name: String },
+    /// skipped = 跳过（未启用 / condition 不满足）：引擎随后仍补一条 StepEnd(0)，
+    /// UI 据此显示灰色"跳过"而非绿色"成功"
+    StepStart { step_index: usize, name: String, skipped: bool },
     Stdout { step_index: usize, line: String },
     Stderr { step_index: usize, line: String },
     StepEnd { step_index: usize, exit_code: i32, duration_ms: u64 },
+    /// 失败重试的退避等待开始（UI 显示黄色等待态；退避结束引擎补一条 StepStart 表示恢复执行）
+    StepRetryWait { step_index: usize, attempt: u32 },
     JobEnd { run_id: String, status: JobStatus, total_duration_ms: u64 },
     Error { message: String },
 }

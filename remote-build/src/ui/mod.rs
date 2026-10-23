@@ -6,6 +6,7 @@ pub mod job_editor;
 pub mod new_project;
 pub mod project_tree;
 pub mod settings;
+pub mod status;
 pub mod targets;
 
 use eframe::egui;

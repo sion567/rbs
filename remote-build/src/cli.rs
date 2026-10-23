@@ -143,12 +143,14 @@ fn run(args: &[String]) {
             match ev {
                 LogEvent::Stdout { line, .. } => println!("{line}"),
                 LogEvent::Stderr { line, .. } => eprintln!("[stderr] {line}"),
-                LogEvent::StepStart { step_index, name } => {
+                LogEvent::StepStart { step_index, name, .. } => {
                     println!("── Step {} ── {name}", step_index + 1)
                 }
                 LogEvent::StepEnd { step_index, exit_code, duration_ms } => {
                     println!("── Step {} 退出码 {exit_code} ({duration_ms}ms)", step_index + 1)
                 }
+                // 退避等待期已有失败告警行，不重复输出
+                LogEvent::StepRetryWait { .. } => {}
                 LogEvent::Error { message } => eprintln!("[error] {message}"),
                 LogEvent::JobEnd { .. } => {}
             }

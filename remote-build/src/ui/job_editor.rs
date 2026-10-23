@@ -2,6 +2,7 @@
 
 use crate::app::MainState;
 use crate::models::{FailureAction, Job, Step, StepType, Tool};
+use crate::ui::status::{self, StepVisualState};
 use eframe::egui;
 use egui::Color32;
 /// 步骤「工具」下拉的菜单数据：项目级 / 全局分组 + 合并解析表
@@ -120,6 +121,11 @@ pub fn show(main: &mut MainState, ui: &mut egui::Ui) {
     // 工具菜单（项目级 / 全局分组 + 合并解析表）
     let tool_menu = ToolMenu::build(main);
 
+    // 状态可视化：光圈颜色按主题取色；状态快照为 owned，避免与下面的可变借用冲突
+    let dark = !matches!(main.global.theme, crate::models::Theme::Light);
+    let (run_proj, run_job_name) = main.run_job.clone().unwrap_or_default();
+    let step_states = main.run_steps.clone();
+
     // 同一 ProjectEntry 的两个字段分别借用（字段级借用拆分）
     let entry = &mut main.projects[pi];
     let project = &mut entry.project;
@@ -128,86 +134,96 @@ pub fn show(main: &mut MainState, ui: &mut egui::Ui) {
     };
     let job = &mut job_entry.job;
 
-    // ── 第 1 行：流程名 + 项目目录（占满剩余宽度）──
-    ui.horizontal(|ui| {
-        ui.heading(format!("📄 {}", job.name));
-        ui.separator();
-        ui.label("项目目录:");
-        let dir_width = (ui.available_width() - 90.0).max(280.0);
-        ui.add(
-            egui::TextEdit::singleline(&mut project.local_path)
-                .desired_width(dir_width)
-                .hint_text("D:\\workspace\\my-project"),
-        );
-        if ui.button("📂 浏览…").clicked() {
-            if let Some(dir) = rfd::FileDialog::new()
-                .set_title("选择项目本地目录")
-                .pick_folder()
-            {
-                project.local_path = dir.to_string_lossy().to_string();
-            }
-        }
-    });
+    // ── 运行中禁用编辑输入 ──
+    // 注意不能 disable 整个面板 Ui：egui 的滚轮滚动会检查所在 Ui 的 enabled
+    // （scroll_area.rs 的 mouse_wheel 门），禁用容器会连"翻看步骤"一起锁死。
+    // 因此分块禁用：第 1/2/3 行各包 add_enabled_ui；步骤列表只 disable 内容，
+    // ScrollArea 本身保持 enabled，滚轮/拖动翻看不受影响（⏹ Stop 在工具栏）。
+    // 顺带保证运行中步骤列表不被增删，光圈与 step_index 不会错位。
+
     let env_names: Vec<String> = project.variables.keys().cloned().collect();
     // 目标下拉 = 本项目 project.yaml 的 targets 表（§3.5 目标随项目走）
     let mut target_names: Vec<String> = project.targets.keys().cloned().collect();
     target_names.sort();
     // 流程默认目标的展示文本（步骤「跟随流程」时显示它）
     let job_target_display = job.target.clone().unwrap_or_else(|| "无".to_string());
+
+    // ── 第 1 行：流程名 + 项目目录（占满剩余宽度）──
     // ── 第 2 行：变量组 / 目标 / 失败策略（悬停可见说明）──
-    ui.horizontal(|ui| {
-        ui.label("变量组:").on_hover_text(
-            "决定 ${{ variables.X }} 从哪张变量表取值（project.yaml 的 variables.<组名>）。\n\
-             例：变量组=prod 时 ${{ variables.DEPLOY_DIR }} 取 variables.prod.DEPLOY_DIR，\n\
-             同一条流程换变量组即换一套参数（私服地址 / 部署目录等）。\n\
-             注意：它不是 Spring profile 那样的运行环境；执行机器由「目标」决定。",
-        );
-        egui::ComboBox::from_id_salt("env_combo")
-            .selected_text(job.environment.clone().unwrap_or_else(|| "无".to_string()))
-            .width(140.0)
-            .show_ui(ui, |ui| {
-                ui.selectable_value(&mut job.environment, None, "无");
-                for name in &env_names {
-                    ui.selectable_value(&mut job.environment, Some(name.clone()), name);
+    ui.add_enabled_ui(!running, |ui| {
+        ui.horizontal(|ui| {
+            ui.heading(format!("📄 {}", job.name));
+            ui.separator();
+            ui.label("项目目录:");
+            let dir_width = (ui.available_width() - 90.0).max(280.0);
+            ui.add(
+                egui::TextEdit::singleline(&mut project.local_path)
+                    .desired_width(dir_width)
+                    .hint_text("D:\\workspace\\my-project"),
+            );
+            if ui.button("📂 浏览…").clicked() {
+                if let Some(dir) = rfd::FileDialog::new()
+                    .set_title("选择项目本地目录")
+                    .pick_folder()
+                {
+                    project.local_path = dir.to_string_lossy().to_string();
                 }
-            });
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("变量组:").on_hover_text(
+                "决定 ${{ variables.X }} 从哪张变量表取值（project.yaml 的 variables.<组名>）。\n\
+                 例：变量组=prod 时 ${{ variables.DEPLOY_DIR }} 取 variables.prod.DEPLOY_DIR，\n\
+                 同一条流程换变量组即换一套参数（私服地址 / 部署目录等）。\n\
+                 注意：它不是 Spring profile 那样的运行环境；执行机器由「目标」决定。",
+            );
+            egui::ComboBox::from_id_salt("env_combo")
+                .selected_text(job.environment.clone().unwrap_or_else(|| "无".to_string()))
+                .width(140.0)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut job.environment, None, "无");
+                    for name in &env_names {
+                        ui.selectable_value(&mut job.environment, Some(name.clone()), name);
+                    }
+                });
 
-        ui.separator();
-        ui.label("默认目标:").on_hover_text(
-            "流程的默认执行机器（取自本项目 project.yaml 的 targets 表）。\n\
-             每个步骤可用自己的「目标」覆盖它——混合流程示例：\n\
-             下载(local) → 编译(local) → 上传(prod) → 发布(prod)。\n\
-             local = 本机 cmd 执行；SSH 目标 = 远端 Linux（exec 经 plink、upload 经 pscp）。",
-        );
-        egui::ComboBox::from_id_salt("target_combo")
-            .selected_text(job.target.clone().unwrap_or_else(|| "无".to_string()))
-            .width(160.0)
-            .show_ui(ui, |ui| {
-                ui.selectable_value(&mut job.target, None, "无");
-                for name in &target_names {
-                    ui.selectable_value(&mut job.target, Some(name.clone()), name);
-                }
-            });
+            ui.separator();
+            ui.label("默认目标:").on_hover_text(
+                "流程的默认执行机器（取自本项目 project.yaml 的 targets 表）。\n\
+                 每个步骤可用自己的「目标」覆盖它——混合流程示例：\n\
+                 下载(local) → 编译(local) → 上传(prod) → 发布(prod)。\n\
+                 local = 本机 cmd 执行；SSH 目标 = 远端 Linux（exec 经 plink、upload 经 pscp）。",
+            );
+            egui::ComboBox::from_id_salt("target_combo")
+                .selected_text(job.target.clone().unwrap_or_else(|| "无".to_string()))
+                .width(160.0)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut job.target, None, "无");
+                    for name in &target_names {
+                        ui.selectable_value(&mut job.target, Some(name.clone()), name);
+                    }
+                });
 
-        ui.separator();
-        ui.label("on_failure:").on_hover_text(
-            "某步失败且该步未勾选「失败继续」时的处理：\n\
-             stop = 立即终止整个流程（默认）；continue = 跳过该步继续后面的步骤；\n\
-             retry = 整个流程重试（P1，当前等同 stop）。",
-        );
-        let on_failure_label = match &job.on_failure {
-            FailureAction::Stop => "stop",
-            FailureAction::Continue => "continue",
-            FailureAction::Retry => "retry",
-        };
-        egui::ComboBox::from_id_salt("on_failure_combo")
-            .selected_text(on_failure_label)
-            .width(110.0)
-            .show_ui(ui, |ui| {
-                ui.selectable_value(&mut job.on_failure, FailureAction::Stop, "stop");
-                ui.selectable_value(&mut job.on_failure, FailureAction::Continue, "continue");
-                ui.selectable_value(&mut job.on_failure, FailureAction::Retry, "retry");
-            });
+            ui.separator();
+            ui.label("on_failure:").on_hover_text(
+                "某步失败且该步未勾选「失败继续」时的处理：\n\
+                 stop = 立即终止整个流程（默认）；continue = 跳过该步继续后面的步骤；\n\
+                 retry = 整个流程重试（P1，当前等同 stop）。",
+            );
+            let on_failure_label = match &job.on_failure {
+                FailureAction::Stop => "stop",
+                FailureAction::Continue => "continue",
+                FailureAction::Retry => "retry",
+            };
+            egui::ComboBox::from_id_salt("on_failure_combo")
+                .selected_text(on_failure_label)
+                .width(110.0)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut job.on_failure, FailureAction::Stop, "stop");
+                    ui.selectable_value(&mut job.on_failure, FailureAction::Continue, "continue");
+                    ui.selectable_value(&mut job.on_failure, FailureAction::Retry, "retry");
+                });
+        });
     });
 
     // ── 第 3 行：流程管理按钮 ──
@@ -216,35 +232,37 @@ pub fn show(main: &mut MainState, ui: &mut egui::Ui) {
     let mut delete_job_confirmed = false;
     let mut open_var_help = false;
     ui.add_space(4.0);
-    ui.horizontal(|ui| {
-        if ui.button("🔧 工具覆盖").clicked() {
-            open_tool_overrides = true;
-        }
-        if ui.button("？ 变量语法").clicked() {
-            open_var_help = true;
-        }
-        ui.separator();
-        if ui.button("＋ 新建流程").clicked() {
-            create_job_requested = true;
-            main.new_job.message = None;
-            main.new_job.name.clear();
-        }
-        // 删除流程：两段确认，避免误删
-        let job_name = job.name.clone();
-        if !main.delete_job_armed {
-            if ui.button("🗑 删除流程").clicked() {
-                main.delete_job_armed = true;
+    ui.add_enabled_ui(!running, |ui| {
+        ui.horizontal(|ui| {
+            if ui.button("🔧 工具覆盖").clicked() {
+                open_tool_overrides = true;
             }
-        } else {
-            ui.colored_label(Color32::from_rgb(230, 120, 90), format!("删除「{job_name}」？"));
-            if ui.small_button("确认").clicked() {
-                delete_job_confirmed = true;
-                main.delete_job_armed = false;
+            if ui.button("？ 变量语法").clicked() {
+                open_var_help = true;
             }
-            if ui.small_button("取消").clicked() {
-                main.delete_job_armed = false;
+            ui.separator();
+            if ui.button("＋ 新建流程").clicked() {
+                create_job_requested = true;
+                main.new_job.message = None;
+                main.new_job.name.clear();
             }
-        }
+            // 删除流程：两段确认，避免误删
+            let job_name = job.name.clone();
+            if !main.delete_job_armed {
+                if ui.button("🗑 删除流程").clicked() {
+                    main.delete_job_armed = true;
+                }
+            } else {
+                ui.colored_label(Color32::from_rgb(230, 120, 90), format!("删除「{job_name}」？"));
+                if ui.small_button("确认").clicked() {
+                    delete_job_confirmed = true;
+                    main.delete_job_armed = false;
+                }
+                if ui.small_button("取消").clicked() {
+                    main.delete_job_armed = false;
+                }
+            }
+        });
     });
 
     ui.add_space(8.0);
@@ -257,8 +275,28 @@ pub fn show(main: &mut MainState, ui: &mut egui::Ui) {
         .id_salt("steps_scroll")
         .auto_shrink([false, false])
         .show(ui, |ui| {
+            // 运行中只禁内容、不禁 ScrollArea 所在容器：滚轮翻看仍可用
+            if running {
+                ui.disable();
+            }
             for si in 0..job.steps.len() {
-                actions.push(edit_step(ui, job, si, &tool_menu, running, &target_names, job_target_display.as_str()));
+                // 光圈只挂在「正在显示的作业 = 正在运行的作业」上
+                let state = if run_proj == project.name && run_job_name == job.name {
+                    step_states.get(si).copied().unwrap_or_default()
+                } else {
+                    StepVisualState::Idle
+                };
+                actions.push(edit_step(
+                    ui,
+                    job,
+                    si,
+                    &tool_menu,
+                    running,
+                    &target_names,
+                    job_target_display.as_str(),
+                    state,
+                    dark,
+                ));
             }
 
             ui.add_space(4.0);
@@ -568,6 +606,8 @@ fn delete_current_job(main: &mut MainState) {
 /// 下拉分组展示「本项目 / 全局」，选中后以徽标标注来源、悬停显示解析到的实际地址。
 /// running = 有作业在跑（此时单步运行按钮禁用）。
 /// target_names = 本项目可用的目标名；job_target_display = 流程默认目标的展示文本。
+/// state = 本步骤的运行状态（卡片外围光圈：运行蓝闪/等待黄闪/成功绿/失败红，见 ui::status）。
+#[allow(clippy::too_many_arguments)]
 fn edit_step(
     ui: &mut egui::Ui,
     job: &mut Job,
@@ -576,10 +616,12 @@ fn edit_step(
     running: bool,
     target_names: &[String],
     job_target_display: &str,
+    state: StepVisualState,
+    dark: bool,
 ) -> StepAction {
     let mut action = StepAction::None;
 
-    ui.group(|ui| {
+    status::step_frame(ui, state, dark).show(ui, |ui| {
         let step = &mut job.steps[si];
         ui.horizontal(|ui| {
             ui.checkbox(&mut step.enabled, "");

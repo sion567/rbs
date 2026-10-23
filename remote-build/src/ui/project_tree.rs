@@ -24,7 +24,14 @@ pub enum TreeRenameTarget {
 pub fn show(main: &mut MainState, ui: &mut egui::Ui) {
     ui.horizontal(|ui| {
         ui.heading("项目");
-        if ui.small_button("＋ 新建项目").clicked() {
+        // 运行中禁用（统一"执行时所有输入禁用"；引擎正按路径读写工作区）
+        if ui
+            .add_enabled(
+                !main.run_active(),
+                egui::Button::new("＋ 新建项目").small(),
+            )
+            .clicked()
+        {
             crate::ui::new_project::open_new(main);
         }
     });
@@ -65,16 +72,28 @@ pub fn show(main: &mut MainState, ui: &mut egui::Ui) {
                 .default_open(true)
                 .show(ui, |ui| {
                     for ji in 0..main.projects[pi].jobs.len() {
-                        let (label, selected) = {
+                        let (label, selected, dot_state) = {
                             let je = &main.projects[pi].jobs[ji];
                             (
                                 je.job.name.clone(),
                                 main.selected_project == Some(pi)
                                     && main.selected_job == Some(ji),
+                                main.job_dot_state(&main.projects[pi].project.name, &je.job.name),
                             )
                         };
-                        // 📄 强调"一个流程一个 yaml 文件"，与运行按钮的 ▶ 区分开
-                        let resp = ui.selectable_label(selected, format!("📄 {label}"));
+                        // 📄 强调"一个流程一个 yaml 文件"，与运行按钮的 ▶ 区分开；
+                        // 运行中的作业在名字后面带状态圆点（蓝闪/黄闪/绿/红，见 ui::status）
+                        let inner = ui.horizontal(|ui| {
+                            let r = ui.selectable_label(selected, format!("📄 {label}"));
+                            if let Some(st) = dot_state {
+                                let dark =
+                                    !matches!(main.global.theme, crate::models::Theme::Light);
+                                ui.label(crate::ui::status::status_dot(ui, st, dark))
+                                    .on_hover_text(st.label());
+                            }
+                            r
+                        });
+                        let resp = inner.inner;
                         if resp.clicked() {
                             main.selected_project = Some(pi);
                             main.selected_job = Some(ji);

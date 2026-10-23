@@ -91,7 +91,11 @@ impl Engine {
 
             if !step.enabled {
                 let _ = log_tx
-                    .send(LogEvent::StepStart { step_index: index, name: format!("{step_name}（跳过：未启用）") })
+                    .send(LogEvent::StepStart {
+                        step_index: index,
+                        name: format!("{step_name}（跳过：未启用）"),
+                        skipped: true,
+                    })
                     .await;
                 let _ = log_tx
                     .send(LogEvent::StepEnd { step_index: index, exit_code: 0, duration_ms: 0 })
@@ -107,6 +111,7 @@ impl Engine {
                             .send(LogEvent::StepStart {
                                 step_index: index,
                                 name: format!("{step_name}（跳过：condition 不满足）"),
+                                skipped: true,
                             })
                             .await;
                         let _ = log_tx
@@ -127,7 +132,9 @@ impl Engine {
                 }
             }
 
-            let _ = log_tx.send(LogEvent::StepStart { step_index: index, name: step_name }).await;
+            let _ = log_tx
+                .send(LogEvent::StepStart { step_index: index, name: step_name, skipped: false })
+                .await;
 
             // ── 有效目标（§3.3）：步骤级 target 覆盖流程级默认 ──
             // 混合流程的关键：下载/编译用 local，上传/发布用 prod，各步各选
@@ -348,6 +355,11 @@ async fn run_step_with_retry(
     // 重试计划：显式 retry 配置优先；upload 步骤无配置时默认重试 1 次（网络抖动兜底）
     let (attempts, backoff_secs) = step_retry_plan(step);
     let backoff = Duration::from_secs(backoff_secs);
+    // 恢复执行时补发 StepStart 的名字（与主循环同一推导：优先自定义名，否则命令首行）
+    let step_name = step
+        .name
+        .clone()
+        .unwrap_or_else(|| step.command.lines().next().unwrap_or("").to_string());
 
     let deadline = tokio::time::Instant::now() + step_timeout;
 
@@ -393,10 +405,21 @@ async fn run_step_with_retry(
                         ),
                     })
                     .await;
+                // 退避等待期：UI 把该步骤切到黄色等待态（恢复执行时由下方 StepStart 切回）
+                let _ = log_tx
+                    .send(LogEvent::StepRetryWait { step_index: index, attempt })
+                    .await;
                 tokio::select! {
                     _ = tokio::time::sleep(backoff) => {}
                     _ = cancel_rx.recv() => return StepResult::Cancelled,
                 }
+                let _ = log_tx
+                    .send(LogEvent::StepStart {
+                        step_index: index,
+                        name: format!("{step_name}（第 {attempt} 次重试）"),
+                        skipped: false,
+                    })
+                    .await;
             }
         }
     }

@@ -3,9 +3,10 @@
 //! 桥接模型：tokio 引擎在后台 runtime 运行，LogEvent 经 tokio mpsc →
 //! 转发任务（追加日志文件）→ std mpsc，UI 每帧 try_recv 排空后渲染（§4.2）。
 
-use crate::models::{JobStatus, LogEvent};
+use crate::models::{JobStatus, LogEvent, StepType};
 use crate::storage::files::{self, ProjectEntry};
 use crate::ui;
+use crate::ui::status::StepVisualState;
 use eframe::egui;
 use std::sync::mpsc as std_mpsc;
 use std::sync::Arc;
@@ -128,6 +129,13 @@ pub struct MainState {
     /// 主题是否已在首帧应用（egui ctx 需要在 show 阶段才能设置）
     pub theme_applied: bool,
     pub status_msg: Option<String>,
+    /// 步骤运行状态可视化（ui::status）：drain_events 按事件驱动，start_run 复位
+    pub run_steps: Vec<StepVisualState>,
+    /// 正在运行的作业（项目名, 流程名）——光圈/圆点只对它显示，
+    /// 防止运行中在树上切换到别的流程时把状态错挂到别的作业上
+    pub run_job: Option<(String, String)>,
+    /// 运行作业各步骤是否为 wait 类型（轮询期间该步骤显示黄色等待态）
+    pub run_step_wait: Vec<bool>,
 }
 
 pub struct RunHandle {
@@ -164,6 +172,9 @@ impl MainState {
             show_var_help: false,
             theme_applied: false,
             status_msg: None,
+            run_steps: Vec::new(),
+            run_job: None,
+            run_step_wait: Vec::new(),
         };
         s.reload();
         s
@@ -253,18 +264,19 @@ impl MainState {
                     }
                     self.status_msg = Some("已发送取消信号…".to_string());
                 }
-                if ui.button("💾 Save").clicked() {
+                // 运行中禁用一切会改盘/改配置的入口（引擎正按路径读写、状态可视化依赖步骤索引稳定）
+                if ui.add_enabled(!running, egui::Button::new("💾 Save")).clicked() {
                     self.save_selected();
                 }
-                if ui.button("⟳ Reload").clicked() {
+                if ui.add_enabled(!running, egui::Button::new("⟳ Reload")).clicked() {
                     self.reload();
                 }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("⚙ 设置").clicked() {
+                    if ui.add_enabled(!running, egui::Button::new("⚙ 设置")).clicked() {
                         self.show_settings = !self.show_settings;
                     }
-                    if ui.button("🎯 目标").clicked() {
+                    if ui.add_enabled(!running, egui::Button::new("🎯 目标")).clicked() {
                         self.target_editor.open = !self.target_editor.open;
                     }
                     if let Some(msg) = &self.status_msg {
@@ -305,9 +317,9 @@ impl MainState {
         ui::job_editor::show_new_job_window(&ctx, self);
         ui::job_editor::show_var_help_window(&ctx, self);
 
-        // 运行中保持帧率，让日志事件流畅上屏
+        // 运行中保持帧率：日志流畅上屏 + 蓝黄光圈 1Hz 呼吸动画
         if running {
-            ctx.request_repaint_after(Duration::from_millis(100));
+            ctx.request_repaint_after(Duration::from_millis(50));
         }
     }
 
@@ -318,6 +330,32 @@ impl MainState {
         }
     }
 
+    /// 树上作业行的状态圆点（ui::status）：仅运行中/最近完成的作业有。
+    /// 运行中：有步骤在等待（wait 轮询 / 重试退避）= 黄，否则 = 蓝；
+    /// 已结束：按最终状态显示（成功绿 / 失败红 / 取消灰），直到下一次 start_run 复位。
+    pub fn job_dot_state(&self, project_name: &str, job_name: &str) -> Option<StepVisualState> {
+        let (run_proj, run_job_name) = self.run_job.as_ref()?;
+        if run_proj != project_name || run_job_name != job_name {
+            return None;
+        }
+        let run = self.run.as_ref()?;
+        if let Some(status) = &run.finished {
+            return Some(match status {
+                JobStatus::Success => StepVisualState::Success,
+                JobStatus::Failed { .. } => StepVisualState::Failed,
+                JobStatus::Cancelled | JobStatus::Timeout => StepVisualState::Cancelled,
+                JobStatus::Running => StepVisualState::Running,
+            });
+        }
+        if self.run_steps.contains(&StepVisualState::Waiting) {
+            return Some(StepVisualState::Waiting);
+        }
+        if self.run_steps.contains(&StepVisualState::Running) {
+            return Some(StepVisualState::Running);
+        }
+        None
+    }
+
     fn drain_events(&mut self) {
         let Some(run) = &mut self.run else { return };
         let mut events = Vec::new();
@@ -325,8 +363,44 @@ impl MainState {
             events.push(ev);
         }
         for ev in &events {
-            if let LogEvent::JobEnd { status, .. } = ev {
-                run.finished = Some(status.clone());
+            // 步骤状态机（run / run_steps / console 为不同字段，可拆分借用）
+            match ev {
+                LogEvent::StepStart { step_index, skipped, .. } => {
+                    if let Some(st) = self.run_steps.get_mut(*step_index) {
+                        *st = if *skipped {
+                            StepVisualState::Skipped
+                        } else if self.run_step_wait.get(*step_index).copied().unwrap_or(false) {
+                            // wait 类型步骤整个执行期都在轮询等待，直接进入黄色等待态
+                            StepVisualState::Waiting
+                        } else {
+                            StepVisualState::Running
+                        };
+                    }
+                }
+                LogEvent::StepEnd { step_index, exit_code, .. } => {
+                    if let Some(st) = self.run_steps.get_mut(*step_index) {
+                        if *st != StepVisualState::Skipped {
+                            *st = if *exit_code == 0 {
+                                StepVisualState::Success
+                            } else {
+                                StepVisualState::Failed
+                            };
+                        }
+                    }
+                }
+                LogEvent::StepRetryWait { step_index, .. } => {
+                    if let Some(st) = self.run_steps.get_mut(*step_index) {
+                        *st = StepVisualState::Waiting;
+                    }
+                }
+                LogEvent::JobEnd { status, .. } => {
+                    run.finished = Some(status.clone());
+                    // 取消/超时：被中断的步骤等不到 StepEnd，兜底落终态，避免永远闪蓝
+                    if matches!(status, JobStatus::Cancelled | JobStatus::Timeout) {
+                        mark_interrupted_cancelled(&mut self.run_steps);
+                    }
+                }
+                _ => {}
             }
             self.console.push_event(ev);
         }
@@ -336,6 +410,7 @@ impl MainState {
                 step_index: 0,
                 reason: "引擎任务异常终止".to_string(),
             });
+            mark_interrupted_cancelled(&mut self.run_steps);
         }
     }
 
@@ -353,6 +428,16 @@ impl MainState {
 
         let project = self.projects[pi].project.clone();
         let job = self.projects[pi].jobs[ji].job.clone();
+
+        // 状态可视化复位：新一次运行所有步骤的光圈回 Idle，并记录运行对象与 wait 步骤
+        self.run_steps = vec![StepVisualState::Idle; job.steps.len()];
+        self.run_step_wait = job
+            .steps
+            .iter()
+            .map(|s| matches!(s.step_type, StepType::Wait))
+            .collect();
+        self.run_job = Some((project.name.clone(), job.name.clone()));
+
         // §3.5：项目级目标覆盖全局 targets.yaml（键相同项目优先），并回填凭据键
         let effective = crate::config::effective_targets(&project);
         let mut label = format!("{}/{}", project.name, job.name);
@@ -408,7 +493,9 @@ impl MainState {
             while let Some(ev) = tok_rx.recv().await {
                 if let Some(f) = file.as_mut() {
                     use std::io::Write;
-                    let _ = writeln!(f, "{}", format_event(&ev));
+                    if let Some(text) = format_event(&ev) {
+                        let _ = writeln!(f, "{text}");
+                    }
                 }
                 if std_tx.send(ev).is_err() {
                     break; // UI 已关闭
@@ -444,6 +531,15 @@ impl MainState {
     }
 }
 
+/// 取消/超时/异常退出时，仍在运行的步骤等不到 StepEnd，兜底落中性终态（避免永远闪蓝）
+fn mark_interrupted_cancelled(steps: &mut [StepVisualState]) {
+    for st in steps.iter_mut() {
+        if st.in_progress() {
+            *st = StepVisualState::Cancelled;
+        }
+    }
+}
+
 /// 日志文件的行格式（控制台渲染走 ConsoleLine 带色，文件存纯文本）
 /// 应用主题（明亮/暗黑；System 视同暗黑——egui 无法直接感知系统主题）
 pub(crate) fn apply_theme(ctx: &egui::Context, theme: &crate::models::Theme) {
@@ -452,19 +548,21 @@ pub(crate) fn apply_theme(ctx: &egui::Context, theme: &crate::models::Theme) {
         _ => ctx.set_visuals(egui::Visuals::dark()),
     }
 }
-fn format_event(ev: &LogEvent) -> String {
+fn format_event(ev: &LogEvent) -> Option<String> {
     match ev {
-        LogEvent::Stdout { line, .. } => line.clone(),
-        LogEvent::Stderr { line, .. } => format!("[stderr] {line}"),
-        LogEvent::StepStart { step_index, name } => {
-            format!("── Step {} ── {name}", step_index + 1)
+        LogEvent::Stdout { line, .. } => Some(line.clone()),
+        LogEvent::Stderr { line, .. } => Some(format!("[stderr] {line}")),
+        LogEvent::StepStart { step_index, name, .. } => {
+            Some(format!("── Step {} ── {name}", step_index + 1))
         }
         LogEvent::StepEnd { step_index, exit_code, duration_ms } => {
-            format!("── Step {} 退出码 {exit_code} ({duration_ms}ms)", step_index + 1)
+            Some(format!("── Step {} 退出码 {exit_code} ({duration_ms}ms)", step_index + 1))
         }
+        // 退避等待期已有"第 N 次尝试失败…后重试"告警行，不重复落盘
+        LogEvent::StepRetryWait { .. } => None,
         LogEvent::JobEnd { status, total_duration_ms, .. } => {
-            format!("==== {} ({total_duration_ms}ms) ====", status.short())
+            Some(format!("==== {} ({total_duration_ms}ms) ====", status.short()))
         }
-        LogEvent::Error { message } => format!("[error] {message}"),
+        LogEvent::Error { message } => Some(format!("[error] {message}")),
     }
 }

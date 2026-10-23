@@ -77,7 +77,7 @@ impl Default for ConsoleState {
 impl ConsoleState {
     pub fn push_event(&mut self, ev: &LogEvent) {
         match ev {
-            LogEvent::StepStart { step_index, name } => {
+            LogEvent::StepStart { step_index, name, .. } => {
                 self.push(
                     format!("── Step {} ── {name}", step_index + 1),
                     Role::StepStart,
@@ -103,6 +103,8 @@ impl ConsoleState {
                 };
                 self.push(text, role);
             }
+            // 退避等待期：告警行（Error）已上屏，恢复执行时还有 StepStart 行，这里不重复
+            LogEvent::StepRetryWait { .. } => {}
             LogEvent::JobEnd { status, total_duration_ms, .. } => {
                 let role = match status {
                     JobStatus::Success => Role::Ok,
