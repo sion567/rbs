@@ -236,14 +236,18 @@ fn probe(exe: &str, args: &[&str]) -> Option<String> {
     };
     let _ = status;
 
-    let mut out = String::new();
-    let mut err = String::new();
+    // read_to_string 遇到非 UTF-8 字节会整体失败（GBK 输出 → 空），
+    // 因此先读原始字节再按控制台编码解码
+    let mut out = Vec::new();
+    let mut err = Vec::new();
     if let Some(mut o) = child.stdout.take() {
-        let _ = o.read_to_string(&mut out);
+        let _ = o.read_to_end(&mut out);
     }
     if let Some(mut e) = child.stderr.take() {
-        let _ = e.read_to_string(&mut err);
+        let _ = e.read_to_end(&mut err);
     }
+    let out = crate::transport::decode_console_bytes(&out);
+    let err = crate::transport::decode_console_bytes(&err);
     out.lines()
         .chain(err.lines())
         .map(str::trim)

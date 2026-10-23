@@ -108,6 +108,11 @@ pub struct MainState {
     pub new_job: ui::job_editor::NewJobState,
     /// 删除流程的两段确认状态
     pub delete_job_armed: bool,
+    /// 项目树右键菜单：待确认的删除目标（弹窗确认后才执行）
+    pub tree_delete: Option<ui::project_tree::TreeDeleteTarget>,
+    /// 项目树右键菜单：改名目标 + 输入缓冲
+    pub tree_rename: Option<ui::project_tree::TreeRenameTarget>,
+    pub tree_rename_buf: String,
     pub target_editor: ui::targets::TargetEditorState,
     /// 设置窗口当前分区 tab
     pub settings_tab: ui::settings::SettingsTab,
@@ -144,6 +149,9 @@ impl MainState {
             new_project: Default::default(),
             new_job: Default::default(),
             delete_job_armed: false,
+            tree_delete: None,
+            tree_rename: None,
+            tree_rename_buf: String::new(),
             target_editor: Default::default(),
             settings_tab: Default::default(),
             show_var_help: false,

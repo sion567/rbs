@@ -82,7 +82,7 @@ pub(super) fn pipe_child_output(child: &mut tokio::process::Child, log: &LogHand
                 match reader.read_until(b'\n', &mut buf).await {
                     Ok(0) | Err(_) => break,
                     Ok(_) => {
-                        let line = String::from_utf8_lossy(&buf);
+                        let line = super::decode_console_bytes(&buf);
                         log.line(Stream::Stdout, line.trim_end_matches(['\r', '\n']));
                     }
                 }
@@ -99,7 +99,7 @@ pub(super) fn pipe_child_output(child: &mut tokio::process::Child, log: &LogHand
                 match reader.read_until(b'\n', &mut buf).await {
                     Ok(0) | Err(_) => break,
                     Ok(_) => {
-                        let line = String::from_utf8_lossy(&buf);
+                        let line = super::decode_console_bytes(&buf);
                         log.line(Stream::Stderr, line.trim_end_matches(['\r', '\n']));
                     }
                 }

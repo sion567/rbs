@@ -158,6 +158,49 @@ pub(crate) fn merged_env(env: &HashMap<String, String>) -> HashMap<String, Strin
     out
 }
 
+/// 子进程输出按行解码：优先按 UTF-8（远端 Linux 的 plink 输出、node 系工具）；
+/// 非 UTF-8 时按控制台 OEM 代码页兜底——中文 Windows 为 cp936/GBK，
+/// cmd 内置命令（echo）与 JVM 系工具的管道输出都是这个编码。
+pub(crate) fn decode_console_bytes(bytes: &[u8]) -> String {
+    match std::str::from_utf8(bytes) {
+        Ok(s) => s.to_string(),
+        Err(_) => decode_with_oem_codepage(bytes),
+    }
+}
+
+#[cfg(windows)]
+fn decode_with_oem_codepage(bytes: &[u8]) -> String {
+    use winapi::um::stringapiset::MultiByteToWideChar;
+    use winapi::um::winnls::GetOEMCP;
+
+    if bytes.is_empty() {
+        return String::new();
+    }
+    unsafe {
+        // 每字节至多产生 2 个 UTF-16 单元（DBCS 情况），多留一倍
+        let mut wide = vec![0u16; bytes.len() * 2];
+        let n = MultiByteToWideChar(
+            GetOEMCP(),
+            0, // 不带 MB_ERR_INVALID_CHARS：宽松解码，坏字节不报错
+            bytes.as_ptr() as *const i8, // winapi CHAR = i8
+            bytes.len() as i32,
+            wide.as_mut_ptr(),
+            wide.len() as i32,
+        );
+        if n > 0 {
+            wide.truncate(n as usize);
+            String::from_utf16_lossy(&wide)
+        } else {
+            String::from_utf8_lossy(bytes).into_owned()
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn decode_with_oem_codepage(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -178,5 +221,24 @@ mod tests {
         assert_eq!(merged_paths[1], std::path::Path::new("C:\\a"));
         // 进程 PATH 追加在后面
         assert!(merged_paths.len() > 2);
+    }
+
+    #[test]
+    fn console_decode_prefers_utf8() {
+        // UTF-8 输出（远端 plink / node 系工具）必须走严格 UTF-8 路径
+        assert_eq!(decode_console_bytes("中文 ok\r\n".as_bytes()), "中文 ok\r\n");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn console_decode_falls_back_to_oem_codepage() {
+        // GBK 编码的 "中文"（D6D0 CEC4）不是合法 UTF-8，应按 OEM 代码页还原；
+        // 仅在中文 Windows（OEMCP=936）上断言结果，其他代码页下只要求不 panic
+        let gbk = [0xD6u8, 0xD0, 0xCE, 0xC4];
+        let cp = unsafe { winapi::um::winnls::GetOEMCP() };
+        let decoded = decode_console_bytes(&gbk);
+        if cp == 936 {
+            assert_eq!(decoded, "中文");
+        }
     }
 }

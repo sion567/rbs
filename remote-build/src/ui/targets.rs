@@ -87,6 +87,9 @@ pub fn show(ctx: &egui::Context, main: &mut MainState) {
     let has_project = main.selected_project.is_some();
 
     let mut open = main.target_editor.open;
+    if open {
+        crate::ui::modal_backdrop(ctx, "mask_targets");
+    }
     egui::Window::new("🎯 目标管理")
         .open(&mut open)
         .default_width(720.0)
@@ -111,6 +114,7 @@ pub fn show(ctx: &egui::Context, main: &mut MainState) {
                 ui.weak("请先在左侧选择一个项目。");
             }
         });
+    crate::ui::raise_above_backdrop(ctx, "🎯 目标管理");
     main.target_editor.open = open;
 
     if main.target_editor.test_rx.is_some() {

@@ -189,6 +189,9 @@ pub fn show(ctx: &egui::Context, main: &mut MainState) {
     }
 
     let mut open = main.show_settings;
+    if open {
+        crate::ui::modal_backdrop(ctx, "mask_settings");
+    }
     egui::Window::new("⚙ 设置")
         .open(&mut open)
         .default_width(780.0)
@@ -224,9 +227,16 @@ pub fn show(ctx: &egui::Context, main: &mut MainState) {
                         ToolScope::Global => 0,
                         ToolScope::Project => 1,
                     };
+                    let project_name = main
+                        .selected_project
+                        .and_then(|pi| main.projects.get(pi))
+                        .map(|p| p.project.name.clone());
                     let scope_tabs = vec![
                         "🌐 全局 (tools.yaml)".to_string(),
-                        "📦 本项目 (project.yaml)".to_string(),
+                        match &project_name {
+                            Some(name) => format!("📦 本项目[{name}] (project.yaml)"),
+                            None => "📦 本项目 (project.yaml)".to_string(),
+                        },
                     ];
                     if let Some(i) = tab_row(ui, &scope_tabs, scope_idx, &[true, has_project]) {
                         let new_scope = if i == 0 { ToolScope::Global } else { ToolScope::Project };
@@ -268,10 +278,12 @@ pub fn show(ctx: &egui::Context, main: &mut MainState) {
                     ui.add_space(4.0);
                     tool_editor(ui, main);
                 }
-                SettingsTab::Putty => putty_section(ui),
+                SettingsTab::Putty => putty_section(ui, &mut main.global),
                 SettingsTab::Global => global_section(ctx, ui, &mut main.global),
             }
         });
+    // 每帧把窗口抬回遮罩之上（遮罩被点击/首帧会在这带内置顶）
+    crate::ui::raise_above_backdrop(ctx, "⚙ 设置");
     main.show_settings = open;
 
     if main.tool_editor.verify_rx.is_some() {
@@ -661,69 +673,72 @@ fn start_verify(main: &mut MainState) {
 }
 
 // ---------------------------------------------------------------------------
-// PuTTY 状态（只读展示）
+// PuTTY：自定义目录设置（探测在执行时按「custom → builtin → PATH → Program Files」进行）
 // ---------------------------------------------------------------------------
 
-fn putty_section(ui: &mut egui::Ui) {
-    ui.heading("PuTTY（§5.3 探测结果）");
-    let detection = crate::transport::putty::detect_putty_tools();
-    if detection.found {
-        ui.colored_label(
-            Color32::from_rgb(120, 200, 120),
-            format!(
-                "✅ 已找到（来源: {}，版本: {}）",
-                detection.source,
-                detection.version.as_deref().unwrap_or("未知")
-            ),
-        );
-        egui::Grid::new("settings_putty")
-            .num_columns(2)
-            .spacing([16.0, 4.0])
-            .show(ui, |ui| {
-                for (label, path) in [
-                    ("plink:", &detection.plink),
-                    ("pscp:", &detection.pscp),
-                    ("psftp:", &detection.psftp),
-                ] {
-                    ui.label(label);
-                    ui.monospace(path.to_string_lossy().to_string());
-                    ui.end_row();
-                }
-                if let Some(p) = &detection.puttygen {
-                    ui.label("puttygen:");
-                    ui.monospace(p.to_string_lossy().to_string());
-                    ui.end_row();
-                }
-                if let Some(p) = &detection.pageant {
-                    ui.label("pageant:");
-                    ui.monospace(p.to_string_lossy().to_string());
-                    ui.end_row();
-                }
-            });
+fn putty_section(ui: &mut egui::Ui, global: &mut crate::models::GlobalConfig) {
+    ui.heading("PuTTY");
+    ui.weak(
+        "SSH 执行 / 上传依赖 plink / pscp。不设置时按「内置捆绑 → 系统 PATH → Program Files」\
+         自动探测；自定义目录优先级最高，需包含 plink.exe / pscp.exe。",
+    );
+    ui.add_space(4.0);
 
-        match crate::transport::putty::verify_putty_integrity(&detection.dir) {
-            Ok(()) => {
-                ui.colored_label(
-                    Color32::from_rgb(120, 200, 120),
-                    "✅ 完整性校验通过（5 exe + VERSION）",
-                );
+    ui.label("PuTTY 目录:");
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        match &mut global.putty.custom_path {
+            Some(path) => {
+                changed |= ui
+                    .add(
+                        egui::TextEdit::singleline(path)
+                            .desired_width(430.0)
+                            .hint_text("D:/tools/putty"),
+                    )
+                    .changed();
+                if ui
+                    .small_button("×")
+                    .on_hover_text("清除，恢复自动探测")
+                    .clicked()
+                {
+                    global.putty.custom_path = None;
+                    changed = true;
+                }
             }
-            Err(e) => {
-                // 系统 PATH 里的单文件 PuTTY 只有 plink/pscp，完整性校验失败是正常的
-                ui.colored_label(
-                    Color32::from_rgb(230, 180, 80),
-                    format!("⚠ 完整性校验未通过（内置捆绑需要 5 exe + VERSION）: {e}"),
-                );
+            None => {
+                ui.weak("（未设置，自动探测）");
             }
         }
-    } else {
-        ui.colored_label(
-            Color32::from_rgb(230, 180, 80),
-            format!(
-                "❌ 未找到 PuTTY。安装 PuTTY 或将套件放入 {}\n（SSH 执行/上传依赖 plink/pscp）",
-                crate::transport::putty::builtin_dir_hint()
-            ),
-        );
+        if ui.button("📂 浏览…").clicked() {
+            if let Some(dir) = rfd::FileDialog::new()
+                .set_title("选择 PuTTY 所在文件夹（含 plink.exe / pscp.exe）")
+                .pick_folder()
+            {
+                global.putty.custom_path = Some(dir.to_string_lossy().to_string());
+                changed = true;
+            }
+        }
+    });
+    if changed {
+        if let Err(e) = crate::config::save_global(global) {
+            eprintln!("保存 PuTTY 目录配置失败: {e}");
+        }
+    }
+
+    // 只对自定义目录本身做存在性校验（不做全量探测展示），给出能否直接生效的即时反馈
+    if let Some(path) = &global.putty.custom_path {
+        let dir = std::path::PathBuf::from(path);
+        if dir.join("plink.exe").exists() && dir.join("pscp.exe").exists() {
+            ui.colored_label(
+                Color32::from_rgb(120, 200, 120),
+                format!("✅ 目录有效（已找到 plink.exe / pscp.exe）: {path}"),
+            );
+        } else {
+            ui.colored_label(
+                Color32::from_rgb(230, 180, 80),
+                format!("⚠ {path} 下未找到 plink.exe / pscp.exe，执行时将回退自动探测"),
+            );
+        }
     }
 }
 
@@ -785,7 +800,7 @@ fn global_section(
             ui.end_row();
         });
     ui.weak(
-        "提示：config.yaml 中 putty.custom_path 可指定自定义 PuTTY 目录；\
+        "提示：PuTTY 自定义目录在「🔌 PuTTY」页设置（putty.custom_path）；\
          tools.yaml 的 putty 条目由探测自动生成，仅供展示。控制台配色跟随主题（深浅两套色板各自调校）。",
     );
 }

@@ -332,6 +332,9 @@ pub struct NewJobState {
 
 pub fn show_new_job_window(ctx: &egui::Context, main: &mut MainState) {
     let mut open = main.new_job.open;
+    if open {
+        crate::ui::modal_backdrop(ctx, "mask_new_job");
+    }
     egui::Window::new("＋ 新建流程")
         .open(&mut open)
         .default_width(520.0)
@@ -380,6 +383,7 @@ pub fn show_new_job_window(ctx: &egui::Context, main: &mut MainState) {
                 }
             });
         });
+    crate::ui::raise_above_backdrop(ctx, "＋ 新建流程");
     main.new_job.open = open;
 }
 
@@ -463,6 +467,9 @@ fn create_job(main: &mut MainState) {
 /// 「？ 变量语法」帮助窗口（速查表，与 docs/变量速查.md 内容一致）
 pub fn show_var_help_window(ctx: &egui::Context, main: &mut MainState) {
     let mut open = main.show_var_help;
+    if open {
+        crate::ui::modal_backdrop(ctx, "mask_var_help");
+    }
     egui::Window::new("？ 变量语法速查")
         .open(&mut open)
         .default_width(720.0)
@@ -529,6 +536,7 @@ pub fn show_var_help_window(ctx: &egui::Context, main: &mut MainState) {
             ui.add_space(8.0);
             ui.weak("完整说明见 docs/变量速查.md（设计文档 §6）。");
         });
+    crate::ui::raise_above_backdrop(ctx, "？ 变量语法速查");
     main.show_var_help = open;
 }
 

@@ -29,7 +29,10 @@ pub struct PuttyDetection {
     pub plink: PathBuf,
     pub pscp: PathBuf,
     pub psftp: PathBuf,
+    /// P1 启动校验预留（探测仍填充；UI 探测展示已移除，暂无读取方）
+    #[allow(dead_code)]
     pub puttygen: Option<PathBuf>,
+    #[allow(dead_code)]
     pub pageant: Option<PathBuf>,
     pub version: Option<String>,
 }
@@ -144,6 +147,8 @@ fn which_dir(exe: &str) -> Option<PathBuf> {
 // 完整性校验（§5.5 v0.4：与 §5.4 捆绑清单一一对应）
 // ---------------------------------------------------------------------------
 
+/// 当前仅单元测试使用；启动期强制校验为 P1
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn verify_putty_integrity(putty_dir: &Path) -> Result<(), String> {
     // 5 个 exe + VERSION 清单，缺一不可。
     // puttygen.exe（密钥转换）、pageant.exe（agent 认证）虽不在传输主链路上，

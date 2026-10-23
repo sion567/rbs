@@ -43,6 +43,17 @@ pub struct NewProjectState {
     pub message: Option<(bool, String)>,
 }
 
+/// 打开向导：清空上一次的全部输入（地址 / 账号密码 / 目录 / 名称 / 提示）。
+/// 进行中的后台任务（result_rx / progress）保留，避免克隆结果无人回收。
+pub fn open_new(main: &mut MainState) {
+    let in_flight_rx = main.new_project.result_rx.take();
+    let in_flight_progress = main.new_project.progress.take();
+    main.new_project = NewProjectState::default();
+    main.new_project.result_rx = in_flight_rx;
+    main.new_project.progress = in_flight_progress;
+    main.new_project.open = true;
+}
+
 pub fn show(ctx: &egui::Context, main: &mut MainState) {
     // 回收后台克隆结果
     if let Some(rx) = &main.new_project.result_rx {
@@ -59,7 +70,11 @@ pub fn show(ctx: &egui::Context, main: &mut MainState) {
             Ok(Err(e)) => {
                 main.new_project.result_rx = None;
                 main.new_project.progress = None;
-                main.new_project.message = Some((false, e));
+                // 弹窗在任务提交时即已关闭，失败要落到状态栏才能被看到；
+                // message 保留：若用户恰在此期间重新打开向导可直接看到详情
+                main.new_project.message = Some((false, e.clone()));
+                let first = e.lines().next().unwrap_or("").to_string();
+                main.status_msg = Some(format!("项目创建失败 ❌ {first}"));
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {}
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
@@ -71,6 +86,9 @@ pub fn show(ctx: &egui::Context, main: &mut MainState) {
 
     let busy = main.new_project.result_rx.is_some();
     let mut open = main.new_project.open;
+    if open {
+        crate::ui::modal_backdrop(ctx, "mask_new_project");
+    }
 
     egui::Window::new("＋ 新建项目")
         .open(&mut open)
@@ -111,7 +129,10 @@ pub fn show(ctx: &egui::Context, main: &mut MainState) {
                     SourceKind::Local => "创建项目",
                 };
                 if ui.add_enabled(!busy, egui::Button::new(label)).clicked() {
-                    start(main);
+                    // 校验失败留在弹窗看错误；任务提交成功即关闭弹窗
+                    if start(main) {
+                        main.new_project.open = false;
+                    }
                 }
                 if busy {
                     ui.add(egui::Spinner::new().size(16.0));
@@ -146,6 +167,7 @@ pub fn show(ctx: &egui::Context, main: &mut MainState) {
                 }
             }
         });
+    crate::ui::raise_above_backdrop(ctx, "＋ 新建项目");
     main.new_project.open = open;
 
     if busy {
@@ -235,10 +257,10 @@ fn local_form(ui: &mut egui::Ui, main: &mut MainState) {
                         rfd::FileDialog::new().set_title("选择项目本地目录").pick_folder()
                     {
                         main.new_project.local_dir = dir.to_string_lossy().to_string();
-                        if main.new_project.project_name.is_empty() {
-                            if let Some(name) = dir.file_name() {
-                                main.new_project.project_name = name.to_string_lossy().to_string();
-                            }
+                        // 目录末节直接作为项目名（覆盖旧值）
+                        if let Some(name) = dir.file_name() {
+                            main.new_project.project_name =
+                                sanitize_name(&name.to_string_lossy());
                         }
                     }
                 }
@@ -260,20 +282,26 @@ fn auto_fill_from_url(main: &mut MainState) {
     if derived.is_empty() {
         return;
     }
-    if main.new_project.project_name.is_empty() {
-        main.new_project.project_name = derived.clone();
-    }
+    // 地址末段直接作为项目名（地址再变化时以新末段覆盖）
+    main.new_project.project_name = derived.clone();
     if main.new_project.git_target.is_empty() {
         main.new_project.git_target =
             crate::config::default_project_dir(&derived).to_string_lossy().to_string();
     }
 }
 
-fn start(main: &mut MainState) {
+/// 校验输入并提交任务。返回 false 表示校验未过（错误写在 message，弹窗保持打开）。
+fn start(main: &mut MainState) -> bool {
+    // 弹窗可能在任务进行中被重新打开，防止重复提交
+    if main.new_project.result_rx.is_some() {
+        main.new_project.message =
+            Some((false, "已有创建任务进行中，请等待其完成".to_string()));
+        return false;
+    }
     let name = sanitize_name(main.new_project.project_name.trim());
     if name.is_empty() || name == "." || name == ".." {
         main.new_project.message = Some((false, "请填写合法的项目名称".to_string()));
-        return;
+        return false;
     }
     main.new_project.project_name = name.clone();
 
@@ -283,11 +311,11 @@ fn start(main: &mut MainState) {
     }
 }
 
-fn start_local(main: &mut MainState, name: String) {
+fn start_local(main: &mut MainState, name: String) -> bool {
     let dir = main.new_project.local_dir.trim().to_string();
     if dir.is_empty() || !Path::new(&dir).exists() {
         main.new_project.message = Some((false, format!("本地目录不存在: {dir}")));
-        return;
+        return false;
     }
     match crate::config::create_project_entry(&name, Path::new(&dir)) {
         Ok(_) => {
@@ -295,24 +323,26 @@ fn start_local(main: &mut MainState, name: String) {
             main.reload();
             main.select_project_by_name(&name);
             main.status_msg = Some(format!("项目「{name}」创建成功 ✅"));
-            main.new_project.open = false;
+            true
         }
         Err(e) => {
             main.new_project.message = Some((false, format!("创建项目失败: {e}")));
+            false
         }
     }
 }
 
-fn start_clone(main: &mut MainState, name: String) {
+/// 校验并派发后台克隆。返回 false 表示校验未过。
+fn start_clone(main: &mut MainState, name: String) -> bool {
     let url = main.new_project.git_url.trim().to_string();
     if url.is_empty() {
         main.new_project.message = Some((false, "请填写仓库地址".to_string()));
-        return;
+        return false;
     }
     let target = main.new_project.git_target.trim().to_string();
     if target.is_empty() {
         main.new_project.message = Some((false, "请填写目标目录".to_string()));
-        return;
+        return false;
     }
     let target_path = Path::new(&target);
     if target_path.exists() {
@@ -322,7 +352,7 @@ fn start_clone(main: &mut MainState, name: String) {
         if not_empty {
             main.new_project.message =
                 Some((false, format!("目标目录已存在且非空: {target}")));
-            return;
+            return false;
         }
     }
 
@@ -352,6 +382,7 @@ fn start_clone(main: &mut MainState, name: String) {
         let res = run_clone(&git_cmd, &full_url, &target, &branch, progress, &password);
         let _ = tx.send(res.map(|_| name));
     });
+    true
 }
 
 /// 后台线程执行 git clone，进度写入 progress（已脱敏），返回 Ok(())/Err(错误详情)。
