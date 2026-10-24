@@ -92,7 +92,7 @@ pub fn show(ctx: &egui::Context, main: &mut MainState) {
 
     egui::Window::new("＋ 新建项目")
         .open(&mut open)
-        .order(egui::Order::Tooltip)
+        .order(egui::Order::Foreground)
         .default_width(600.0)
         .show(ctx, |ui| {
             // 来源选择

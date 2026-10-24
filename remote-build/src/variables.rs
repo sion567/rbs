@@ -2,6 +2,7 @@
 //!
 //! 替换语法与来源（优先级见 §6.1）：
 //! - `${{ variables.X }}`  → project.variables[environment] 的环境变量表
+//! - `${{ variables.X || 默认值 }}` → 未定义时取默认值（Jinja2 default 语义）
 //! - `${{ env.X }}`        → 步骤产出 / Target / Tool / Step 注入的全局 env
 //! - `${{ targets.<名>.<字段> }}` → target 配置字段（host/port/user/...）
 //! - `${{ now }}` 等内置变量 → 引擎侧生成的运行时刻（一次运行所有步骤同值）
@@ -73,9 +74,10 @@ fn replace_double_brace(input: &str, ctx: &VarContext) -> String {
         match after.find("}}") {
             Some(end) => {
                 let expr = after[..end].trim();
-                match lookup_double(expr, ctx) {
+                match lookup_expr(expr, ctx) {
                     Some(v) => out.push_str(&v),
-                    None => out.push_str(&rest[..start + 3 + end + 2]), // 原样保留 ${{ ... }}
+                    // 原样保留 ${{ ... }}（只推占位符段，前面的文本已在 out 里，勿重复）
+                    None => out.push_str(&rest[start..start + 3 + end + 2]),
                 }
                 rest = &after[end + 2..];
             }
@@ -103,6 +105,30 @@ fn lookup_double(expr: &str, ctx: &VarContext) -> Option<String> {
         ["now", "iso"] => Some(ctx.now.iso.clone()),
         ["run", "id"] => ctx.run_id.clone(),
         _ => None,
+    }
+}
+
+/// 取值表达式求值：在 `variables.X` 等形态之上支持 `expr || 默认值`
+/// （Jinja2 `| default()` 语义）。左侧解析成功（含"定义了但为空串"）直接用；
+/// 未定义 / 不可解析时取右侧默认值（可带引号，按原样文本注入）。
+pub fn lookup_expr(expr: &str, ctx: &VarContext) -> Option<String> {
+    if let Some((left, default)) = expr.split_once("||") {
+        if let Some(v) = lookup_double(left.trim(), ctx) {
+            return Some(v);
+        }
+        return Some(strip_quote_pairs(default.trim()).to_string());
+    }
+    lookup_double(expr, ctx)
+}
+
+/// 去掉成对的单/双引号（条件比较、默认值字面量用）
+fn strip_quote_pairs(s: &str) -> &str {
+    if s.len() >= 2
+        && ((s.starts_with('\'') && s.ends_with('\'')) || (s.starts_with('"') && s.ends_with('"')))
+    {
+        &s[1..s.len() - 1]
+    } else {
+        s
     }
 }
 
@@ -190,42 +216,67 @@ fn lookup_single(name: &str, ctx: &VarContext) -> String {
     std::env::var(name).unwrap_or_else(|_| format!("${{{name}}}"))
 }
 
-/// P0 条件求值（§13.3）：只支持非空检查。
-/// 支持形态（两侧允许带 ${{ }} 包装）：
-///   env.X != ''   /   env.X == ''
-///   variables.X != '' / variables.X == ''
+/// 条件求值（§13.3）。支持形态（两侧允许带 ${{ }} 包装，Ansible when 风格）：
+///   env.X != ''   /   env.X == ''          非空 / 空判断（未解析视为空）
+///   ${{ variables.ENV }} == prod           与字面量比较（可带引号）
+///   variables.A == variables.B             与另一取值表达式比较（支持 || 默认值）
 /// 其他表达式 → None，由调用方决定策略（fail-open + 告警）。
 pub fn eval_condition(condition: &str, ctx: &VarContext) -> Option<bool> {
-    let inner = condition.trim();
-    let inner = inner
+    let trimmed = condition.trim();
+    // 两种形态：
+    // A. 整体一个包装、运算符在内：${{ env.VERSION != '' }}
+    // B. 运算符在外、两侧各自包装：${{ variables.ENV }} == ${{ variables.TARGET }}
+    //    （外层 strip 会把 B 形态剥坏，故剥完检查有没有残留包装再决定用哪个）
+    let inner = match trimmed
         .strip_prefix("${{")
         .and_then(|s| s.strip_suffix("}}"))
         .map(str::trim)
-        .unwrap_or(inner);
+    {
+        Some(s) if !s.contains("${{") && !s.contains("}}") => s,
+        _ => trimmed,
+    };
 
     let (lhs, op, rhs) = if let Some(pos) = inner.find("!=") {
         (&inner[..pos], "!=", &inner[pos + 2..])
-    } else if let Some(pos) = inner.find("==") {
-        (&inner[..pos], "==", &inner[pos + 2..])
     } else {
-        return None;
+        let pos = inner.find("==")?;
+        (&inner[..pos], "==", &inner[pos + 2..])
     };
 
     let lhs = lhs.trim();
     let rhs = rhs.trim();
-    let empty: &[&str] = &["''", "\"\""];
-    if !empty.contains(&rhs) {
-        return None;
+
+    fn unwrap_side(s: &str) -> &str {
+        s.strip_prefix("${{")
+            .and_then(|x| x.strip_suffix("}}"))
+            .map(str::trim)
+            .unwrap_or(s)
     }
 
-    let value = lookup_double(lhs, ctx);
-    // 未解析（None / 占位符原样）视为空
-    let is_empty = match value {
-        None => true,
-        Some(v) => v.is_empty() || v.starts_with("${{") || v.starts_with("${"),
+    // 空串判断形态：== '' / != ''（未解析 / 占位符原样视为空）
+    let empty: &[&str] = &["''", "\"\""];
+    if empty.contains(&rhs) {
+        let value = lookup_expr(unwrap_side(lhs), ctx);
+        let is_empty = match value {
+            None => true,
+            Some(v) => v.is_empty() || v.starts_with("${{") || v.starts_with("${"),
+        };
+        return Some(if op == "!=" { !is_empty } else { is_empty });
+    }
+
+    // 值比较：lhs 未解析视为空串（与空判断同语义）；rhs 优先按取值表达式解析，
+    // 解析不到再按字面量（去引号）
+    let lhs_val = match lookup_expr(unwrap_side(lhs), ctx) {
+        Some(v) if !v.starts_with("${{") && !v.starts_with("${") => v,
+        _ => String::new(),
+    };
+    let rhs_unwrapped = unwrap_side(rhs);
+    let rhs_val = match lookup_expr(rhs_unwrapped, ctx) {
+        Some(v) if !v.starts_with("${{") && !v.starts_with("${") => v,
+        _ => strip_quote_pairs(rhs_unwrapped).to_string(),
     };
 
-    Some(if op == "!=" { !is_empty } else { is_empty })
+    Some(if op == "==" { lhs_val == rhs_val } else { lhs_val != rhs_val })
 }
 
 // ---------------------------------------------------------------------------
@@ -310,6 +361,11 @@ mod tests {
         let c = ctx();
         assert_eq!(resolve("${{ variables.TYPO }}", &c), "${{ variables.TYPO }}");
         assert_eq!(resolve("${{ unknown.kind }}", &c), "${{ unknown.kind }}");
+        // 回归：占位符前有文本时，未解析分支不得重复前缀
+        assert_eq!(
+            resolve("echo ${{ variables.TYPO }}!", &c),
+            "echo ${{ variables.TYPO }}!"
+        );
     }
 
     #[test]
@@ -336,6 +392,54 @@ mod tests {
         assert_eq!(eval_condition("${{ env.VERSION != '' }}", &c), Some(true));
         assert_eq!(eval_condition("${{ env.MISSING != '' }}", &c), Some(false));
         assert_eq!(eval_condition("${{ env.MISSING == '' }}", &c), Some(true));
-        assert_eq!(eval_condition("VERSION > 1", &c), None, "P0 只支持非空检查");
+        assert_eq!(eval_condition("VERSION > 1", &c), None, "无 ==/!= 运算符不支持");
+    }
+
+    #[test]
+    fn condition_value_comparison() {
+        let c = ctx();
+        // 与字面量比较（TODO「when」示例形态）
+        assert_eq!(eval_condition("${{ variables.NAMESPACE }} == staging", &c), Some(true));
+        assert_eq!(eval_condition("${{ variables.NAMESPACE }} == prod", &c), Some(false));
+        assert_eq!(eval_condition("${{ variables.NAMESPACE }} != prod", &c), Some(true));
+        // 引号字面量
+        assert_eq!(eval_condition("${{ variables.NAMESPACE }} == 'staging'", &c), Some(true));
+        // 未定义变量：视为空串参与比较
+        assert_eq!(eval_condition("${{ variables.TYPO }} == prod", &c), Some(false));
+        assert_eq!(eval_condition("${{ variables.TYPO }} != prod", &c), Some(true));
+        // 两个取值表达式互比
+        assert_eq!(eval_condition("variables.NAMESPACE == variables.NAMESPACE", &c), Some(true));
+        // 两侧 ${{ }} 包装齐全的写法
+        assert_eq!(
+            eval_condition("${{ variables.NAMESPACE }} == ${{ variables.NAMESPACE }}", &c),
+            Some(true)
+        );
+        // 数值字面量按字符串比较
+        assert_eq!(eval_condition("${{ targets.prod.port }} == 2222", &c), Some(true));
+    }
+
+    #[test]
+    fn default_value_syntax() {
+        let c = ctx();
+        // 已定义 → 用真值
+        assert_eq!(
+            resolve("${{ variables.REGISTRY || registry.local:5000 }}", &c),
+            "registry-staging.internal:5000"
+        );
+        // 未定义 → 默认值
+        assert_eq!(resolve("${{ variables.TYPO || fallback }}", &c), "fallback");
+        // 默认值可带引号、含空格
+        assert_eq!(resolve("${{ variables.TYPO || 'a b c' }}", &c), "a b c");
+        assert_eq!(resolve("${{ variables.TYPO || \"x\" }}", &c), "x");
+        // 未定义且无默认值 → 仍原样保留（便于发现拼写错误）
+        assert_eq!(resolve("${{ variables.TYPO }}", &c), "${{ variables.TYPO }}");
+        // 内置变量也可带默认值
+        c_run_id_default();
+    }
+
+    fn c_run_id_default() {
+        let c = ctx();
+        assert_eq!(resolve("${{ run.id || manual-run }}", &c), "manual-run");
+        assert_eq!(resolve("${{ run.id }}", &c), "${{ run.id }}", "无默认值仍原样保留");
     }
 }

@@ -194,7 +194,7 @@ pub fn show(ctx: &egui::Context, main: &mut MainState) {
     }
     egui::Window::new("⚙ 设置")
         .open(&mut open)
-        .order(egui::Order::Tooltip)
+        .order(egui::Order::Foreground)
         .default_width(780.0)
         .default_height(560.0)
         .show(ctx, |ui| {

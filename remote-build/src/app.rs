@@ -140,6 +140,21 @@ pub struct MainState {
     pub pull_lines: Option<std_mpsc::Receiver<String>>,
     /// 「⟳ 更新代码」任务完成信号（Ok = 项目名，Err = 错误详情）
     pub pull_done: Option<std_mpsc::Receiver<Result<String, String>>>,
+    /// 人工确认门弹窗（job.confirm）：输入确认词后才真正启动运行
+    pub confirm_gate: ConfirmGate,
+}
+
+/// 「🔒 人工确认」窗口状态（GHA environment protection 思路）
+#[derive(Default)]
+pub struct ConfirmGate {
+    pub open: bool,
+    pub input: String,
+    /// 需要输入的确认词（job.confirm）
+    pub expected: String,
+    /// 展示用：项目/流程名
+    pub job_label: String,
+    /// 确认通过后要启动的运行参数 (from_step, only_step)
+    pub pending: Option<(usize, Option<usize>)>,
 }
 
 pub struct RunHandle {
@@ -181,12 +196,24 @@ impl MainState {
             run_step_wait: Vec::new(),
             pull_lines: None,
             pull_done: None,
+            confirm_gate: Default::default(),
         };
         s.reload();
         s
     }
 
     pub fn reload(&mut self) {
+        // Reload 会重建内存里的项目/作业列表：顺手复位上次运行的残留状态
+        // （失败红点/状态圈挂在已被 Reload 掉的作业上只会误导）。运行中 Reload
+        // 按钮本就禁用，这里再兜一层底。
+        let had_stale_run = self.run_job.is_some() && !self.run_active();
+        if !self.run_active() {
+            self.run = None;
+            self.run_job = None;
+            self.run_steps.clear();
+            self.run_step_wait.clear();
+        }
+
         self.global = crate::config::load_global().unwrap_or_default();
         let root = if self.global.workspace_root.is_empty() {
             crate::config::projects_dir()
@@ -219,7 +246,11 @@ impl MainState {
             self.selected_job = Some(ji);
         }
         if warnings.is_empty() {
-            self.status_msg = Some(format!("已加载 {} 个项目", self.projects.len()));
+            self.status_msg = Some(format!(
+                "已加载 {} 个项目{}",
+                self.projects.len(),
+                if had_stale_run { "（已复位上次运行状态）" } else { "" }
+            ));
         } else {
             self.status_msg = Some(format!(
                 "⚠ {}（已加载 {} 个项目）",
@@ -259,11 +290,24 @@ impl MainState {
                 let running = self.run_active();
                 let has_selection = self.selected_project.is_some() && self.selected_job.is_some();
                 if ui
-                    .add_enabled(has_selection && !running, egui::Button::new("▶ 运行全部"))
-                    .on_hover_text("按顺序执行所有启用的步骤（单步调试请用步骤卡片上的「▶ 从此 / ▶ 仅此」）")
+                    .add_enabled(has_selection, egui::Button::new("▶ 运行全部"))
+                    .on_hover_text(
+                        "按顺序执行所有启用的步骤。\n\
+                         运行中再次点击 = 取消当前运行并重新开始（仅同项目，GHA concurrency 语义）",
+                    )
                     .clicked()
                 {
                     self.start_run(0, None);
+                }
+                if ui
+                    .add_enabled(has_selection && !running, egui::Button::new("👁 预览"))
+                    .on_hover_text(
+                        "干跑预览：展示变量全量解析后的最终命令、上传清单与将跳过的步骤，\
+                         不执行任何命令；未解析的变量占位符会以 ⚠ 标出",
+                    )
+                    .clicked()
+                {
+                    self.preview_selected();
                 }
                 if ui.add_enabled(running, egui::Button::new("⏹ Stop")).clicked() {
                     if let Some(run) = &self.run {
@@ -323,6 +367,7 @@ impl MainState {
         ui::new_project::show(&ctx, self);
         ui::job_editor::show_new_job_window(&ctx, self);
         ui::job_editor::show_var_help_window(&ctx, self);
+        show_confirm_gate_window(&ctx, self);
 
         // 运行中保持帧率：日志流畅上屏 + 蓝黄光圈 1Hz 呼吸动画；更新代码中保持进度上屏
         if running {
@@ -515,10 +560,156 @@ impl MainState {
         }
     }
 
+    /// 「👁 预览」：干跑展示当前流程（变量全量解析、when/creates 判定、上传清单），
+    /// 结果进控制台。同步无副作用，不启动引擎任务、不发任何网络请求。
+    fn preview_selected(&mut self) {
+        let (Some(pi), Some(ji)) = (self.selected_project, self.selected_job) else {
+            return;
+        };
+        let Some(entry) = self.projects.get(pi) else { return };
+        let Some(je) = entry.jobs.get(ji) else { return };
+        let project = entry.project.clone();
+        let job = je.job.clone();
+
+        let effective = crate::config::effective_targets(&project);
+        let input = crate::engine::RunInput {
+            project: project.clone(),
+            job: job.clone(),
+            tools: self.tools.clone(),
+            all_targets: effective,
+            from_step: 0,
+            only_step: None,
+            run_id: String::new(),
+            default_step_timeout: self.global.default_timeout,
+            cancel_tx: None,
+        };
+
+        let previews = crate::engine::preview_job(&input);
+        use crate::ui::console::Role;
+        let workspace = std::path::PathBuf::from(&project.local_path);
+        self.console.push_line(
+            format!("==== 预览（干跑，不执行）: {}/{} ====", project.name, job.name),
+            Role::Info,
+        );
+        // 作业级信息：确认门 / 前置检查
+        if let Some(c) = job.confirm.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            self.console
+                .push_line(format!("🔒 确认门: 运行前需输入「{c}」"), Role::Info);
+        }
+        for pre in &job.preconditions {
+            let msg = if pre.message.trim().is_empty() {
+                String::new()
+            } else {
+                format!("（失败: {}）", pre.message.trim())
+            };
+            self.console
+                .push_line(format!("前置检查: {}{msg}", pre.check), Role::Info);
+        }
+        let (mut exec_n, mut skip_n) = (0usize, 0usize);
+        for p in &previews {
+            let tgt = p.target.clone().unwrap_or_else(|| "local".to_string());
+            if p.skipped {
+                skip_n += 1;
+                self.console.push_line(
+                    format!(
+                        "[{}] {}  ⏭ 跳过：{}",
+                        p.index + 1,
+                        p.name,
+                        p.note.as_deref().unwrap_or("")
+                    ),
+                    Role::Cancelled,
+                );
+            } else {
+                exec_n += 1;
+                self.console.push_line(
+                    format!("[{}] {}  目标: {}", p.index + 1, p.name, tgt),
+                    Role::StepStart,
+                );
+                if !p.command.is_empty() {
+                    self.console
+                        .push_line(format!("    $ {}", p.command), Role::Stdout);
+                }
+                for (l, r, exists) in &p.uploads {
+                    self.console.push_line(
+                        format!(
+                            "    ↑ {l} -> {r}{}",
+                            if *exists { "" } else { "（本地缺失 ⚠）" }
+                        ),
+                        Role::Stdout,
+                    );
+                }
+                if let Some((s, d)) = &p.pack {
+                    self.console
+                        .push_line(format!("    ⧉ 打包 {s} -> {d}"), Role::Stdout);
+                }
+                if p.working_dir != workspace && !p.working_dir.as_os_str().is_empty() {
+                    self.console.push_line(
+                        format!("    工作目录: {}", p.working_dir.display()),
+                        Role::Stdout,
+                    );
+                }
+            }
+            for w in &p.warnings {
+                self.console.push_line(format!("    ⚠ {w}"), Role::Fail);
+            }
+        }
+        self.console.push_line(
+            format!("==== 预览结束：{exec_n} 步执行 / {skip_n} 步跳过 ===="),
+            Role::Ok,
+        );
+        self.status_msg = Some(format!("预览完成: {}/{}", project.name, job.name));
+    }
+
     pub(crate) fn start_run(&mut self, from_step: usize, only_step: Option<usize>) {
-        if self.run_active() {
+        let (pi, ji) = match (self.selected_project, self.selected_job) {
+            (Some(a), Some(b)) => (a, b),
+            _ => return,
+        };
+        if self.projects.get(pi).and_then(|p| p.jobs.get(ji)).is_none() {
             return;
         }
+        // 人工确认门（job.confirm）：弹窗输入确认词才放行，防手滑上生产
+        let expected = self.projects[pi].jobs[ji]
+            .job
+            .confirm
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        if let Some(expected) = expected {
+            if !self.confirm_gate.open {
+                self.confirm_gate = ConfirmGate {
+                    open: true,
+                    input: String::new(),
+                    expected,
+                    job_label: format!(
+                        "{}/{}",
+                        self.projects[pi].project.name, self.projects[pi].jobs[ji].job.name
+                    ),
+                    pending: Some((from_step, only_step)),
+                };
+            }
+            return;
+        }
+        self.launch_run(from_step, only_step);
+    }
+
+    /// 确认门通过：按 pending 参数真正启动
+    fn confirm_gate_pass(&mut self) {
+        if self.confirm_gate.input.trim() != self.confirm_gate.expected {
+            self.status_msg = Some(format!(
+                "确认词不匹配，需输入「{}」",
+                self.confirm_gate.expected
+            ));
+            return;
+        }
+        self.confirm_gate.open = false;
+        if let Some((from, only)) = self.confirm_gate.pending.take() {
+            self.launch_run(from, only);
+        }
+    }
+
+    fn launch_run(&mut self, from_step: usize, only_step: Option<usize>) {
         // 与「⟳ 更新代码」互斥：git 改文件期间跑作业会读到半新半旧的代码
         if self.pull_done.is_some() {
             self.status_msg = Some("⚠ 正在更新代码，请稍候再运行".to_string());
@@ -534,6 +725,28 @@ impl MainState {
 
         let project = self.projects[pi].project.clone();
         let job = self.projects[pi].jobs[ji].job.clone();
+
+        // GHA concurrency：同项目重跑 = 取消旧的换新的（引擎锁接管 + 直接发取消信号）；
+        // 不同项目仍互斥（GUI 单运行槽），跨进程互斥由引擎的运行锁保证
+        if self.run_active() {
+            let same = self
+                .run_job
+                .as_ref()
+                .map(|(p, j)| p == &project.name && j == &job.name)
+                .unwrap_or(false);
+            if !same {
+                self.status_msg =
+                    Some("⚠ 有其他项目的作业运行中；同项目重跑会自动取消旧的".to_string());
+                return;
+            }
+            if let Some(run) = &self.run {
+                let _ = run.cancel_tx.send(());
+            }
+            self.console.push_line(
+                "==== 同项目重新运行：旧运行取消中，新运行即将开始 ====".to_string(),
+                crate::ui::console::Role::Info,
+            );
+        }
 
         // 状态可视化复位：新一次运行所有步骤的光圈回 Idle，并记录运行对象与 wait 步骤
         self.run_steps = vec![StepVisualState::Idle; job.steps.len()];
@@ -553,7 +766,8 @@ impl MainState {
             label.push_str(&format!(" · 从 Step {}", from_step + 1));
         }
 
-        // §12.2：每个 job 一个 broadcast sender
+        // §12.2：每个 job 一个 broadcast sender（cancel_tx 一份进 RunInput ——
+        // 引擎用它实现同项目运行互斥的锁监视）
         let (cancel_tx, cancel_rx) = broadcast::channel(4);
         let (tok_tx, mut tok_rx) = mpsc::channel(8192);
         let (std_tx, std_rx) = std_mpsc::channel();
@@ -570,6 +784,8 @@ impl MainState {
             from_step,
             only_step,
             run_id: run_id.clone(),
+            default_step_timeout: self.global.default_timeout,
+            cancel_tx: Some(cancel_tx.clone()),
         };
 
         // 日志文件（§11：日志原文落文件，SQLite 只存路径——P1）
@@ -611,6 +827,31 @@ impl MainState {
             }
         });
 
+        // 运行前自动保存：跑的必然是内存里刚编辑过的副本，用户忘了点「💾 Save」时
+        // Reload 也不会把编辑丢掉（新建流程本就落盘，这里兜住步骤编辑）
+        {
+            let entry = &self.projects[pi];
+            let job_entry = &entry.jobs[ji];
+            let results = (
+                files::save_yaml(&entry.dir.join("project.yaml"), &entry.project),
+                files::save_yaml(&job_entry.path, &job_entry.job),
+            );
+            match results {
+                (Ok(()), Ok(())) => {
+                    self.console.push_line(
+                        "（运行前已自动保存 project.yaml 与当前流程）",
+                        crate::ui::console::Role::Info,
+                    );
+                }
+                (Err(e), _) | (_, Err(e)) => {
+                    self.console.push_line(
+                        format!("⚠ 运行前自动保存失败: {e}（本次按内存内容执行）"),
+                        crate::ui::console::Role::Info,
+                    );
+                }
+            }
+        }
+
         self.console.push_line(
             format!("==== 启动作业 {label} ===="),
             crate::ui::console::Role::Info,
@@ -636,6 +877,60 @@ impl MainState {
             (Ok(()), Ok(())) => "已保存 ✅".to_string(),
             (Err(e), _) | (_, Err(e)) => format!("保存失败: {e}"),
         });
+    }
+}
+
+/// 「🔒 人工确认」窗口（job.confirm 确认门）：输入确认词后才真正 launch_run
+fn show_confirm_gate_window(ctx: &egui::Context, main: &mut MainState) {
+    if !main.confirm_gate.open {
+        return;
+    }
+    crate::ui::modal_backdrop(ctx, "mask_confirm_gate");
+    let mut pass = false;
+    let mut cancel = false;
+    egui::Window::new("🔒 人工确认")
+        .collapsible(false)
+        .order(egui::Order::Tooltip)
+        .default_width(420.0)
+        .show(ctx, |ui| {
+            let gate = &mut main.confirm_gate;
+            ui.colored_label(
+                egui::Color32::from_rgb(230, 180, 80),
+                format!(
+                    "流程「{}」设置了确认门（防手滑上生产）。\n输入「{}」以继续执行：",
+                    gate.job_label, gate.expected
+                ),
+            );
+            ui.add_space(4.0);
+            let resp = ui.add(
+                egui::TextEdit::singleline(&mut gate.input)
+                    .desired_width(180.0)
+                    .hint_text("输入确认词"),
+            );
+            let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            let matched = gate.input.trim() == gate.expected;
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(matched, egui::Button::new("✅ 确认执行"))
+                    .clicked()
+                    || (enter && matched)
+                {
+                    pass = true;
+                }
+                if ui.button("取消").clicked() {
+                    cancel = true;
+                }
+                if !gate.input.is_empty() && !matched {
+                    ui.weak(format!("输入与确认词「{}」不一致", gate.expected));
+                }
+            });
+        });
+    if pass {
+        main.confirm_gate_pass();
+    }
+    if cancel {
+        main.confirm_gate.open = false;
     }
 }
 

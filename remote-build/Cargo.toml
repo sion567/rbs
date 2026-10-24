@@ -11,6 +11,7 @@ resources = ["tools/", "config/"]
 # wgpu 渲染后端：glow 在 RDP/远程会话下只有 GDI OpenGL 1.1，无法满足 GL2 要求；
 # wgpu 走 DX12/Vulkan，远程桌面可用
 eframe = { version = "0.37", default-features = false, features = [
+    "clipboard", # 系统剪贴板（arboard）：缺了它 Ctrl+C/V 只走 egui 内部剪贴板，外部复制的内容粘不进来
     "accesskit",
     "default_fonts",
     "wgpu",
@@ -24,13 +25,14 @@ async-trait = "0.1"
 thiserror = "1.0"
 anyhow = "1.0"
 dirs = "5.0"
+log = "0.4"                         # 仅用于 StderrLogger（main.rs）：暴露 egui-winit/arboard/wgpu 的静默错误
 whoami = "1.4"
 chrono = { version = "0.4", features = ["serde"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 sha2 = "0.10"                    # 工具校验和
 keyring = "2.0"                  # Windows Credential Manager（P1 密码存储）
-winapi = { version = "0.3", features = ["shellapi", "winuser", "wincon", "winnls", "stringapiset"] }  # 快捷方式/通知（P2）；子进程输出 OEM 代码页解码
+winapi = { version = "0.3", features = ["shellapi", "winuser", "wincon", "winnls", "stringapiset", "jobapi2", "winnt", "handleapi"] }  # 快捷方式/通知（P2）；OEM 代码页解码；Job Object 进程树终止
 rfd = "0.13"                     # 原生文件/文件夹选择对话框（项目目录浏览）
 zip = { version = "2", default-features = false, features = ["deflate"] }  # pack 步骤内置打包
 glob = "0.3"                     # pack 源通配匹配（如 target/*.jar）

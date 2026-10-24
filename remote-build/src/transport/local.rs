@@ -39,12 +39,17 @@ impl RemoteTransport for LocalTransport {
         cmd.stderr(std::process::Stdio::piped());
         // 不弹出额外控制台窗口（CREATE_NO_WINDOW）
         cmd.creation_flags(0x0800_0000);
+        // 超时丢弃 future 时保底杀掉直接子进程（进程树交给 Job Object，见下）
+        cmd.kill_on_drop(true);
 
         let mut child = cmd.spawn().map_err(|e| {
             anyhow::anyhow!("命令启动失败: {e}（command: {command}）")
         })?;
+        // 挂进 KILL_ON_JOB_CLOSE 的 Job Object：超时（future 丢弃 → 句柄关闭）/
+        // 取消（显式 terminate）时 cmd.exe → java.exe → … 整棵树一起终止
+        let tree = super::win_job::ProcTreeGuard::attach(&child);
         pipe_child_output(&mut child, log);
-        wait_with_cancel(&mut child, cancel).await
+        wait_with_cancel(&mut child, cancel, &tree).await
     }
 
     async fn upload(
@@ -108,10 +113,13 @@ pub(super) fn pipe_child_output(child: &mut tokio::process::Child, log: &LogHand
     }
 }
 
-/// 等待子进程退出；取消信号到达时 kill（§12.2 select! 模型）
+/// 等待子进程退出；取消信号到达时终止整棵进程树（§12.2 select! 模型）。
+/// `tree` 为 KILL_ON_JOB_CLOSE 的 Job Object 守卫：`terminate()` 杀树、
+/// Drop（调用方栈帧销毁，如超时丢 future）也会杀树；kill 仅作挂载失败时的兜底。
 pub(super) async fn wait_with_cancel(
     child: &mut tokio::process::Child,
     cancel: &mut broadcast::Receiver<()>,
+    tree: &super::win_job::ProcTreeGuard,
 ) -> anyhow::Result<ExitStatus> {
     tokio::select! {
         status = child.wait() => {
@@ -119,6 +127,7 @@ pub(super) async fn wait_with_cancel(
             Ok(ExitStatus::from_code(status.code().unwrap_or(-1)))
         }
         _ = cancel.recv() => {
+            tree.terminate();
             let _ = child.kill().await;
             anyhow::bail!("__cancelled__")
         }

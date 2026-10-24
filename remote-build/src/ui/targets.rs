@@ -86,13 +86,29 @@ pub fn show(ctx: &egui::Context, main: &mut MainState) {
 
     let has_project = main.selected_project.is_some();
 
+    // 未选中时默认选中一个目标：优先 local，其次按名称排最前的，省得每次手动点
+    if has_project && main.target_editor.selected.is_none() {
+        let names: Vec<String> = scope_map_ref(main)
+            .map(|m| m.keys().cloned().collect())
+            .unwrap_or_default();
+        let pick = names
+            .iter()
+            .find(|n| n.as_str() == "local")
+            .cloned()
+            .or_else(|| names.iter().min().cloned());
+        if let Some(name) = pick {
+            load_buffers(main, &name);
+            main.target_editor.selected = Some(name);
+        }
+    }
+
     let mut open = main.target_editor.open;
     if open {
         crate::ui::modal_backdrop(ctx, "mask_targets");
     }
     egui::Window::new("🎯 目标管理")
         .open(&mut open)
-        .order(egui::Order::Tooltip)
+        .order(egui::Order::Foreground)
         .default_width(720.0)
         .default_height(560.0)
         .show(ctx, |ui| {
@@ -200,8 +216,11 @@ fn target_list_and_form(ui: &mut egui::Ui, main: &mut MainState) {
             }
         }
         if ui
-            .button("🔌 连接测试")
-            .on_hover_text("SSH 连接测试 + 服务器体检：CPU / 内存 / 磁盘 / 负载（8 秒超时）")
+            .button("🔌 测试连接")
+            .on_hover_text(
+                "SSH 连接测试 + 服务器体检：CPU / 内存 / 磁盘 / 负载（8 秒超时）。\n\
+                 直接用当前表单值测试（无需先保存）；密码栏已输入未保存的密码也会参与本次测试",
+            )
             .clicked()
         {
             start_test(main);
@@ -237,13 +256,18 @@ fn target_list_and_form(ui: &mut egui::Ui, main: &mut MainState) {
             Color32::from_rgb(230, 110, 110)
         };
         let icon = if *ok { "✅" } else { "❌" };
-        // 等宽字体：磁盘/内存列对齐（体检信息为多行）
-        ui.colored_label(
-            color,
-            egui::RichText::new(format!("{icon} {msg}")).monospace(),
+        // 等宽字体：磁盘/内存列对齐（体检信息为多行）；
+        // selectable：指纹等关键信息可直接选中复制，避免手抄 43 位出错
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(format!("{icon} {msg}"))
+                    .monospace()
+                    .color(color),
+            )
+            .selectable(true),
         );
         if !ok && msg.contains("host key") {
-            ui.weak("提示：把连接测试输出中的 SHA256 指纹填入「主机键指纹」字段即可信任（TOFU）。");
+            ui.weak("提示：把连接测试输出中的 SHA256 指纹（可选中复制）填入「主机键指纹」字段即可信任（TOFU）。");
         }
     }
 }
@@ -264,9 +288,13 @@ fn edit_form(ui: &mut egui::Ui, main: &mut MainState) {
     // 重命名放在取 map 可变借用之后会失效，这里先收集、表单结束后统一应用
     let mut rename_to: Option<String> = None;
 
+    // 限制列宽让长提示文字在单元格内换行：默认 Grid 文本不换行，提示文字会把
+    // 第 1 列撑到几百 px，把同行更靠右的控件推出可视区
+    let form_width = ui.available_width();
     egui::Grid::new("target_form_grid")
         .num_columns(2)
         .spacing([10.0, 4.0])
+        .max_col_width(form_width)
         .show(ui, |ui| {
             ui.label("名称:");
             ui.horizontal(|ui| {
@@ -366,12 +394,14 @@ fn edit_form(ui: &mut egui::Ui, main: &mut MainState) {
                         AuthMethod::Password { .. } => {
                             ui.label("密码:");
                             ui.horizontal(|ui| {
+                                // 给「保存密码」按钮留位，避免窄窗口下按钮被右缘裁掉
+                                let input_w = (ui.available_width() - 90.0).max(120.0);
                                 let resp = ui.add(
                                     egui::TextEdit::singleline(
                                         &mut main.target_editor.password_buf,
                                     )
                                     .password(true)
-                                    .desired_width(200.0),
+                                    .desired_width(input_w),
                                 );
                                 if resp.changed() {
                                     main.target_editor.unsaved = true;
@@ -422,7 +452,8 @@ fn edit_form(ui: &mut egui::Ui, main: &mut MainState) {
                 }
                 TargetType::Kubernetes { kubeconfig, context, namespace, registry } => {
                     ui.label("kubeconfig:");
-                    if text_row(ui, kubeconfig, 300.0) {
+                    // 占满单元格剩余宽度：固定 300 在窄窗口会被右缘裁掉
+                    if text_row(ui, kubeconfig, ui.available_width()) {
                         main.target_editor.unsaved = true;
                     }
                     ui.end_row();
@@ -444,8 +475,10 @@ fn edit_form(ui: &mut egui::Ui, main: &mut MainState) {
             }
 
             if matches!(target.target_type, TargetType::Ssh { .. }) {
-                ui.label("远端根目录:");
-                if option_text_row(ui, "work_root:", &mut target.work_root, 220.0) {
+                // 注意：一行只能占 Grid 的两格（label + 值控件）。此前在外面多加了
+                // 「远端根目录:」label，把值控件挤到第 2 列、推出可视区（点 ＋ 后
+                // 输入框只露一半），现在 label 直接由 option_text_row 渲染
+                if option_text_row(ui, "远端根目录:", &mut target.work_root, 220.0) {
                     main.target_editor.unsaved = true;
                 }
                 ui.label("");
@@ -456,7 +489,7 @@ fn edit_form(ui: &mut egui::Ui, main: &mut MainState) {
                 if let TargetType::Ssh { host_key, .. } = &mut target.target_type {
                     let resp = ui.add(
                         egui::TextEdit::singleline(host_key.get_or_insert_default())
-                            .desired_width(300.0)
+                            .desired_width(ui.available_width())
                             .font(egui::TextStyle::Monospace)
                             .hint_text("SHA256:...（连接测试失败时输出会给出，复制填入）"),
                     );
@@ -603,7 +636,9 @@ fn load_buffers(main: &mut MainState, name: &str) {
 }
 
 /// 后台线程做 SSH 连接测试 + 服务器体检（复用 putty::probe_server，8 秒超时）；
-/// 回填凭据键，保证密码取自本项目的条目
+/// 回填凭据键，保证密码取自本项目的条目。
+/// 表单里已输入、尚未点「保存密码」的密码直接参与本次测试（DBeaver 式：
+/// 首次配置即可验证连通性，不必先落凭据管理器；临时密码不落任何存储）。
 fn start_test(main: &mut MainState) {
     let Some(name) = main.target_editor.selected.clone() else {
         return;
@@ -617,17 +652,33 @@ fn start_test(main: &mut MainState) {
         return;
     }
     if matches!(&t.target_type, TargetType::Ssh { host, .. } if host.trim().is_empty()) {
-        main.target_editor.test_result = Some((false, "主机为空，请先填写并保存".to_string()));
+        main.target_editor.test_result = Some((false, "主机为空，请先填写主机地址".to_string()));
         return;
     }
     t.cred_key = Some(cred_key_for(main, &name));
+
+    // 已输入未保存的密码：仅本次测试使用
+    let typed_password = matches!(
+        &t.target_type,
+        TargetType::Ssh { auth: AuthMethod::Password { .. }, .. }
+    )
+    .then(|| main.target_editor.password_buf.clone())
+    .filter(|p| !p.is_empty());
 
     main.target_editor.test_result = None;
     let (tx, rx) = std::sync::mpsc::channel();
     main.target_editor.test_rx = Some(rx);
     std::thread::spawn(move || {
-        let res = crate::transport::putty::probe_server(&t)
-            .map(|(info, elapsed)| info.display(elapsed));
+        let res = crate::transport::putty::probe_server_with(&t, typed_password.as_deref())
+            .map(|(info, elapsed)| {
+                let mut text = info.display(elapsed);
+                if typed_password.is_some() {
+                    text.push_str(
+                        "\n（本次使用表单输入的密码，尚未保存——点「保存密码」写入凭据管理器）",
+                    );
+                }
+                text
+            });
         let _ = tx.send(res);
     });
 }

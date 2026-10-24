@@ -14,7 +14,9 @@ use eframe::egui;
 /// 弹窗遮罩：全屏半透明黑罩，打开弹窗时挡住下层 UI 的鼠标交互。
 ///
 /// 遮罩画在 Order::Middle（与主界面同带、区域内置顶，点它也只会在这带内置顶）；
-/// 配套的弹窗窗口用 `.order(egui::Order::Tooltip)` 罩在遮罩之上。
+/// 配套的弹窗窗口用 `.order(egui::Order::Foreground)` 罩在遮罩之上。
+/// 注意不能用 Order::Tooltip：ComboBox 弹层固定在 Foreground 带，
+/// Tooltip 带的窗口会把弹窗内所有下拉框的列表整个盖住。
 pub(crate) fn modal_backdrop(ctx: &egui::Context, id: &str) {
     egui::Area::new(egui::Id::unique(id))
         .order(egui::Order::Middle)

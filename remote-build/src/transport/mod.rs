@@ -7,6 +7,7 @@ pub mod local;
 pub mod openssh;
 pub mod putty;
 pub mod russh;
+pub mod win_job;
 
 use crate::models::{LogEvent, Target, TargetType};
 use async_trait::async_trait;

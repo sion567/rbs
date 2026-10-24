@@ -103,10 +103,26 @@ pub struct Job {
     pub environment: Option<String>,
     /// 整个 job 超时（秒）
     pub timeout: Option<u64>,
+    /// 人工确认门（GHA environment protection 思路）：执行前要求输入该确认词才放行，
+    /// 防手滑上生产。例：confirm: prod —— 运行时弹窗输入 prod 才开始。
+    pub confirm: Option<String>,
+    /// 前置检查（Task preconditions 语义）：执行前在发版机本地逐条跑 check 命令，
+    /// 任一退出码非 0 → 整个 job 零秒失败并展示 message（人话说明）。
+    pub preconditions: Vec<Precondition>,
     pub on_failure: FailureAction,
     pub steps: Vec<Step>,
     /// 项目级默认工作目录（相对 local_path）
     pub working_dir: Option<String>,
+}
+
+/// job 前置检查条目：check 在发版本机本地执行（经变量替换），退出码 0 = 通过
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct Precondition {
+    /// 本地检查命令，如 java -version / test -d /opt/backup
+    pub check: String,
+    /// 失败时展示的人话说明（如「JDK 未安装」）；空 = 用命令输出兜底
+    #[serde(default)]
+    pub message: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -147,8 +163,14 @@ pub struct Step {
     pub working_dir: Option<String>,
     /// 步骤级额外环境变量
     pub env: HashMap<String, String>,
-    /// 条件执行，如 ${{ env.VERSION != '' }}
+    /// 条件执行（Ansible when 语义；YAML 可写 when: 或 condition:，二者等价）。
+    /// 例：${{ variables.ENV }} == prod / ${{ env.VERSION != '' }}
+    #[serde(alias = "when")]
     pub condition: Option<String>,
+    /// 状态守卫（Ansible creates 语义）：该路径已存在则跳过本步，重跑秒过已完成步骤。
+    /// 本地步骤相对 project.local_path（支持 * 通配）；SSH 目标为远端路径（相对 = work_root）。
+    /// 例：「拉依赖」creates node_modules、「编译」creates target/*.jar
+    pub creates: Option<String>,
     /// step_type=k8s-apply 时有效（P1.5 生效）
     pub k8s_watch: Option<Vec<K8sWatchTarget>>,
     /// 步骤级目标（§3.3）：覆盖流程级默认目标——混合流程的关键。
@@ -509,6 +531,7 @@ impl<'de> Deserialize<'de> for AuthMethod {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GlobalConfig {
+    /// 步骤默认超时（秒）：步骤未显式配 step.timeout 时的兜底（引擎接线）
     pub default_timeout: u64,
     pub max_concurrent_jobs: u32,
     pub log_retention_days: u32,
@@ -605,13 +628,20 @@ pub enum JobStatus {
 }
 
 impl JobStatus {
+    /// 前置检查失败的 step_index 占位（不对应任何真实步骤）
+    pub const PRECONDITION_STEP: usize = usize::MAX;
+
     pub fn short(&self) -> String {
         match self {
             JobStatus::Running => "running".into(),
             JobStatus::Success => "success".into(),
             JobStatus::Failed { step_index, reason } => {
-                // 对外展示统一 1 起始（与 StepStart/StepEnd 事件一致）
-                format!("failed (step {}: {})", step_index + 1, reason)
+                if *step_index == Self::PRECONDITION_STEP {
+                    format!("failed (precondition: {reason})")
+                } else {
+                    // 对外展示统一 1 起始（与 StepStart/StepEnd 事件一致）
+                    format!("failed (step {}: {})", step_index + 1, reason)
+                }
             }
             JobStatus::Cancelled => "cancelled".into(),
             JobStatus::Timeout => "timeout".into(),
@@ -765,6 +795,25 @@ steps:
         assert!(matches!(j.steps[0].step_type, StepType::Exec));
         assert!(j.steps[0].enabled);
         assert!(matches!(j.on_failure, FailureAction::Stop));
+    }
+
+    #[test]
+    fn step_when_alias_and_creates() {
+        // when: 是 condition 的别名（Ansible 风格写法）；creates 状态守卫
+        let yaml = r#"
+name: w
+project: p
+steps:
+  - name: 拉依赖
+    command: pnpm install
+    step_type: exec
+    enabled: true
+    when: ${{ variables.ENV }} == prod
+    creates: node_modules
+"#;
+        let j: Job = yaml_serde::from_str(yaml).unwrap();
+        assert_eq!(j.steps[0].condition.as_deref(), Some("${{ variables.ENV }} == prod"));
+        assert_eq!(j.steps[0].creates.as_deref(), Some("node_modules"));
     }
 
     #[test]

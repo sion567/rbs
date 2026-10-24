@@ -27,6 +27,10 @@ pub fn dispatch(args: &[String]) -> Option<()> {
             run(args.get(1..).unwrap_or_default());
             Some(())
         }
+        Some("preview") => {
+            preview(args.get(1..).unwrap_or_default());
+            Some(())
+        }
         Some("help" | "--help" | "-h") => {
             print_help();
             Some(())
@@ -41,7 +45,8 @@ fn print_help() {
          remote-build                                  启动图形界面\n  \
          remote-build set-password <目标名> <密码>     写入系统凭据管理器（不落盘）\n  \
          remote-build test-conn <目标名>               SSH 连接测试\n  \
-         remote-build run <项目名> <流程名>            无头执行一条流程"
+         remote-build run <项目名> <流程名> [--yes]    无头执行一条流程（--yes 跳过确认门）\n  \
+         remote-build preview <项目名> <流程名>        干跑预览（展示解析后的命令，不执行）"
     );
 }
 
@@ -104,8 +109,9 @@ fn test_conn(args: &[String]) {
 }
 
 fn run(args: &[String]) {
-    if args.len() != 2 {
-        eprintln!("用法: remote-build run <项目名> <流程名>");
+    let yes_flag = args.get(2).map(|s| s.as_str() == "--yes").unwrap_or(false);
+    if args.len() != 2 && !(args.len() == 3 && yes_flag) {
+        eprintln!("用法: remote-build run <项目名> <流程名> [--yes]");
         std::process::exit(2);
     }
     let (project_name, job_name) = (args[0].clone(), args[1].clone());
@@ -133,6 +139,28 @@ fn run(args: &[String]) {
         std::process::exit(2);
     };
 
+    // 人工确认门（job.confirm）：交互终端输入确认词；非交互终端必须显式 --yes
+    let expected = je.job.confirm.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    if let Some(expected) = expected {
+        use std::io::IsTerminal as _;
+        if yes_flag {
+            println!("ℹ 已跳过确认门（--yes，确认词: {expected}）");
+        } else if !std::io::stdin().is_terminal() {
+            eprintln!("❌ 流程设置了确认门（需输入「{expected}」）：非交互终端请追加 --yes");
+            std::process::exit(1);
+        } else {
+            print!("🔒 确认门：输入「{expected}」以继续执行: ");
+            use std::io::Write as _;
+            std::io::stdout().flush().ok();
+            let mut line = String::new();
+            let _ = std::io::stdin().read_line(&mut line);
+            if line.trim() != expected {
+                eprintln!("❌ 确认词不匹配，已取消");
+                std::process::exit(1);
+            }
+        }
+    }
+
     let tools = config::load_tools().map(|t| t.tools).unwrap_or_default();
     let all_targets = config::effective_targets(&entry.project);
 
@@ -157,7 +185,7 @@ fn run(args: &[String]) {
         }
     });
 
-    let (_cancel_tx, cancel_rx) = broadcast::channel(4);
+    let (cancel_tx, cancel_rx) = broadcast::channel(4);
     let engine = Engine;
     let run_id = format!(
         "{}-{}",
@@ -172,6 +200,11 @@ fn run(args: &[String]) {
         from_step: 0,
         only_step: None,
         run_id,
+        default_step_timeout: config::load_global()
+            .map(|g| g.default_timeout)
+            .unwrap_or(crate::engine::DEFAULT_STEP_TIMEOUT),
+        // 传取消发送端 = 启用同项目运行互斥（新运行自动取消旧运行）
+        cancel_tx: Some(cancel_tx),
     };
 
     let status = rt.block_on(engine.run_job(input, cancel_rx, tx));
@@ -180,4 +213,79 @@ fn run(args: &[String]) {
     if !status.ok() {
         std::process::exit(1);
     }
+}
+
+/// `remote-build preview <项目名> <流程名>`：干跑预览（Ansible --check 思路），
+/// 展示变量全量解析后的最终命令 / 上传清单 / 将跳过的步骤，不执行任何命令。
+fn preview(args: &[String]) {
+    if args.len() != 2 {
+        eprintln!("用法: remote-build preview <项目名> <流程名>");
+        std::process::exit(2);
+    }
+    let (project_name, job_name) = (args[0].clone(), args[1].clone());
+
+    let (projects, warnings) = crate::storage::files::discover_with_errors(&config::projects_dir());
+    for w in &warnings {
+        eprintln!("⚠ {w}");
+    }
+    let Some(entry) = projects.into_iter().find(|p| p.project.name == project_name) else {
+        eprintln!("❌ 未找到项目: {project_name}");
+        std::process::exit(2);
+    };
+    let Some(je) = entry.jobs.iter().find(|j| j.job.name == job_name) else {
+        eprintln!("❌ 项目 {project_name} 下未找到流程: {job_name}");
+        std::process::exit(2);
+    };
+
+    let input = RunInput {
+        project: entry.project.clone(),
+        job: je.job.clone(),
+        tools: config::load_tools().map(|t| t.tools).unwrap_or_default(),
+        all_targets: config::effective_targets(&entry.project),
+        from_step: 0,
+        only_step: None,
+        run_id: String::new(),
+        default_step_timeout: config::load_global()
+            .map(|g| g.default_timeout)
+            .unwrap_or(crate::engine::DEFAULT_STEP_TIMEOUT),
+        cancel_tx: None,
+    };
+
+    let previews = crate::engine::preview_job(&input);
+    println!("==== 预览（干跑，不执行）: {project_name}/{job_name} ====");
+    if let Some(c) = je.job.confirm.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        println!("🔒 确认门: 运行前需输入「{c}」");
+    }
+    for pre in &je.job.preconditions {
+        let msg = if pre.message.trim().is_empty() {
+            String::new()
+        } else {
+            format!("（失败: {}）", pre.message.trim())
+        };
+        println!("前置检查: {}{msg}", pre.check);
+    }
+    let (mut exec_n, mut skip_n) = (0usize, 0usize);
+    for p in &previews {
+        let tgt = p.target.clone().unwrap_or_else(|| "local".to_string());
+        if p.skipped {
+            skip_n += 1;
+            println!("[{}] {}  ⏭ 跳过：{}", p.index + 1, p.name, p.note.as_deref().unwrap_or(""));
+        } else {
+            exec_n += 1;
+            println!("[{}] {}  目标: {}", p.index + 1, p.name, tgt);
+            if !p.command.is_empty() {
+                println!("    $ {}", p.command);
+            }
+            for (l, r, exists) in &p.uploads {
+                println!("    ↑ {l} -> {r}{}", if *exists { "" } else { "（本地缺失 ⚠）" });
+            }
+            if let Some((s, d)) = &p.pack {
+                println!("    ⧉ 打包 {s} -> {d}");
+            }
+        }
+        for w in &p.warnings {
+            eprintln!("    ⚠ {w}");
+        }
+    }
+    println!("==== 预览结束：{exec_n} 步执行 / {skip_n} 步跳过 ====");
 }

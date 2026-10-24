@@ -46,7 +46,14 @@ impl FirstRunPage {
             ui.add_space(24.0);
             ui.vertical_centered(|ui| {
                 ui.heading("Remote Build System — 首次启动");
-                ui.label("已扫描系统环境变量与 PATH，确认后生成配置文件到 ~/.remote-build/");
+                // 显示解析后的实际目录：REMOTE_BUILD_HOME 重定向时避免误导（如测试时指向 temp）
+                ui.label(format!(
+                    "已扫描系统环境变量与 PATH，确认后生成配置文件到 {}",
+                    crate::config::app_root().display()
+                ));
+                if std::env::var_os("REMOTE_BUILD_HOME").is_some() {
+                    ui.weak("（检测到 REMOTE_BUILD_HOME，数据目录已被重定向到上面路径）");
+                }
             });
             ui.add_space(16.0);
 

@@ -192,6 +192,8 @@ fn create_example_project() -> Result<()> {
         target: Some("local".to_string()),
         environment: Some("staging".to_string()),
         timeout: Some(60),
+        confirm: None,
+        preconditions: Vec::new(),
         on_failure: FailureAction::Stop,
         steps: vec![
             Step {
@@ -272,6 +274,8 @@ pub fn create_project_entry(name: &str, local_path: &Path) -> Result<PathBuf> {
         target: Some("local".to_string()),
         environment: None,
         timeout: Some(60),
+        confirm: None,
+        preconditions: Vec::new(),
         on_failure: FailureAction::Stop,
         steps: vec![Step {
             name: Some("项目就绪".to_string()),

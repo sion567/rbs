@@ -223,6 +223,36 @@ pub fn show(main: &mut MainState, ui: &mut egui::Ui) {
                     ui.selectable_value(&mut job.on_failure, FailureAction::Continue, "continue");
                     ui.selectable_value(&mut job.on_failure, FailureAction::Retry, "retry");
                 });
+
+            ui.separator();
+            // 人工确认门（GHA environment protection）：防手滑上生产
+            match &mut job.confirm {
+                Some(c) => {
+                    ui.label("确认门:").on_hover_text(
+                        "运行前弹窗要求输入该确认词（如 prod）才放行，防手滑上生产。\n\
+                         CLI 对应 remote-build run ... [--yes] 跳过",
+                    );
+                    ui.add(
+                        egui::TextEdit::singleline(c)
+                            .desired_width(70.0)
+                            .hint_text("prod"),
+                    );
+                    if ui.small_button("×").clicked() {
+                        job.confirm = None;
+                    }
+                }
+                None => {
+                    if ui
+                        .small_button("＋确认门")
+                        .on_hover_text(
+                            "运行前要求输入确认词（如 prod）才放行，防手滑上生产",
+                        )
+                        .clicked()
+                    {
+                        job.confirm = Some("prod".to_string());
+                    }
+                }
+            }
         });
     });
 
@@ -267,6 +297,58 @@ pub fn show(main: &mut MainState, ui: &mut egui::Ui) {
 
     ui.add_space(8.0);
     ui.separator();
+
+    // ── 前置检查（Task preconditions）：执行前本地断言，失败零秒退出 ──
+    let mut pre_del: Option<usize> = None;
+    let mut pre_add = false;
+    ui.add_enabled_ui(!running, |ui| {
+        ui.horizontal(|ui| {
+            if ui
+                .small_button("＋前置检查")
+                .on_hover_text(
+                    "执行前在发版机本地逐条运行，任一退出码非 0 → 整个流程零秒失败并展示说明。\n\
+                     例：java -version（失败说明「JDK 未安装」）；支持 ${{ variables.X }} 替换",
+                )
+                .clicked()
+            {
+                pre_add = true;
+            }
+            if !job.preconditions.is_empty() {
+                ui.weak(format!(
+                    "前置检查 {} 条：任一失败整个流程不执行",
+                    job.preconditions.len()
+                ));
+            }
+        });
+        for (i, pre) in job.preconditions.iter_mut().enumerate() {
+            ui.horizontal(|ui| {
+                if ui.small_button("−").clicked() {
+                    pre_del = Some(i);
+                }
+                ui.monospace(format!("{}", i + 1));
+                ui.add(
+                    egui::TextEdit::singleline(&mut pre.check)
+                        .desired_width(300.0)
+                        .hint_text("本地命令，如 java -version"),
+                );
+                ui.add(
+                    egui::TextEdit::singleline(&mut pre.message)
+                        .desired_width(200.0)
+                        .hint_text("失败时的人话说明"),
+                );
+            });
+        }
+    });
+    if let Some(i) = pre_del {
+        if i < job.preconditions.len() {
+            job.preconditions.remove(i);
+        }
+    }
+    if pre_add {
+        job.preconditions.push(crate::models::Precondition::default());
+    }
+
+    ui.add_space(4.0);
     ui.add_space(4.0);
 
     // ── 步骤列表 ─────────────────────────────────────────────────────
@@ -376,7 +458,7 @@ pub fn show_new_job_window(ctx: &egui::Context, main: &mut MainState) {
     }
     egui::Window::new("＋ 新建流程")
         .open(&mut open)
-        .order(egui::Order::Tooltip)
+        .order(egui::Order::Foreground)
         .default_width(520.0)
         .show(ctx, |ui| {
             let Some(pi) = main.selected_project else {
@@ -468,6 +550,8 @@ fn create_job(main: &mut MainState) {
         target: None,
         environment: None,
         timeout: Some(60),
+        confirm: None,
+        preconditions: Vec::new(),
         on_failure: FailureAction::Stop,
         steps,
         working_dir: None,
@@ -511,7 +595,7 @@ pub fn show_var_help_window(ctx: &egui::Context, main: &mut MainState) {
     }
     egui::Window::new("？ 变量语法速查")
         .open(&mut open)
-        .order(egui::Order::Tooltip)
+        .order(egui::Order::Foreground)
         .default_width(720.0)
         .default_height(520.0)
         .show(ctx, |ui| {
@@ -533,6 +617,11 @@ pub fn show_var_help_window(ctx: &egui::Context, main: &mut MainState) {
                             "${{ variables.X }}".into(),
                             "project.yaml 的 variables.<组名>（「变量组」下拉选中的表）",
                             "选 prod 组时 ${{ variables.DEPLOY_DIR }} → /opt/yudao/prod",
+                        ),
+                        (
+                            "${{ variables.X || 默认值 }}".into(),
+                            "X 未定义时取默认值（Jinja2 default 语义；默认值可带引号）",
+                            "${{ variables.PORT || 8080 }} → 未定义时展开为 8080",
                         ),
                         (
                             "${{ env.X }}".into(),
@@ -576,10 +665,12 @@ pub fn show_var_help_window(ctx: &egui::Context, main: &mut MainState) {
             ui.add_space(8.0);
             ui.separator();
             ui.add_space(4.0);
-            ui.strong("二、条件表达式（步骤的「＋条件」字段）");
-            ui.monospace("${{ env.VERSION != '' }}      # 非空才执行本步；为空/未产出 → 跳过");
-            ui.monospace("${{ variables.ENABLE == '' }}  # 反向判断");
-            ui.weak("前缀支持 env. / variables. / targets.名.字段；P0 仅支持非空检查（!= '' / == ''）；解析失败按真值执行并警告。");
+            ui.strong("二、条件与状态守卫（步骤的「＋条件」/「＋creates」字段）");
+            ui.monospace("${{ env.VERSION != '' }}        # 非空才执行本步；为空/未产出 → 跳过");
+            ui.monospace("${{ variables.ENV }} == prod  # 等值比较（YAML 里可写 when: 等价别名）");
+            ui.monospace("${{ variables.ENV }} != prod  # 不等比较；未定义变量按空串参与比较");
+            ui.monospace("creates: node_modules         # 产物路径已存在 → 跳过本步（重跑秒过）");
+            ui.weak("条件两侧支持 env. / variables. / targets.名.字段 / now / run.id；解析失败按真值执行并警告。");
 
             ui.add_space(8.0);
             ui.separator();
@@ -587,6 +678,17 @@ pub fn show_var_help_window(ctx: &egui::Context, main: &mut MainState) {
             ui.strong("三、env 注入优先级（后者被前者覆盖）");
             ui.monospace("步骤 env > 工具 env > target env > 系统环境变量");
             ui.weak("JAVA_HOME 这类注入只影响该步骤的子进程，不改系统设置；env.X 特指前序步骤产出，全局配置请走 variables.X。");
+
+            ui.add_space(8.0);
+            ui.separator();
+            ui.add_space(4.0);
+            ui.strong("四、流程级开关（build.yaml）");
+            ui.monospace("confirm: prod            # 确认门：运行前弹窗输入 prod 才放行");
+            ui.monospace("preconditions:           # 前置检查：发版机本地断言，失败零秒退出");
+            ui.monospace("  - check: java -version");
+            ui.monospace("    message: JDK 未安装");
+            ui.monospace("timeout: 600             # 作业级总超时（秒）；步骤级用 step.timeout");
+            ui.weak("同项目运行互斥（GHA concurrency）：新运行自动取消旧运行，无需配置。");
 
             ui.add_space(8.0);
             ui.weak("完整说明见 docs/变量速查.md（设计文档 §6）。");
@@ -829,13 +931,52 @@ fn edit_step(
                     }
                 }
             }
+            // creates 状态守卫（Ansible creates）：产物已存在 → 跳过本步
+            match &mut step.creates {
+                Some(c) => {
+                    ui.label("creates:").on_hover_text(
+                        "产物路径已存在则整个步骤跳过（重跑秒过已完成步骤）。\n\
+                         本地相对项目目录，支持 * 通配；SSH 目标为远端路径（相对 = work_root）",
+                    );
+                    ui.add(
+                        egui::TextEdit::singleline(c)
+                            .desired_width(140.0)
+                            .hint_text("node_modules / target/*.jar"),
+                    );
+                    if ui.small_button("×").clicked() {
+                        step.creates = None;
+                    }
+                }
+                None => {
+                    if ui
+                        .small_button("＋creates")
+                        .on_hover_text(
+                            "状态守卫：声明本步的产物路径，已存在则跳过。\n\
+                             例：「拉依赖」creates node_modules、「编译」creates target/*.jar",
+                        )
+                        .clicked()
+                    {
+                        step.creates = Some(String::new());
+                    }
+                }
+            }
             if let Some(cond) = &mut step.condition {
-                ui.label("条件:");
+                ui.label("条件:").on_hover_text(
+                    "when / condition：条件不满足则跳过本步。\n\
+                     例：${{ variables.ENV }} == prod、${{ env.VERSION != '' }}",
+                );
                 ui.add(egui::TextEdit::singleline(cond).desired_width(220.0));
                 if ui.small_button("×").clicked() {
                     step.condition = None;
                 }
-            } else if ui.small_button("＋条件").clicked() {
+            } else if ui
+                .small_button("＋条件")
+                .on_hover_text(
+                    "条件跳过（YAML 里写 when: 或 condition: 等价）：\n\
+                     例：${{ variables.ENV }} == prod（生产专属步骤与通用流程合到一个流程）",
+                )
+                .clicked()
+            {
                 step.condition = Some("${{ env.VERSION != '' }}".to_string());
             }
         });

@@ -208,6 +208,15 @@ impl PuttyTransport {
     /// 解构出 host / port / user / auth / host_key，拼 plink / pscp 公共参数。
     /// 非 SSH 目标返回错误，由上层按 StepResult::Failed 处理，不 panic。
     pub(crate) fn build_ssh_args(target: &Target) -> anyhow::Result<(String, Vec<String>)> {
+        Self::build_ssh_args_with(target, None)
+    }
+
+    /// 同上，但 password 认证可用 `transient_password` 覆盖 Credential Manager——
+    /// 目标管理「连接测试」允许用表单里已输入、尚未保存的密码先行验证（DBeaver 式）。
+    pub(crate) fn build_ssh_args_with(
+        target: &Target,
+        transient_password: Option<&str>,
+    ) -> anyhow::Result<(String, Vec<String>)> {
         let mut args = vec!["-batch".to_string()];
 
         match &target.target_type {
@@ -216,12 +225,20 @@ impl PuttyTransport {
                 args.push(port.to_string());
 
                 // 主机键指纹固定（TOFU）：首次连接测试的输出会给出服务器指纹，
-                // 填入目标配置后即可在 -batch 模式下免交互连接，且比注册表缓存更严格
+                // 填入目标配置后即可在 -batch 模式下免交互连接，且比注册表缓存更严格。
+                // 先规范化：手抄/粘贴常带进杂质，坏格式 plink 只会报一句英文
+                // "is not a valid format for a manual host key specification"
                 if let Some(fp) = host_key {
-                    let fp = fp.trim();
-                    if !fp.is_empty() {
+                    if !fp.trim().is_empty() {
+                        let norm = normalize_host_key(fp).ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "主机键指纹格式无效（当前值「{}」）：应为 SHA256: 开头的服务器指纹，\
+                                 可从连接测试输出中选中复制",
+                                fp.trim()
+                            )
+                        })?;
                         args.push("-hostkey".to_string());
-                        args.push(fp.to_string());
+                        args.push(norm);
                     }
                 }
 
@@ -234,18 +251,24 @@ impl PuttyTransport {
                         // §5.7 / §14：密码只存 Windows Credential Manager，
                         // 键 = {项目}/{目标}（项目级）或 global/{目标}（全局共享），
                         // 不落 YAML；执行时经 -pw 传递（本机进程列表存在短暂暴露窗口，
-                        // 内网工具可接受，高安全场景请用 key / agent）
-                        let key = target
-                            .cred_key
-                            .clone()
-                            .unwrap_or_else(|| target.name.clone());
-                        let pwd = crate::secrets::get_password(&key).ok_or_else(|| {
-                            anyhow::anyhow!(
-                                "目标「{}」未存储密码（凭据键: {key}）：\
-                                 请在 🎯 目标管理中配置，或改用 key / agent 认证",
-                                target.name
-                            )
-                        })?;
+                        // 内网工具可接受，高安全场景请用 key / agent）。
+                        // 连接测试场景允许用表单临时密码（不落任何存储）。
+                        let pwd = match transient_password {
+                            Some(p) => p.to_string(),
+                            None => {
+                                let key = target
+                                    .cred_key
+                                    .clone()
+                                    .unwrap_or_else(|| target.name.clone());
+                                crate::secrets::get_password(&key).ok_or_else(|| {
+                                    anyhow::anyhow!(
+                                        "目标「{}」未存储密码（凭据键: {key}）：\
+                                         请在 🎯 目标管理中配置，或改用 key / agent 认证",
+                                        target.name
+                                    )
+                                })?
+                            }
+                        };
                         args.push("-pw".to_string());
                         args.push(pwd);
                     }
@@ -266,6 +289,8 @@ impl PuttyTransport {
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
         cmd.creation_flags(0x0800_0000);
+        // 超时丢弃 future 时杀掉 plink/pscp（叶子进程，无进程树）
+        cmd.kill_on_drop(true);
         cmd
     }
 
@@ -280,8 +305,11 @@ impl PuttyTransport {
             let mut child = cmd
                 .spawn()
                 .with_context(|| format!("启动失败: {}", self.plink.display()))?;
+            // 与 local.rs 同一套守卫：取消时整树终止；plink/pscp 是叶子进程，
+            // 挂 job 主要为了超时丢弃 future 时句柄关闭能可靠杀掉它们
+            let tree = super::win_job::ProcTreeGuard::attach(&child);
             pipe_child_output(&mut child, log);
-            wait_with_cancel(&mut child, cancel).await
+            wait_with_cancel(&mut child, cancel, &tree).await
         })
     }
 }
@@ -369,10 +397,6 @@ impl RemoteTransport for PuttyTransport {
 pub fn escape_posix_single_quote(s: &str) -> String {
     s.replace('\'', "'\\''")
 }
-
-/// SSH 连接测试（CLI test-conn 与 GUI 🎯 目标管理共用）：
-/// `plink -batch <认证参数> user@host "echo __RBS_OK__"`，5 秒超时。
-/// 认证参数复用 build_ssh_args（密码自动从 Credential Manager 取，§14）。
 
 /// 解析 sha256sum 输出行（`<hash>  <path>`），取小写哈希
 pub fn parse_sha256sum_output(line: &str) -> Option<String> {
@@ -488,12 +512,21 @@ pub const PROBE_CMD: &str = concat!(
 /// 并采集 CPU / 内存 / 磁盘等基础信息。超时 8s（df 比单条 echo 慢）。
 /// 成功返回 (ServerInfo, 耗时毫秒)；失败语义与原 test_connection 一致（含指纹引导）。
 pub fn probe_server(target: &Target) -> Result<(ServerInfo, u128), String> {
+    probe_server_with(target, None)
+}
+
+/// 同 probe_server，但 password 认证可用表单临时密码覆盖 Credential Manager
+/// （目标管理「连接测试」支持验证已输入、尚未保存的密码）。
+pub fn probe_server_with(
+    target: &Target,
+    transient_password: Option<&str>,
+) -> Result<(ServerInfo, u128), String> {
     let d = detect_putty_tools();
     if !d.found {
         return Err("未找到 plink（PuTTY），请安装或将套件放入内置目录".to_string());
     }
-    let (dest, mut args) =
-        PuttyTransport::build_ssh_args(target).map_err(|e| e.to_string())?;
+    let (dest, mut args) = PuttyTransport::build_ssh_args_with(target, transient_password)
+        .map_err(|e| e.to_string())?;
     args.push(dest);
     args.push(PROBE_CMD.to_string());
 
@@ -743,6 +776,40 @@ fn extract_fingerprint(text: &str) -> Option<String> {
     Some(rest[..end].trim().to_string())
 }
 
+/// 规范化用户填写的「主机键指纹」为 plink `-hostkey` 可接受的规格：
+/// 裸 `SHA256:base64`（PuTTY ≥0.75）或 MD5 十六进制冒号串；
+/// 粘贴整行（如 `ssh-ed25519 255 SHA256:...`）时从中提取指纹。
+/// 认不出（漏抄/多抄字符）返回 None，由调用方给出中文错误。
+fn normalize_host_key(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    // SHA256 指纹 = 32 字节 base64 去掉尾部 = 后恰好 43 字符
+    for (i, _) in raw.match_indices("SHA256:") {
+        let token = raw[i..].split_whitespace().next().unwrap_or_default();
+        let b64 = token["SHA256:".len()..].trim_end_matches('=');
+        if b64.len() == 43
+            && b64
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/')
+        {
+            // 统一返回去 padding 的形式（PuTTY 显示规范）
+            return Some(format!("SHA256:{b64}"));
+        }
+    }
+    // MD5 指纹 = 16 组两位十六进制（可带 MD5: 前缀）
+    raw.split_whitespace().find_map(|t| {
+        let t = t.strip_prefix("MD5:").unwrap_or(t);
+        (t.len() == 47
+            && t.split(':').count() == 16
+            && t.split(':').all(|g| {
+                g.len() == 2 && g.chars().all(|c| c.is_ascii_hexdigit())
+            }))
+        .then(|| t.to_string())
+    })
+}
+
 // ---------------------------------------------------------------------------
 // 测试
 // ---------------------------------------------------------------------------
@@ -790,6 +857,49 @@ mod tests {
     fn build_ssh_args_rejects_non_ssh() {
         let target = Target { name: "l".into(), target_type: TargetType::Local, ..Default::default() };
         assert!(PuttyTransport::build_ssh_args(&target).is_err());
+    }
+
+    #[test]
+    fn normalize_host_key_accepts_valid_specs() {
+        // 裸 SHA256 指纹（连接测试输出原样）
+        let fp = "SHA256:E4Wpmw1njCQ2d/UhkEpm9xMOTGDIZhgVLIsa0SnpGw4";
+        assert_eq!(normalize_host_key(fp).as_deref(), Some(fp));
+        // 完整规格整行粘贴 → 提取裸指纹
+        let full = format!("  ssh-ed25519 255 {fp} \n");
+        assert_eq!(normalize_host_key(&full).as_deref(), Some(fp));
+        // 带 padding 的 44 字符形式 → 去掉 = 统一为 43 字符
+        assert_eq!(
+            normalize_host_key("SHA256:abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRST=")
+                .as_deref(),
+            Some("SHA256:abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRST")
+        );
+        // MD5 指纹
+        let md5 = "aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99";
+        assert_eq!(normalize_host_key(md5).as_deref(), Some(md5));
+        assert_eq!(
+            normalize_host_key(&format!("MD5:{md5}")).as_deref(),
+            Some(md5)
+        );
+    }
+
+    #[test]
+    fn normalize_host_key_rejects_garbled_input() {
+        // 漏抄几位 → 报错而不是传给 plink 撞英文提示
+        assert_eq!(normalize_host_key("SHA256:E4Wpmw1njCQ2d/UhkEpm9xMOTGDIZhgVLIsa0"), None);
+        assert_eq!(normalize_host_key("aa:bb:cc"), None);
+        assert_eq!(normalize_host_key("hello"), None);
+        assert_eq!(normalize_host_key("   "), None);
+        assert_eq!(normalize_host_key(""), None);
+    }
+
+    #[test]
+    fn build_ssh_args_validates_host_key() {
+        let mut target = ssh_target(AuthMethod::Agent);
+        if let TargetType::Ssh { host_key, .. } = &mut target.target_type {
+            *host_key = Some("SHA256:短了".to_string());
+        }
+        let err = PuttyTransport::build_ssh_args(&target).unwrap_err();
+        assert!(err.to_string().contains("主机键指纹格式无效"), "got: {err}");
     }
 
     #[test]

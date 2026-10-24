@@ -177,7 +177,7 @@ fn confirm_delete_window(ctx: &egui::Context, main: &mut MainState) {
     let mut open = true;
     egui::Window::new("⚠ 确认删除")
         .open(&mut open)
-        .order(egui::Order::Tooltip)
+        .order(egui::Order::Foreground)
         .collapsible(false)
         .resizable(false)
         .default_width(480.0)
@@ -242,7 +242,7 @@ fn rename_window(ctx: &egui::Context, main: &mut MainState) {
     let mut do_rename = false;
     egui::Window::new("✏ 改名")
         .open(&mut open)
-        .order(egui::Order::Tooltip)
+        .order(egui::Order::Foreground)
         .collapsible(false)
         .resizable(false)
         .default_width(420.0)
