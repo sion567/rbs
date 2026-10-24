@@ -112,6 +112,7 @@ pub enum SettingsTab {
     Tools,
     Putty,
     Global,
+    History,
 }
 
 /// 文件夹样式的 tab 行：选中项填充高亮 + 粗体并压在下方分隔线上。
@@ -198,18 +199,24 @@ pub fn show(ctx: &egui::Context, main: &mut MainState) {
         .default_width(780.0)
         .default_height(560.0)
         .show(ctx, |ui| {
-            // ── 窗口级 tab：工具管理 / PuTTY / 全局配置 ──
+            // ── 窗口级 tab：工具管理 / PuTTY / 全局配置 / 运行历史 ──
             let tab_idx = match main.settings_tab {
                 SettingsTab::Tools => 0,
                 SettingsTab::Putty => 1,
                 SettingsTab::Global => 2,
+                SettingsTab::History => 3,
             };
-            let section_tabs =
-                vec!["🧰 工具管理".to_string(), "🔌 PuTTY".to_string(), "⚙ 全局配置".to_string()];
-            if let Some(i) = tab_row(ui, &section_tabs, tab_idx, &[true, true, true]) {
+            let section_tabs = vec![
+                "🧰 工具管理".to_string(),
+                "🔌 PuTTY".to_string(),
+                "⚙ 全局配置".to_string(),
+                "🕘 运行历史".to_string(),
+            ];
+            if let Some(i) = tab_row(ui, &section_tabs, tab_idx, &[true, true, true, true]) {
                 main.settings_tab = match i {
                     1 => SettingsTab::Putty,
                     2 => SettingsTab::Global,
+                    3 => SettingsTab::History,
                     _ => SettingsTab::Tools,
                 };
             }
@@ -281,6 +288,7 @@ pub fn show(ctx: &egui::Context, main: &mut MainState) {
                 }
                 SettingsTab::Putty => putty_section(ui, &mut main.global),
                 SettingsTab::Global => global_section(ctx, ui, &mut main.global),
+                SettingsTab::History => history_section(ui, main),
             }
         });
     // 每帧把窗口抬回遮罩之上（遮罩被点击/首帧会在这带内置顶）
@@ -767,7 +775,25 @@ fn global_section(
             ui.label(global.max_concurrent_jobs.to_string());
             ui.end_row();
             ui.label("日志保留:");
-            ui.label(format!("{} 天", global.log_retention_days));
+            ui.label(format!("{} 天（日志文件与运行历史共用）", global.log_retention_days));
+            ui.end_row();
+            ui.label("保留运行历史:");
+            if ui
+                .checkbox(&mut global.save_history, "存 SQLite（~/.remote-build/data/history.db）")
+                .changed()
+                && crate::config::save_global(global).is_err()
+            {
+                eprintln!("保存 config.yaml 失败");
+            }
+            ui.end_row();
+            ui.label("桌面通知:");
+            if ui
+                .checkbox(&mut global.desktop_notify, "作业结束时弹 Windows 通知（toast）")
+                .changed()
+                && crate::config::save_global(global).is_err()
+            {
+                eprintln!("保存 config.yaml 失败");
+            }
             ui.end_row();
             ui.label("主题:");
             let theme_names = ["明亮", "暗黑"];
@@ -801,4 +827,121 @@ fn global_section(
         "提示：PuTTY 自定义目录在「🔌 PuTTY」页设置（putty.custom_path）；\
          tools.yaml 的 putty 条目由探测自动生成，仅供展示。控制台配色跟随主题（深浅两套色板各自调校）。",
     );
+}
+
+// ---------------------------------------------------------------------------
+// 运行历史（SQLite，§11.2）：最近运行列表（kamal audit 最小形态——先有列表，再谈详情）
+// ---------------------------------------------------------------------------
+
+fn history_section(ui: &mut egui::Ui, main: &mut MainState) {
+    ui.heading("运行历史（SQLite）");
+    if !main.global.save_history {
+        ui.colored_label(
+            Color32::from_rgb(230, 180, 80),
+            "⚠ 「保留运行历史」未开启（全局配置页可勾选）——当前运行不入库。",
+        );
+    }
+    ui.weak(format!("库文件: {}", history_db_display()));
+    ui.add_space(4.0);
+
+    ui.horizontal(|ui| {
+        if ui.button("⟳ 刷新").clicked() {
+            main.history_rows = None; // 清缓存 → 下方重新加载
+        }
+        if ui
+            .button("🗑 清空历史")
+            .on_hover_text("删除全部运行记录（日志文件不受影响）")
+            .clicked()
+        {
+            #[cfg(feature = "sqlite")]
+            {
+                let _ = main.runtime.block_on(async {
+                    crate::storage::sqlite::clear_all().await
+                });
+                main.history_rows = None;
+            }
+        }
+        if let Some(n) = &main.history_rows {
+            ui.weak(format!("{} 条", n.len()));
+        }
+    });
+    ui.separator();
+
+    // 懒加载：首次进入 / 刷新时读一次（本地 SQLite，毫秒级；block_on 可接受）
+    if main.history_rows.is_none() {
+        #[cfg(feature = "sqlite")]
+        {
+            main.history_rows = Some(
+                main.runtime
+                    .block_on(async { crate::storage::sqlite::recent_runs(100).await })
+                    .unwrap_or_default(),
+            );
+        }
+        #[cfg(not(feature = "sqlite"))]
+        {
+            main.history_rows = Some(Vec::new());
+        }
+    }
+
+    let rows = main.history_rows.clone().unwrap_or_default();
+    if rows.is_empty() {
+        ui.weak("（暂无运行记录）");
+        return;
+    }
+    egui::ScrollArea::vertical()
+        .id_salt("history_scroll")
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            egui::Grid::new("history_grid")
+                .num_columns(6)
+                .spacing([14.0, 3.0])
+                .show(ui, |ui| {
+                    ui.strong("开始时间");
+                    ui.strong("项目/流程");
+                    ui.strong("目标");
+                    ui.strong("触发");
+                    ui.strong("状态");
+                    ui.strong("耗时");
+                    ui.end_row();
+                    for r in &rows {
+                        ui.monospace(&r.started_at).on_hover_text(format!(
+                            "run_id: {}
+日志: {}",
+                            r.run_id,
+                            r.log_path.as_deref().unwrap_or("—")
+                        ));
+                        ui.label(format!("{}/{}", r.project, r.job));
+                        ui.label(r.target.clone().unwrap_or_else(|| "—".into()));
+                        ui.weak(match r.trigger.as_str() {
+                            "watch" => "👀 监听",
+                            "cli" => "终端",
+                            _ => "手动",
+                        });
+                        let (icon, color) = match r.status.as_str() {
+                            "success" => ("✅ 成功", Color32::from_rgb(120, 200, 120)),
+                            "success-warn" => ("⚠ 成功(有跳过)", Color32::from_rgb(230, 180, 80)),
+                            "failed" => ("❌ 失败", Color32::from_rgb(230, 110, 110)),
+                            "cancelled" => ("🚫 取消", Color32::GRAY),
+                            "timeout" => ("⏱ 超时", Color32::from_rgb(230, 110, 110)),
+                            _ => ("… 运行中", Color32::GRAY),
+                        };
+                        ui.colored_label(color, icon);
+                        ui.monospace(match r.duration_ms {
+                            Some(ms) => format!("{:.1}s", ms as f64 / 1000.0),
+                            None => "—".into(),
+                        });
+                        ui.end_row();
+                    }
+                });
+        });
+}
+
+#[cfg(feature = "sqlite")]
+fn history_db_display() -> String {
+    crate::storage::sqlite::db_path().to_string_lossy().to_string()
+}
+
+#[cfg(not(feature = "sqlite"))]
+fn history_db_display() -> String {
+    "（编译未启用 sqlite feature）".to_string()
 }

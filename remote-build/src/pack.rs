@@ -13,8 +13,22 @@ use std::path::{Path, PathBuf};
 
 /// 打包入口：返回 (文件数, zip 字节数)。
 /// 目标父目录自动创建；文件清单先收集完再写包，避免目标在源目录内时自吞。
-pub fn pack(src: &Path, dst: &Path) -> Result<(usize, u64)> {
-    let files = collect_files(src)?;
+/// `excludes`（rsync --exclude 语义）：字面量 = 路径任一目录/文件名分量匹配即排除
+/// （如 `node_modules`）；含 `*` `?` = 对相对路径与文件名做通配匹配（如 `*.map`）。
+pub fn pack(src: &Path, dst: &Path, excludes: &[String]) -> Result<(usize, u64)> {
+    // 归一化 `.` 分量（workspace.join(".") 之类），避免 zip 条目出现 `dir/./file`
+    let src = {
+        let normalized: PathBuf = src
+            .components()
+            .filter(|c| !matches!(c, std::path::Component::CurDir))
+            .collect();
+        if normalized.as_os_str().is_empty() {
+            src.to_path_buf()
+        } else {
+            normalized
+        }
+    };
+    let files = collect_files(&src, excludes)?;
     if let Some(parent) = dst.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)
@@ -29,7 +43,7 @@ pub fn pack(src: &Path, dst: &Path) -> Result<(usize, u64)> {
         .compression_method(zip::CompressionMethod::Deflated);
 
     for path in &files {
-        let entry_name = entry_name_for(src, path)?;
+        let entry_name = entry_name_for(&src, path)?;
         zip.start_file(entry_name.as_str(), options)
             .with_context(|| format!("写入条目失败: {entry_name}"))?;
         let mut f = std::fs::File::open(path)
@@ -58,13 +72,13 @@ fn entry_name_for(src: &Path, path: &Path) -> Result<String> {
     Ok(rel.to_string_lossy().replace('\\', "/"))
 }
 
-/// 收集待打包文件：目录递归 → 全部文件；通配 → 匹配的文件
-fn collect_files(src: &Path) -> Result<Vec<PathBuf>> {
+/// 收集待打包文件：目录递归 → 全部文件；通配 → 匹配的文件；应用排除规则
+fn collect_files(src: &Path, excludes: &[String]) -> Result<Vec<PathBuf>> {
     let mut out = Vec::new();
     if src.is_dir() {
-        walk(src, &mut out);
+        walk(src, src, excludes, &mut out);
         if out.is_empty() {
-            anyhow::bail!("目录为空: {}", src.display());
+            anyhow::bail!("目录为空: {}（或全部被 --exclude 排除）", src.display());
         }
         return Ok(out);
     }
@@ -77,25 +91,84 @@ fn collect_files(src: &Path) -> Result<Vec<PathBuf>> {
     let entries = glob::glob(&pattern)
         .with_context(|| format!("无效的通配模式: {pattern}"))?;
     for entry in entries.flatten() {
-        if entry.is_file() {
+        if entry.is_file() && !is_excluded(&entry, src, excludes) {
             out.push(entry);
         }
     }
     if out.is_empty() {
-        anyhow::bail!("通配没有匹配到文件: {pattern}");
+        anyhow::bail!("通配没有匹配到文件: {pattern}（或全部被 --exclude 排除）");
     }
     Ok(out)
 }
 
-fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+/// 排除判定：字面量 = 相对路径的任一分量或文件名相等（目录整棵排除）；
+/// 含通配符 = glob 匹配相对路径（/ 分隔）或文件名
+fn is_excluded(path: &Path, src_base: &Path, excludes: &[String]) -> bool {
+    if excludes.is_empty() {
+        return false;
+    }
+    // 相对源父目录的路径（与 entry_name_for 同基准），统一 / 分隔
+    let base = if src_base.is_dir() {
+        src_base.parent().unwrap_or(src_base)
+    } else {
+        src_base
+    };
+    let rel = path
+        .strip_prefix(base)
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_default();
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    for ex in excludes {
+        let ex = ex.trim();
+        if ex.is_empty() {
+            continue;
+        }
+        if ex.contains('*') || ex.contains('?') {
+            if let Ok(p) = glob::Pattern::new(ex) {
+                if p.matches(&rel) || p.matches(&name) {
+                    return true;
+                }
+            }
+        } else {
+            // 字面量：匹配任一路径分量（node_modules 排除整个目录内容）
+            if name == ex
+                || path
+                    .strip_prefix(base)
+                    .unwrap_or(path)
+                    .components()
+                    .any(|c| c.as_os_str() == ex)
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn walk(dir: &Path, src_base: &Path, excludes: &[String], out: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
         let p = entry.path();
+        // 目录整棵剪枝：字面量排除匹配目录名时不再下钻（node_modules 大目录性能）
         if p.is_dir() {
-            walk(&p, out);
-        } else {
+            let dir_name = p
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let pruned = excludes.iter().any(|ex| {
+                let ex = ex.trim();
+                !ex.is_empty() && !ex.contains('*') && !ex.contains('?') && ex == dir_name
+            });
+            if pruned {
+                continue;
+            }
+            walk(&p, src_base, excludes, out);
+        } else if !is_excluded(&p, src_base, excludes) {
             out.push(p);
         }
     }
@@ -130,7 +203,7 @@ mod tests {
     fn packs_directory_with_root_prefix() {
         let ws = make_ws("dir");
         let dst = ws.join("out/app.zip");
-        let (count, bytes) = pack(&ws.join("src"), &dst).unwrap();
+        let (count, bytes) = pack(&ws.join("src"), &dst, &[]).unwrap();
         assert_eq!(count, 2);
         assert!(bytes > 0);
         let n = names(&dst);
@@ -143,7 +216,7 @@ mod tests {
     fn packs_glob_matches_as_basenames() {
         let ws = make_ws("glob");
         let dst = ws.join("out/jars.zip");
-        let (count, _) = pack(&ws.join("target/*.jar"), &dst).unwrap();
+        let (count, _) = pack(&ws.join("target/*.jar"), &dst, &[]).unwrap();
         assert_eq!(count, 2);
         let n = names(&dst);
         assert!(n.contains(&"x.jar".to_string()), "entries: {n:?}");
@@ -154,9 +227,32 @@ mod tests {
     #[test]
     fn single_file_and_empty_glob_errors() {
         let ws = make_ws("single");
-        let (count, _) = pack(&ws.join("src/a.txt"), &ws.join("out/one.zip")).unwrap();
+        let (count, _) = pack(&ws.join("src/a.txt"), &ws.join("out/one.zip"), &[]).unwrap();
         assert_eq!(count, 1);
-        assert!(pack(&ws.join("target/*.noext"), &ws.join("out/x.zip")).is_err());
+        assert!(pack(&ws.join("target/*.noext"), &ws.join("out/x.zip"), &[]).is_err());
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn excludes_literal_components_and_globs() {
+        let ws = make_ws("excl");
+        std::fs::create_dir_all(ws.join("src/node_modules/pkg")).unwrap();
+        std::fs::write(ws.join("src/node_modules/pkg/index.js"), "N").unwrap();
+        std::fs::write(ws.join("src/debug.map"), "M").unwrap();
+
+        // 字面量排除整个 node_modules 目录；通配排除 *.map
+        let dst = ws.join("out/excl.zip");
+        let (count, _) = pack(
+            &ws.join("src"),
+            &dst,
+            &["node_modules".to_string(), "*.map".to_string()],
+        )
+        .unwrap();
+        assert_eq!(count, 2, "只剩 a.txt / sub/b.txt");
+        let n = names(&dst);
+        assert!(!n.iter().any(|e| e.contains("node_modules")), "{n:?}");
+        assert!(!n.iter().any(|e| e.ends_with(".map")), "{n:?}");
+
         let _ = std::fs::remove_dir_all(&ws);
     }
 }

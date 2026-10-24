@@ -75,6 +75,11 @@ pub struct Project {
     /// 与全局 targets.yaml 合并时项目同名覆盖全局（§3.5）。
     #[serde(default)]
     pub targets: HashMap<String, Target>,
+    /// 工具版本要求（mise 风格）：键 = tools.yaml / 项目级 tools 的工具名，
+    /// 值 = 要求形态（">=21" / "22" 前缀匹配 22.x / "22.1.3"）。
+    /// 运行前与 tools.yaml 探测到的 version 对比，偏差零步失败；预览显示偏差。
+    #[serde(default)]
+    pub tools_require: HashMap<String, String>,
     /// 可选：加载额外 .env 文件
     pub env_file: Option<String>,
 }
@@ -109,7 +114,17 @@ pub struct Job {
     /// 前置检查（Task preconditions 语义）：执行前在发版机本地逐条跑 check 命令，
     /// 任一退出码非 0 → 整个 job 零秒失败并展示 message（人话说明）。
     pub preconditions: Vec<Precondition>,
+    /// handlers（Ansible handlers + notify）：变更才触发的收尾步骤，按定义顺序执行。
+    /// 主流程步骤 `notify: [名字]` 且**实际产生了变更**（上传真的传了新内容 / 命令真的执行了，
+    /// creates/when 跳过不算），job 成功结束后才执行对应 handler——
+    /// 典型用法：只有真的传了新 jar，才执行远端重启。
+    #[serde(default)]
+    pub handlers: Vec<Step>,
     pub on_failure: FailureAction,
+    /// job 级整体重试（on_failure: retry 时生效）：失败后从头重跑，
+    /// 最多 max_attempts 次（含首次；未配置默认 2）。仅作用于非 continue_on_error 的步骤失败。
+    #[serde(default)]
+    pub retry: Option<RetryConfig>,
     pub steps: Vec<Step>,
     /// 项目级默认工作目录（相对 local_path）
     pub working_dir: Option<String>,
@@ -177,6 +192,47 @@ pub struct Step {
     /// 例：下载/编译用 local，上传/发布用 prod。None = 跟随流程的 job.target。
     #[serde(default)]
     pub target: Option<String>,
+    /// 步骤输出捕获（GHA step outputs）：步骤成功后对 stdout 全文按正则取首个匹配，
+    /// 有捕获组取组 1、无捕获组取整行匹配，存为运行时变量；
+    /// 后续步骤用 ${{ env.<键> }} 引用（与 .env 约定同一命名空间）。
+    /// 例：outputs: { VERSION: 'VERSION=(\S+)' } ← echo VERSION=1.2.0
+    #[serde(default)]
+    pub outputs: HashMap<String, String>,
+    /// 通知的 handler 名（Ansible notify）：本步骤实际产生变更（上传了新内容 /
+    /// 命令真的执行，creates / when / enabled 跳过不算）时登记，job 成功结束后
+    /// 按定义顺序执行对应 handlers。例：notify: [重启服务]
+    #[serde(default)]
+    pub notify: Vec<String>,
+    /// step_type=wait 的探测模式（None = 沿用旧行为：轮询执行 step.command）
+    pub wait: Option<WaitProbe>,
+}
+
+/// wait 步骤探测模式（Docker Compose healthcheck / Ansible wait_for 同款三模式）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WaitMode {
+    /// 轮询执行命令（本地或远端），退出码 0 = 就绪（原有行为）
+    #[default]
+    Command,
+    /// 从发版机直连 tcp host:port，可连 = 就绪（部署后验证服务可达）
+    Tcp,
+    /// 从发版机发 HTTP GET，状态码 2xx = 就绪（仅 http://；https 请用命令模式 curl）
+    Http,
+}
+kebab_string_enum!(WaitMode {
+    Command => "command",
+    Tcp => "tcp",
+    Http => "http",
+});
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct WaitProbe {
+    pub mode: WaitMode,
+    /// command 模式：探测命令（空 = 沿用 step.command）；tcp 模式：host:port；http 模式：http://host[:port]/path
+    #[serde(default)]
+    pub target: String,
+    /// 轮询间隔秒（0 = 默认 5）
+    #[serde(default)]
+    pub interval_seconds: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -186,8 +242,10 @@ pub enum StepType {
     Exec,
     /// 轮询等条件满足
     Wait,
-    /// 文件传输（pscp）
+    /// 文件传输（pscp，本地 -> 远端）
     Upload,
+    /// 文件下载（pscp，远端 -> 本地）：拉远端产物 / 日志回来
+    Download,
     /// 打包为 zip（本地操作，供后续 upload 单文件上传，§5.8）
     Pack,
     /// kubectl apply + 自动 watch 资源状态（P1.5）
@@ -197,6 +255,7 @@ kebab_string_enum!(StepType {
     Exec => "exec",
     Wait => "wait",
     Upload => "upload",
+    Download => "download",
     Pack => "pack",
     K8sApply => "k8s-apply",
 });
@@ -534,7 +593,12 @@ pub struct GlobalConfig {
     /// 步骤默认超时（秒）：步骤未显式配 step.timeout 时的兜底（引擎接线）
     pub default_timeout: u64,
     pub max_concurrent_jobs: u32,
+    /// 日志与运行历史的保留天数（SQLite runs 按 started_at 清理）
     pub log_retention_days: u32,
+    /// 是否保留运行历史（SQLite ~/.remote-build/data/history.db；关掉则完全不建库）
+    pub save_history: bool,
+    /// 作业结束时弹 Windows 桌面通知（toast，最小化时也能看到结果）
+    pub desktop_notify: bool,
     pub workspace_root: String,
     pub auto_update_tools: bool,
     pub theme: Theme,
@@ -548,6 +612,8 @@ impl Default for GlobalConfig {
             default_timeout: 600,
             max_concurrent_jobs: 3,
             log_retention_days: 30,
+            save_history: true,
+            desktop_notify: true,
             workspace_root: String::new(), // 由 config::default_global() 填充实际路径
             auto_update_tools: false,
             theme: Theme::Dark,
@@ -622,6 +688,9 @@ pub enum JobStatus {
     #[allow(dead_code)]
     Running,
     Success,
+    /// 成功但有 continue_on_error / on_failure=continue 的步骤失败被跳过
+    /// （GHA 黄灯语义：结论成功，汇总里标注哪些步骤失败过）
+    SucceededWithFailures { failed_steps: Vec<usize> },
     Failed { step_index: usize, reason: String },
     Cancelled,
     Timeout,
@@ -635,6 +704,14 @@ impl JobStatus {
         match self {
             JobStatus::Running => "running".into(),
             JobStatus::Success => "success".into(),
+            JobStatus::SucceededWithFailures { failed_steps } => {
+                let list = failed_steps
+                    .iter()
+                    .map(|i| (i + 1).to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                format!("success（{list} 步失败被跳过）")
+            }
             JobStatus::Failed { step_index, reason } => {
                 if *step_index == Self::PRECONDITION_STEP {
                     format!("failed (precondition: {reason})")
@@ -649,7 +726,7 @@ impl JobStatus {
     }
 
     pub fn ok(&self) -> bool {
-        matches!(self, JobStatus::Success)
+        matches!(self, JobStatus::Success | JobStatus::SucceededWithFailures { .. })
     }
 }
 
@@ -660,6 +737,9 @@ pub enum StepResult {
         duration_ms: u64,
         /// 步骤产出变量，合并进 ctx.variables
         output_vars: HashMap<String, String>,
+        /// 本步骤是否实际产生变更（上传真传了 / 命令真执行了；creates/when 跳过 = false）
+        /// —— step.notify 的登记依据
+        changed: bool,
     },
     Failed {
         exit_code: i32,
@@ -814,6 +894,56 @@ steps:
         let j: Job = yaml_serde::from_str(yaml).unwrap();
         assert_eq!(j.steps[0].condition.as_deref(), Some("${{ variables.ENV }} == prod"));
         assert_eq!(j.steps[0].creates.as_deref(), Some("node_modules"));
+    }
+
+    #[test]
+    fn new_step_fields_roundtrip() {
+        // v0.5 新字段：outputs / notify / wait 探测 / job.handlers——旧 YAML（缺字段）仍可解析
+        let yaml = r#"
+name: n
+project: p
+handlers:
+  - name: 重启服务
+    command: systemctl restart app
+    step_type: exec
+    enabled: true
+steps:
+  - name: 构建
+    command: pnpm build
+    step_type: exec
+    enabled: true
+    notify:
+      - 重启服务
+    outputs:
+      VER: 'VERSION=(\S+)'
+  - name: 等服务起来
+    command: ""
+    step_type: wait
+    enabled: true
+    wait:
+      mode: http
+      target: http://10.0.0.5:8080/health
+      interval_seconds: 3
+"#;
+        let j: Job = yaml_serde::from_str(yaml).unwrap();
+        assert_eq!(j.handlers.len(), 1);
+        assert_eq!(j.handlers[0].name.as_deref(), Some("重启服务"));
+        assert_eq!(j.steps[0].notify, vec!["重启服务".to_string()]);
+        assert_eq!(
+            j.steps[0].outputs.get("VER").map(String::as_str),
+            Some(r"VERSION=(\S+)")
+        );
+        let probe = j.steps[1].wait.as_ref().expect("wait probe");
+        assert!(matches!(probe.mode, crate::models::WaitMode::Http));
+        assert_eq!(probe.target, "http://10.0.0.5:8080/health");
+        assert_eq!(probe.interval_seconds, 3);
+
+        // 旧流程（无新字段）→ 全部默认
+        let old: Job = yaml_serde::from_str("name: o\nproject: p\nsteps:\n  - command: echo hi\n").unwrap();
+        assert!(old.steps[0].outputs.is_empty());
+        assert!(old.steps[0].notify.is_empty());
+        assert!(old.steps[0].wait.is_none());
+        assert!(old.handlers.is_empty());
     }
 
     #[test]

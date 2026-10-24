@@ -17,6 +17,7 @@ mod storage;
 mod transport;
 mod ui;
 mod variables;
+mod version;
 
 use std::sync::Arc;
 

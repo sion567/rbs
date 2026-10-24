@@ -66,11 +66,13 @@ pub struct ConsoleState {
     pub lines: Vec<ConsoleLine>,
     /// 自动滚动到最新输出（勾选时新日志始终可见；关闭后可上翻检查历史，新行不会拉走视图）
     pub auto_scroll: bool,
+    /// 只看错误（gh run view --log-failed 同款）：隐藏 stdout/提示噪音行，保留步骤头尾与错误
+    pub errors_only: bool,
 }
 
 impl Default for ConsoleState {
     fn default() -> Self {
-        Self { lines: Vec::new(), auto_scroll: true }
+        Self { lines: Vec::new(), auto_scroll: true, errors_only: false }
     }
 }
 
@@ -107,7 +109,7 @@ impl ConsoleState {
             LogEvent::StepRetryWait { .. } => {}
             LogEvent::JobEnd { status, total_duration_ms, .. } => {
                 let role = match status {
-                    JobStatus::Success => Role::Ok,
+                    JobStatus::Success | JobStatus::SucceededWithFailures { .. } => Role::Ok,
                     JobStatus::Cancelled => Role::Cancelled,
                     JobStatus::Timeout => Role::Error,
                     _ => Role::Fail,
@@ -142,8 +144,22 @@ impl ConsoleState {
 }
 
 fn job_label(status: &JobStatus) -> String {
+    job_label_public(status)
+}
+
+/// JobEnd 行/桌面通知共用的结论文案
+pub fn job_label_public(status: &JobStatus) -> String {
     match status {
         JobStatus::Success => "成功 ✅".to_string(),
+        JobStatus::SucceededWithFailures { failed_steps } => format!(
+            "成功，但有 {} 步失败被跳过 ⚠（{}）",
+            failed_steps.len(),
+            failed_steps
+                .iter()
+                .map(|i| (i + 1).to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
         JobStatus::Failed { step_index, reason } => format!("失败（Step {}：{reason}）", step_index + 1),
         JobStatus::Cancelled => "已取消".to_string(),
         JobStatus::Timeout => "超时".to_string(),
@@ -174,6 +190,13 @@ pub fn show(console: &mut ConsoleState, ui: &mut egui::Ui, running: bool, dark: 
             ui.horizontal(|ui| {
                 ui.strong("控制台输出");
                 ui.checkbox(&mut console.auto_scroll, "自动滚动");
+                if ui
+                    .checkbox(&mut console.errors_only, "只看错误")
+                    .on_hover_text("隐藏 stdout / 系统提示行，只保留步骤头尾、stderr 与错误（gh --log-failed 同款）")
+                    .changed()
+                {
+                    console.auto_scroll = true;
+                }
                 if running {
                     ui.add(egui::Spinner::new().size(14.0));
                     ui.weak("运行中…");
@@ -185,6 +208,29 @@ pub fn show(console: &mut ConsoleState, ui: &mut egui::Ui, running: bool, dark: 
                     if ui.button("📋 复制").clicked() {
                         let text = console.all_text();
                         ui.ctx().copy_text(text);
+                    }
+                    if ui.button("💾 导出").clicked() {
+                        // 导出为 .log 文件（§9.3 导出按钮；默认名带时间戳）
+                        let name = format!(
+                            "remote-build-{}.log",
+                            chrono::Local::now().format("%Y%m%d-%H%M%S")
+                        );
+                        if let Some(path) = rfd::FileDialog::new()
+                            .set_file_name(&name)
+                            .set_title("导出控制台输出")
+                            .save_file()
+                        {
+                            match std::fs::write(&path, console.all_text()) {
+                                Ok(()) => console.push_line(
+                                    format!("已导出: {}", path.display()),
+                                    Role::Info,
+                                ),
+                                Err(e) => console.push_line(
+                                    format!("导出失败: {e}"),
+                                    Role::Error,
+                                ),
+                            }
+                        }
                     }
                 });
             });
@@ -198,6 +244,12 @@ pub fn show(console: &mut ConsoleState, ui: &mut egui::Ui, running: bool, dark: 
                     // 紧凑行距；左对齐（不能用 add_sized——它会把文字在整行里居中）
                     ui.spacing_mut().item_spacing.y = 2.0;
                     for line in &console.lines {
+                        // 只看错误：stdout 与系统提示是噪音大头，步骤头尾 / stderr / 错误保留
+                        if console.errors_only
+                            && matches!(line.role, Role::Stdout | Role::Info)
+                        {
+                            continue;
+                        }
                         let color = palette::color_for(line.role, dark);
                         ui.add(
                             egui::Label::new(

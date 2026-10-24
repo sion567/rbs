@@ -181,6 +181,7 @@ fn create_example_project() -> Result<()> {
         tools: HashMap::new(),
         jobs: vec!["build".to_string()],
         targets: crate::config::local_targets_map(),
+        tools_require: HashMap::new(),
         env_file: None,
     };
     crate::storage::files::save_yaml(&dir.join("project.yaml"), &project)?;
@@ -194,6 +195,8 @@ fn create_example_project() -> Result<()> {
         timeout: Some(60),
         confirm: None,
         preconditions: Vec::new(),
+        handlers: Vec::new(),
+        retry: None,
         on_failure: FailureAction::Stop,
         steps: vec![
             Step {
@@ -263,6 +266,7 @@ pub fn create_project_entry(name: &str, local_path: &Path) -> Result<PathBuf> {
         tools: HashMap::new(),
         jobs: vec!["build".to_string()],
         targets: crate::config::local_targets_map(),
+        tools_require: HashMap::new(),
         env_file: None,
     };
     crate::storage::files::save_yaml(&dir.join("project.yaml"), &project)?;
@@ -276,6 +280,8 @@ pub fn create_project_entry(name: &str, local_path: &Path) -> Result<PathBuf> {
         timeout: Some(60),
         confirm: None,
         preconditions: Vec::new(),
+        handlers: Vec::new(),
+        retry: None,
         on_failure: FailureAction::Stop,
         steps: vec![Step {
             name: Some("项目就绪".to_string()),

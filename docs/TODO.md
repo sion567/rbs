@@ -58,13 +58,16 @@
 - 实现为 `engine.rs::preview_job`：同步无副作用，不执行任何命令、不发任何网络请求
   （远端 creates 干跑不校验，仅标注）。
 
-### 3. handlers + notify（变更才触发，未做；地基已就绪 ✅）
+### ✅ 3. handlers + notify（变更才触发，已实现）
 
 - 参照 Ansible「改了配置才 notify 重启服务」：play 结尾统一执行被通知到的 handler。
 - 映射到本项目：**只有这次真的传了新 artifact，才执行远端重启脚本**——
   artifact 没变就跳过重启，避免每次跑流程都打断线上服务。
-- 地基：upload 步骤已实现"本地/远端 sha256 比对，未变更跳过传输"
-  （见「其他工具功能参考 · Task」✅ 条目），变更判定可直接复用。
+- 实现：`Step.notify: [名字]` + `Job.handlers`（同名步骤）。步骤实际产生变更
+  （exec/wait/pack 真执行；upload 真传了新内容——hash 未变更跳过不算；creates/when/enabled
+  跳过不算）→ 登记 handler，主流程成功收尾后按 handlers 定义顺序执行；handler 失败 = job 失败。
+- 引擎重构：单步执行抽为 `run_single_step`（主流程与 handlers 共用），`StepResult::Success`
+  新增 `changed` 标记。e2e 已验证「真执行触发 / creates 跳过不触发」。
 
 ### 4. block / rescue / always（try-catch-finally，未做；前置依赖「问题 1」已解决 ✅）
 
@@ -136,15 +139,17 @@
 
 - **profiles 子集选择**：`--profile deploy` 只启带标签的服务——与 Ansible 一节
   第 5 条 tags 子集执行互为印证，选型时可对比两家的语法形态。
-- **healthcheck 三要素 `test / interval / retries`** + `depends_on: condition: service_healthy`：
-  `wait` 步骤照此丰富为 tcp / http-200 / 命令三种探测模式（Ansible wait_for 同款），
-  代替裸 sleep 轮询。
+- **✅ healthcheck 三要素**（已实现）：`Step.wait: { mode: command|tcp|http, target, interval_seconds }`
+  ——command 沿用旧行为（兼容旧 YAML），tcp 从发版机直连 host:port、http GET 状态码 2xx
+  （仅 http://，https 用命令模式 curl）；轮询间隔可配（默认 5s），总时长仍受步骤/作业超时管。
+  UI 步骤卡片「⏲ 模式」可切换；tcp 模式 e2e 已验证。
 - 默认值插值一项已用 `||` 语法实现（见 Ansible 一节 ✅ 6），不再单列。
 
 ### rsync（upload/pack 步骤的参照物）
 
-- **`--exclude` 排除模式**：pack/upload 大前端产物时排除 node_modules、.map 等，
-  实现便宜（直接采用 rsync 的 glob 语义）。
+- **✅ `--exclude` 排除模式**（已实现，pack 步骤）：`target/ -> dist/app.zip --exclude node_modules --exclude *.map`
+  ——字面量按路径分量整棵排除（递归剪枝，node_modules 大目录不白走）；`*` `?` 通配匹配
+  相对路径与文件名。upload 的 exclude 仍受 pscp 限制（落到 pack 层做）。
 - **`--dry-run` 输出形态**：列出"会传哪些、跳过哪些"——已实现的干跑预览（✅ 2）
   后续增强上传清单展示时可参照此形态。
 - 已知差距：pscp 整文件复制，rsync 有增量传输；大文件高频场景在 P1 换 OpenSSH
@@ -181,3 +186,124 @@
    handlers/notify（Ansible #3）本体在其上待做；
 4. prod 人工确认门 ✅ 已实现（job.confirm 确认词）；Capistrano 回滚待做
    （内容校验和地基已就绪，需要先设计远端 releases/current 目录约定）。
+
+## 更多工具功能参考（第三批，待规划）
+
+> 前两批见「Ansible 功能参考」「其他工具功能参考」。本批按主题分组：
+> 工具链管理 / 数据流 / 传输与开发回路 / 可观测性 / 配置组织 / 构建编排 / 部署可靠性。
+
+### ✅ mise（原 rtx）—— 工具版本管理（对比校验已实现）
+
+- **✅ 版本要求声明 + 偏差校验**（已实现）：project.yaml `tools_require: { java: ">=21" }`，
+  运行前与 tools.yaml 探测的 version 对比（`version.rs`：>= > <= < 数字段比较缺段补 0；
+  裸值前缀匹配 22 → 22.x），偏差零步失败并给人话说明；干跑预览逐条显示 ✓/⚠ 对比。
+  e2e 已验证拦截 / 放行 / 未定义三条路径。
+- 自动安装（winget/scoop 一键装）与 nix `tools.lock` 复刻（未做，后续增强）。
+
+### ✅ GitHub Actions step outputs —— 运行时变量（已实现）
+
+- 实现：`Step.outputs: { 键: 正则 }`，步骤成功后对捕获的 stdout 全文取首个匹配
+  （有捕获组取组 1、无则整行匹配），存为运行时变量，后续步骤 `${{ env.键 }}` 引用——
+  与 .env 约定同一命名空间，`||` 默认值、`when` 条件天然组合。
+- 捕获管道：`LogHandle` 可选附带 stdout 缓冲（捕获只挂 stdout），`apply_step_outputs` 打日志
+  `[outputs] 键 = 值`；未匹配留空并告警。Windows cmd 嵌套调用的引号尾巴做了 trim 防御
+  （建议命令直接写 `echo VERSION=…`，引擎已包 `cmd /C`）。
+- 语法示例：`outputs: { VER: 'VERSION=(\S+)' }`；docs/变量速查.md 已同步。
+
+### WinSCP / watchexec —— 传输与开发回路（GUI 主场）
+
+- **✅ watch 模式（粗档：文件变化自动重跑 job）**（已实现）：工具栏「👀 监听」开关——
+  开启立即跑一次（确认门生效一次），之后 3 秒轮询工作目录 mtime，变化自动重跑
+  （复用同项目重跑链路；排除 .git/node_modules/target/dist 等；目标流程被删自动停止；
+  监听重跑绕过确认门——开启时已确认过）。mtime 轮询零新依赖（notify 事件监听留作增强）。
+- **WinSCP "Keep remote directory up to date"（细档：只推文件）**（未做）：
+  "改一行 → 自动构建 → dist 自动同步测试机"；pscp 不支持就自己组合
+  （目录 watcher + 增量 upload 步骤）。
+- **传输队列面板**（WinSCP/FileZilla 同款）（未做）：upload 已是多行映射，UI 却只有一个步骤状态；
+  抄文件传输工具的队列视图——每文件一行、进度/速度/失败单独重试（需要引擎按文件粒度发事件）。
+  rclone 的进度语义（速度/ETA/百分比）可作展示参照。
+
+### gh CLI / Kamal audit —— 可观测性（接 P1 历史与状态可视化）
+
+- **✅「只看错误」过滤器**（已实现）：控制台勾选后隐藏 stdout / 系统提示行，
+  保留步骤头尾、stderr 与错误（自动滚动打开）。
+- **`gh run watch` 的"跟随模式"**（未做）：跑到哪自动滚到哪——自动滚动已覆盖大半，可选增强。
+- **步骤耗时时间线**（未做）：在「状态可视化」基础上加耗时条 + 重试标注。
+- **步骤耗时时间线**：GHA/GitLab 的每步耗时条形时间线；在「状态可视化」基础上加
+  耗时条 + 重试标注（哪次尝试、耗时多久），再往下可导出 trace 格式用 Perfetto 看。
+- **`kamal audit`**：37signals Kamal（容器版 Capistrano）里小而好的命令——列出历史部署
+  （谁/何时/什么版本）。P1 SQLite 历史照此最小形态起步：先有列表，再谈详情。
+
+### Kustomize / Helm —— 环境分层的另一种解法
+
+- 现状用 `variables.<env>` 做环境差异；overlay 路线是 base build.yaml + 环境覆盖层
+  （只 patch 差异字段，后期覆盖前期）。两路线不冲突，overlay 的好处是
+  GUI 能画出"这层改了什么"的差异视图。
+- **helm diff 插件**最值得抄：升级前对比"远端现在跑的 vs 这次要部署的"——
+  干跑预览再进一阶：不只展示"将做什么"，还展示"和现状比变了什么"。
+
+### docker bake / Earthly / Airflow —— 构建编排（远期）
+
+- **bake `matrix`**：一份定义展开 N 个变体（uniapp 三端构建正好是这个形状）；
+  `inherits` 让 job 继承公共步骤基座；`--print` 又一个干跑印证。
+- **Earthly 显式 artifact 流**：步骤声明"产出哪些文件、消费哪些文件"，引擎获得产物谱系——
+  UI 可展示"这个 jar 是哪步产的"，中间产物可自动清理。
+- **Airflow 教训**（远期，架构动作大）：线性步骤链 → DAG（独立的 pack 与 upload 并行）；
+  固定间隔重试 → 指数退避。等线性链真的痛了再动。
+
+### PM2 / Argo Rollouts —— 部署可靠性
+
+- **PM2 reload vs restart**：restart 硬杀，reload 平滑逐个换新；远端重启步骤值得区分两档
+  （至少文档提醒用户）。
+- **Argo Rollouts 核心思想**：**部署后健康检查不过 → 自动回滚**。把待做的两块
+  （wait 健康探测、Capistrano 回滚）串成闭环——人工回滚按钮是兜底，自动回滚是常态。
+- 依赖：wait 三模式 ✅ 已就绪；Capistrano 回滚落地后此项即可做（需先出 releases/current 目录约定设计）。
+
+### 其余一句话
+
+- **direnv 信任模型**（部分 ✅）：运行启动时检测到项目目录已有 .env 会打提醒行
+  （其变量将并入 `${{ env.X }}`，非预期请删除）；"信任此文件"式显式确认门仍未做。
+- **✅ GHA `continue-on-error` 黄灯汇总**（已实现）：`continue_on_error` / `on_failure: continue`
+  的失败步骤不再静默——job 返回 `SucceededWithFailures`（成功结论 + 短语
+  `success（N 步失败被跳过: i,j）`，控制台 Job 结束行汇总标注）。
+
+### 优先级
+
+1. ✅ GHA step outputs 运行时变量——已实现（outputs 正则捕获 → ${{ env.X }}，e2e 已验证）；
+2. ✅ mise 式工具版本声明 + 偏差显示——已实现（tools_require 校验 + 预览对比，e2e 已验证）；
+3. 👀 watch 模式——粗档（变化自动重跑 job）已实现；细档 keep-up-to-date 与传输队列面板未做
+   （队列面板需要引擎按文件粒度发事件）；
+4. Argo 式自动回滚——wait 三模式 ✅ 已就绪，还差 Capistrano 回滚落地（需先出 releases/current
+   目录约定设计，这是当前 4 号的主阻塞）。
+
+## 第四批（便宜五件套 + SQLite 历史，✅ 已实现）
+
+> 来源：v0.4 设计文档盘点出的未实现项 + 用户的 save_history 开关设想。
+
+- **✅ job 级 `on_failure: retry`**（§13.2 P1）：失败后整个流程从头重跑（creates/when 守卫让重跑
+  只补失败部分），`job.retry: { max_attempts, backoff_seconds }`（未配置默认 2 次 / 5s）；
+  同一 run_id、同一把运行锁；重试退避期可取消。UI 在 on_failure 选 retry 时显示次数/间隔编辑。
+- **✅ download 步骤类型**：`远端 -> 本地` 每行一条，本地相对 workspace、父目录自动创建，
+  单文件下载后 sha256 校验（transport 层 pscp download 早已就绪，本轮接线）。
+- **✅ 桌面通知**：JobEnd 弹 Windows toast（隐藏 PowerShell + WinRT Toast，零 Rust 依赖），
+  `config.yaml desktop_notify` 可关；👀 监听模式自动重跑后尤其有用。
+- **✅ 危险命令静态检查**（§14 P1）：`rm -rf /`、`chmod -R 777`、`mkfs` 等模式——
+  预览 ⚠ + 执行前告警（不拦截，操作者自己判断）。
+- **✅ 控制台导出**：💾 导出按钮，存 .log 文件（§9.3 的 [导出] 终于补上）。
+- **✅ SQLite 运行历史**（§11.2 P1 + kamal audit 最小形态）：
+  - 表：`runs`（run_id/项目/流程/目标/触发/状态/起止/耗时/日志路径/config_snapshot 快照）
+    + `step_runs`（每步状态/退出码/耗时，UNIQUE(run,step) 重试覆盖）；
+  - **`save_history` 开关**（config.yaml + 设置页勾选框，默认开；关掉完全不建库）；
+    保留期复用 `log_retention_days`（启动清理 + 超 24h 仍 running 的残行标 cancelled）；
+  - 入库点 = GUI / CLI 的事件转发任务（所有 LogEvent 必经之路）；触发来源 manual/watch/cli；
+  - 设置页「🕘 运行历史」tab：最近 100 条列表（时间/项目/流程/状态图标/耗时，悬停看 run_id
+    与日志路径）+ 清空按钮；sqlite 为默认 feature，`--no-default-features` 可裁掉。
+  - e2e 已验证：CLI run 入库（failed + duration_ms 正确）；修复了 CLI 不发 JobEnd 导致
+    行卡 running 的缺陷。
+- **✅ README 重写**：修正过期描述（密码认证早已支持）、补齐 CLI preview/--yes 与全部新功能。
+
+### 设计文档盘点出的剩余未做项（第五批候选）
+
+- k8s_watch 轮询（§8.3，需要 k8s 环境验证）；步骤级并行（§12.1，单人桌面暂不痛）；
+  OpenSshTransport（P1）；全局 variables.yaml 兜底（§3.7）；watch 跟随模式增强、
+  trace 导出；传输队列面板（需文件粒度事件）；Capistrano 回滚 + Argo 自动回滚（等目录约定设计）。

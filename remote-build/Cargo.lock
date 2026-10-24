@@ -3557,6 +3557,7 @@ dependencies = [
  "glob",
  "keyring",
  "log",
+ "regex",
  "rfd",
  "serde",
  "sha2",

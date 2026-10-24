@@ -16,7 +16,7 @@ use tokio::sync::{broadcast, mpsc};
 pub const DEFAULT_STEP_TIMEOUT: u64 = 300;
 
 /// 一次运行的输入
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct RunInput {
     pub project: Project,
     pub job: Job,
@@ -76,11 +76,67 @@ impl Engine {
             None
         };
 
-        let status = self.run_job_inner(input, cancel_rx, log_tx).await;
-        if let Some((_, watcher)) = &_lock {
-            watcher.abort();
+        // ── job 级整体重试（§13.2 retry，on_failure: retry 时生效）────────
+        // 整个 job 从头重跑（creates/when 守卫让重跑只补失败部分），同一 run_id、
+        // 同一把运行锁；重试间隔可取消。前置检查/确认门在重试时不重复拦（引擎层无门）。
+        let job_retry = match input.job.on_failure {
+            FailureAction::Retry => input
+                .job
+                .retry
+                .as_ref()
+                .map(|r| (r.max_attempts.max(1), r.backoff_seconds))
+                .unwrap_or((2, 5)),
+            _ => (1, 0),
+        };
+
+        let mut attempt = 0;
+        let mut first_rx = Some(cancel_rx);
+        loop {
+            attempt += 1;
+            // 首次用调用方给的 receiver；重试从 cancel_tx 重新订阅（receiver 已被上次消费）
+            let rx = first_rx.take().unwrap_or_else(|| {
+                input
+                    .cancel_tx
+                    .as_ref()
+                    .map(|tx| tx.subscribe())
+                    .unwrap_or_else(|| broadcast::channel(1).1)
+            });
+
+            let status = self.run_job_inner(input.clone(), rx, log_tx.clone()).await;
+
+            let retriable = matches!(&status, JobStatus::Failed { .. })
+                && input.job.on_failure == FailureAction::Retry;
+            if !retriable || attempt >= job_retry.0 {
+                if let Some((_, watcher)) = &_lock {
+                    watcher.abort();
+                }
+                return status;
+            }
+            let backoff = Duration::from_secs(job_retry.1);
+            let _ = log_tx
+                .send(LogEvent::Error {
+                    message: format!(
+                        "作业失败，{backoff:?} 后第 {}/{} 次整体重试（on_failure: retry）",
+                        attempt, job_retry.0
+                    ),
+                })
+                .await;
+            // 退避期间响应取消（用新订阅收信号）
+            let mut wait_rx = input
+                .cancel_tx
+                .as_ref()
+                .map(|tx| tx.subscribe())
+                .unwrap_or_else(|| broadcast::channel(1).1);
+            tokio::select! {
+                _ = tokio::time::sleep(backoff) => {}
+                _ = wait_rx.recv() => {
+                    if let Some((_, watcher)) = &_lock {
+                        watcher.abort();
+                    }
+                    return JobStatus::Cancelled;
+                }
+            }
         }
-        status
     }
 
     async fn run_job_inner(
@@ -129,6 +185,50 @@ impl Engine {
         };
         let corepack_ok = pinned_frontend && corepack_available();
 
+        // ── 工具版本要求（mise 风格）：偏差零步失败 ────────────────────
+        // 无进程开销（对比 tools.yaml 探测结果），放在前置检查之前先拦配置级问题
+        {
+            let mut reqs: Vec<(&String, &String)> = input.project.tools_require.iter().collect();
+            reqs.sort();
+            for (name, req) in reqs {
+                let outcome: Result<String, String> = (|| {
+                    let Some(tool) = merged_tools.get(name) else {
+                        return Err(format!(
+                            "工具「{name}」未定义（tools.yaml / 项目级 tools 或 ⚙ 设置里添加）"
+                        ));
+                    };
+                    let detected = tool.version.as_deref().unwrap_or("");
+                    match crate::version::version_matches(req, detected) {
+                        Ok(true) => {
+                            Ok(format!("[tools] {name} {detected} 满足 {req} ✓"))
+                        }
+                        Ok(false) => Err(format!(
+                            "工具版本偏差: {name} 需要 {req}，探测到 {detected}\n\
+                             （在 ⚙ 设置里重新探测；版本确实太旧请升级工具）"
+                        )),
+                        Err(e) => Err(format!("工具版本要求无法校验: {name} {req}: {e}")),
+                    }
+                })();
+                match outcome {
+                    Ok(line) => {
+                        let _ = log_tx
+                            .send(LogEvent::Stdout {
+                                step_index: JobStatus::PRECONDITION_STEP,
+                                line,
+                            })
+                            .await;
+                    }
+                    Err(reason) => {
+                        let _ = log_tx.send(LogEvent::Error { message: reason.clone() }).await;
+                        return JobStatus::Failed {
+                            step_index: JobStatus::PRECONDITION_STEP,
+                            reason,
+                        };
+                    }
+                }
+            }
+        }
+
         // ── 前置检查（Task preconditions 语义）──────────────────────────
         // 发版机本地逐条执行，任一退出码非 0 → 人话报错，整个 job 零秒失败
         let pre_total = input.job.preconditions.len();
@@ -157,6 +257,21 @@ impl Engine {
             &crate::config::app_root().join("runs"),
             &input.project.name,
         );
+
+        // direnv 信任模型提醒：仓库自带的 .env 会随步骤成功并入 ${{ env.X }}
+        if workspace.join(".env").exists() {
+            let _ = log_tx
+                .send(LogEvent::Stdout {
+                    step_index: JobStatus::PRECONDITION_STEP,
+                    line: "⚠ 检测到项目目录已有 .env：步骤成功后其 KEY=VALUE 将并入 ${{ env.X }}；非预期请删除或改名".to_string(),
+                })
+                .await;
+        }
+
+        // notify 登记（Ansible handlers 语义）：变更步骤 → 待执行 handler 名
+        let mut notified: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // GHA 黄灯：continue_on_error / on_failure=continue 跳过的失败步骤
+        let mut failed_skipped: Vec<usize> = Vec::new();
 
         for (index, step) in input.job.steps.iter().enumerate() {
             // 范围执行：跳过起始之前的步骤；仅此步模式跳过其他步骤（不产生事件）
@@ -202,235 +317,36 @@ impl Engine {
                 return JobStatus::Cancelled;
             }
 
-            let step_name = step
-                .name
-                .clone()
-                .unwrap_or_else(|| step.command.lines().next().unwrap_or("").to_string());
-
-            if !step.enabled {
-                let _ = log_tx
-                    .send(LogEvent::StepStart {
-                        step_index: index,
-                        name: format!("{step_name}（跳过：未启用）"),
-                        skipped: true,
-                    })
-                    .await;
-                let _ = log_tx
-                    .send(LogEvent::StepEnd { step_index: index, exit_code: 0, duration_ms: 0 })
-                    .await;
-                continue;
-            }
-
-            // when / condition 求值（§13.3；支持空判断与 ==/!= 值比较；无法解析时 fail-open + 告警）
-            if let Some(cond) = &step.condition {
-                match eval_condition(cond, &ctx) {
-                    Some(false) => {
-                        let _ = log_tx
-                            .send(LogEvent::StepStart {
-                                step_index: index,
-                                name: format!("{step_name}（跳过：条件不满足）"),
-                                skipped: true,
-                            })
-                            .await;
-                        let _ = log_tx
-                            .send(LogEvent::StepEnd { step_index: index, exit_code: 0, duration_ms: 0 })
-                            .await;
-                        continue;
-                    }
-                    None => {
-                        let _ = log_tx
-                            .send(LogEvent::Error {
-                                message: format!(
-                                    "步骤 {index} 条件无法解析（支持 ==/!= 比较与空判断），按真值执行: {cond}"
-                                ),
-                            })
-                            .await;
-                    }
-                    Some(true) => {}
-                }
-            }
-
-            // ── 有效目标（§3.3）：步骤级 target 覆盖流程级默认 ──
-            // 混合流程的关键：下载/编译用 local，上传/发布用 prod，各步各选
-            let step_ctx: Result<
-                (Option<Target>, Arc<dyn transport::RemoteTransport>, String),
-                String,
-            > = (|| {
-                let eff_name = step.target.clone().or_else(|| input.job.target.clone());
-                let eff_target = match eff_name.as_deref() {
-                    Some(n) => {
-                        let t = input.all_targets.get(n).ok_or_else(|| {
-                            format!(
-                                "目标「{n}」未定义（请在 project.yaml 的 targets 表或 🎯 目标管理 中配置）"
-                            )
-                        })?;
-                        let mut t = t.clone();
-                        if t.name.is_empty() {
-                            t.name = n.to_string();
-                        }
-                        Some(t)
-                    }
-                    None => None,
-                };
-                let transport = transport::make_transport(eff_target.as_ref())
-                    .map_err(|e| e.to_string())?;
-                // 远端根目录随有效目标走（上传相对路径 / 远端 cd 的基准）
-                let remote_base = eff_target
-                    .as_ref()
-                    .and_then(|t| t.work_root.clone())
-                    .unwrap_or_default();
-                Ok((eff_target, transport, remote_base))
-            })();
-
-            // creates 守卫（Ansible creates 语义）：产物已存在 → 跳过本步，
-            // 流程重跑时「拉依赖 / 编译」等已完成步骤秒过。检查失败 fail-open 照常执行。
-            if let Ok((eff_target, transport, remote_base)) = &step_ctx {
-                if let Some(creates) = &step.creates {
-                    let resolved = resolve(creates, &ctx);
-                    let remote_dir = resolve_remote_step_dir(step, remote_base);
-                    let log = LogHandle::new(log_tx.clone(), index);
-                    match check_creates_exists(
-                        &resolved,
-                        eff_target.as_ref(),
-                        transport,
-                        &remote_dir,
-                        &workspace,
-                        &log,
-                        &mut cancel_rx,
-                    )
-                    .await
-                    {
-                        Err(e) if local::is_cancelled(&e) => return JobStatus::Cancelled,
-                        Err(e) => {
-                            let _ = log_tx
-                                .send(LogEvent::Error {
-                                    message: format!(
-                                        "步骤 {index} creates 检查失败，按不存在继续执行: {e}"
-                                    ),
-                                })
-                                .await;
-                        }
-                        Ok(true) => {
-                            let _ = log_tx
-                                .send(LogEvent::StepStart {
-                                    step_index: index,
-                                    name: format!("{step_name}（跳过：creates 已存在 {resolved}）"),
-                                    skipped: true,
-                                })
-                                .await;
-                            let _ = log_tx
-                                .send(LogEvent::StepEnd { step_index: index, exit_code: 0, duration_ms: 0 })
-                                .await;
-                            continue;
-                        }
-                        Ok(false) => {}
-                    }
-                }
-            }
-
-            let _ = log_tx
-                .send(LogEvent::StepStart { step_index: index, name: step_name, skipped: false })
-                .await;
-
-            let result = match step_ctx {
-                Err(reason) => StepResult::Failed { exit_code: -1, duration_ms: 0, reason },
-                Ok((eff_target, transport, remote_base)) => {
-                    // 变量替换（§6.3 执行前一次性替换）：命令 / 工作目录 / 步骤 env
-                    let mut command = resolve(&step.command, &ctx);
-
-                    // 自动 corepack（§6.5）：仅本地步骤、仅命令以 pnpm/yarn 开头时包装
-                    if pinned_frontend
-                        && corepack_ok
-                        && matches!(step.step_type, StepType::Exec | StepType::K8sApply)
-                        && !is_remote(eff_target.as_ref())
-                    {
-                        let wrapped = auto_corepack_wrap(&command);
-                        if wrapped != command {
-                            let _ = log_tx
-                                .send(LogEvent::Stdout {
-                                    step_index: index,
-                                    line: "[corepack] 检测到 package.json 的 packageManager 钉版，\
-                                           pnpm/yarn 命令自动经 corepack 执行"
-                                        .to_string(),
-                                })
-                                .await;
-                            command = wrapped;
-                        }
-                    }
-                    let step_local_wd = resolve_step_working_dir(step, &job_wd);
-                    let remote_dir = resolve_remote_step_dir(step, &remote_base);
-
-                    // §6.1 优先级：步骤级 env > 工具 env > target env
-                    let mut env_map: HashMap<String, String> = eff_target
-                        .as_ref()
-                        .map(|t| t.env.clone())
-                        .unwrap_or_default();
-                    if let Some(tool) = merged_tools.get(&step.tool) {
-                        env_map.extend(tool.env.clone());
-                    }
-                    for (k, v) in &step.env {
-                        env_map.insert(k.clone(), resolve(v, &ctx));
-                    }
-
-                    // 工具地址落地：tools.yaml / 项目级 tools 的 command 若是完整路径，
-                    // 把其所在目录前置到步骤 PATH——命令里的裸名（mvn/node/git…）
-                    // 优先解析到这份映射，而不是系统 PATH 里的任意版本（§6.5）
-                    if let Some(tool) = merged_tools.get(&step.tool) {
-                        let is_path_like =
-                            tool.command.contains('\\') || tool.command.contains('/');
-                        if is_path_like {
-                            if let Some(parent) = Path::new(&tool.command).parent() {
-                                if parent.exists() {
-                                    env_map = crate::transport::with_path_prepended(
-                                        env_map, parent,
-                                    );
-                                }
-                            }
-                        }
-                    }
-
-                    // 前端工程：node_modules/.bin 前置（vite/jest/tsc 等工程内命令零配置可用）；
-                    // 放在工具目录之后，保证工程内命令优先于全局安装
-                    let project_bin = workspace.join("node_modules").join(".bin");
-                    if project_bin.exists() {
-                        env_map = crate::transport::with_path_prepended(env_map, &project_bin);
-                    }
-
-                    // k8s target：注入 KUBECONFIG（§8.4 走本地 kubectl）
-                    if let Some(TargetType::Kubernetes { kubeconfig, .. }) =
-                        eff_target.as_ref().map(|t| &t.target_type)
-                    {
-                        env_map.insert("KUBECONFIG".to_string(), kubeconfig.clone());
-                    }
-
-                    let step_timeout =
-                        Duration::from_secs(step.timeout.unwrap_or(default_step_timeout));
-                    run_step_with_retry(
-                        &transport,
-                        eff_target.as_ref(),
-                        step,
-                        &command,
-                        &step_local_wd,
-                        &remote_dir,
-                        &env_map,
-                        &workspace,
-                        step_timeout,
-                        job_deadline,
-                        &mut cancel_rx,
-                        &log_tx,
-                        index,
-                    )
-                    .await
-                }
-            };
+            let result = run_single_step(
+                &input,
+                &merged_tools,
+                pinned_frontend,
+                corepack_ok,
+                &workspace,
+                &job_wd,
+                job_deadline,
+                default_step_timeout,
+                &mut ctx,
+                &mut cancel_rx,
+                &log_tx,
+                index,
+                step,
+            )
+            .await;
 
             match result {
-                StepResult::Success { exit_code, duration_ms, output_vars } => {
+                StepResult::Success { exit_code, duration_ms, changed, .. } => {
                     let _ = log_tx
                         .send(LogEvent::StepEnd { step_index: index, exit_code, duration_ms })
                         .await;
-                    // §6.4 步骤间变量传递：P0 文件约定（workspace/.env）
-                    ctx.env.extend(output_vars);
+                    // notify 登记（Ansible 语义）：只有实际产生变更的步骤才触发 handler
+                    if changed {
+                        for name in &step.notify {
+                            if !name.trim().is_empty() {
+                                notified.insert(name.trim().to_string());
+                            }
+                        }
+                    }
                 }
                 StepResult::Cancelled => return JobStatus::Cancelled,
                 StepResult::Timeout => {
@@ -441,10 +357,14 @@ impl Engine {
                         .send(LogEvent::StepEnd { step_index: index, exit_code, duration_ms })
                         .await;
                     if step.continue_on_error {
+                        failed_skipped.push(index);
                         continue;
                     }
                     match &input.job.on_failure {
-                        FailureAction::Continue => continue,
+                        FailureAction::Continue => {
+                            failed_skipped.push(index);
+                            continue;
+                        }
                         // job 级 retry 为 P1（§13.2），P0 按 stop 处理
                         FailureAction::Stop | FailureAction::Retry => {
                             return JobStatus::Failed { step_index: index, reason };
@@ -454,9 +374,362 @@ impl Engine {
             }
         }
 
-        // JobEnd 事件由外层包装任务统一发送（见 app.rs），引擎只返回最终状态
-        JobStatus::Success
+        // ── handlers（Ansible handlers + notify）：变更才触发的收尾步骤 ──
+        // 主流程成功收尾（含黄灯）才执行；只跑被通知到的；按定义顺序；失败 = job 失败
+        if !input.job.handlers.is_empty() && !notified.is_empty() {
+            let _ = log_tx
+                .send(LogEvent::Stdout {
+                    step_index: JobStatus::PRECONDITION_STEP,
+                    line: format!(
+                        "[handlers] 变更通知待执行：{} 个（共 {} 个 handler 定义）",
+                        notified.len(),
+                        input.job.handlers.len()
+                    ),
+                })
+                .await;
+            let handler_base = input.job.steps.len();
+            for (hi, handler) in input.job.handlers.iter().enumerate() {
+                let Some(hname) =
+                    handler.name.as_deref().map(str::trim).filter(|s| !s.is_empty())
+                else {
+                    let _ = log_tx
+                        .send(LogEvent::Error {
+                            message: format!("handler #{} 未命名，跳过", hi + 1),
+                        })
+                        .await;
+                    continue;
+                };
+                if !notified.contains(hname) {
+                    continue;
+                }
+                // handler 之间也响应取消
+                if matches!(
+                    cancel_rx.try_recv(),
+                    Ok(()) | Err(broadcast::error::TryRecvError::Closed)
+                ) {
+                    return JobStatus::Cancelled;
+                }
+                // 事件 step_index 接在主流程之后（UI 的步骤光圈只覆盖主流程，忽略之）
+                let index = handler_base + hi;
+                let _ = log_tx
+                    .send(LogEvent::Stdout {
+                        step_index: index,
+                        line: format!("[handler] 执行「{hname}」"),
+                    })
+                    .await;
+                let result = run_single_step(
+                    &input,
+                    &merged_tools,
+                    pinned_frontend,
+                    corepack_ok,
+                    &workspace,
+                    &job_wd,
+                    job_deadline,
+                    default_step_timeout,
+                    &mut ctx,
+                    &mut cancel_rx,
+                    &log_tx,
+                    index,
+                    handler,
+                )
+                .await;
+                match result {
+                    StepResult::Success { exit_code, duration_ms, .. } => {
+                        let _ = log_tx
+                            .send(LogEvent::StepEnd { step_index: index, exit_code, duration_ms })
+                            .await;
+                    }
+                    StepResult::Cancelled => return JobStatus::Cancelled,
+                    StepResult::Timeout => return JobStatus::Timeout,
+                    StepResult::Failed { exit_code, duration_ms, reason } => {
+                        let _ = log_tx
+                            .send(LogEvent::StepEnd { step_index: index, exit_code, duration_ms })
+                            .await;
+                        return JobStatus::Failed {
+                            step_index: index,
+                            reason: format!("handler「{hname}」失败: {reason}"),
+                        };
+                    }
+                }
+            }
+        }
+
+        // JobEnd 事件由外层包装任务统一发送（见 app.rs），引擎只返回最终状态；
+        // 有被跳过的失败步骤 → 黄灯（成功结论 + 汇总标注）
+        if failed_skipped.is_empty() {
+            JobStatus::Success
+        } else {
+            JobStatus::SucceededWithFailures { failed_steps: failed_skipped }
+        }
     }
+}
+
+// ---------------------------------------------------------------------------
+// 单步完整执行（主流程与 handlers 共用）：跳过判定（enabled / when / creates）
+// + 变量替换 + 有效目标 + 执行。发出 StepStart（含跳过标记），StepEnd 由调用方
+// 统一补发；输出变量在此并入 ctx.env。
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::too_many_arguments)]
+async fn run_single_step(
+    input: &RunInput,
+    merged_tools: &HashMap<String, Tool>,
+    pinned_frontend: bool,
+    corepack_ok: bool,
+    workspace: &Path,
+    job_wd: &Path,
+    job_deadline: Option<tokio::time::Instant>,
+    default_step_timeout: u64,
+    ctx: &mut VarContext,
+    cancel_rx: &mut broadcast::Receiver<()>,
+    log_tx: &mpsc::Sender<LogEvent>,
+    index: usize,
+    step: &Step,
+) -> StepResult {
+    // 跳过路径的统一返回值（exit 0 / 无产出 / 无变更；StepEnd 由调用方补发）
+    let skipped = || {
+        StepResult::Success {
+            exit_code: 0,
+            duration_ms: 0,
+            output_vars: HashMap::new(),
+            changed: false,
+        }
+    };
+
+    let step_name = step
+        .name
+        .clone()
+        .unwrap_or_else(|| step.command.lines().next().unwrap_or("").to_string());
+
+    if !step.enabled {
+        let _ = log_tx
+            .send(LogEvent::StepStart {
+                step_index: index,
+                name: format!("{step_name}（跳过：未启用）"),
+                skipped: true,
+            })
+            .await;
+        return skipped();
+    }
+
+    // when / condition 求值（§13.3；支持空判断与 ==/!= 值比较；无法解析时 fail-open + 告警）
+    if let Some(cond) = &step.condition {
+        match eval_condition(cond, ctx) {
+            Some(false) => {
+                let _ = log_tx
+                    .send(LogEvent::StepStart {
+                        step_index: index,
+                        name: format!("{step_name}（跳过：条件不满足）"),
+                        skipped: true,
+                    })
+                    .await;
+                return skipped();
+            }
+            None => {
+                let _ = log_tx
+                    .send(LogEvent::Error {
+                        message: format!(
+                            "步骤 {index} 条件无法解析（支持 ==/!= 比较与空判断），按真值执行: {cond}"
+                        ),
+                    })
+                    .await;
+            }
+            Some(true) => {}
+        }
+    }
+
+    // ── 有效目标（§3.3）：步骤级 target 覆盖流程级默认 ──
+    // 混合流程的关键：下载/编译用 local，上传/发布用 prod，各步各选
+    let step_ctx: Result<(Option<Target>, Arc<dyn transport::RemoteTransport>, String), String> =
+        (|| {
+            let eff_name = step.target.clone().or_else(|| input.job.target.clone());
+            let eff_target = match eff_name.as_deref() {
+                Some(n) => {
+                    let t = input.all_targets.get(n).ok_or_else(|| {
+                        format!(
+                            "目标「{n}」未定义（请在 project.yaml 的 targets 表或 🎯 目标管理 中配置）"
+                        )
+                    })?;
+                    let mut t = t.clone();
+                    if t.name.is_empty() {
+                        t.name = n.to_string();
+                    }
+                    Some(t)
+                }
+                None => None,
+            };
+            let transport =
+                transport::make_transport(eff_target.as_ref()).map_err(|e| e.to_string())?;
+            // 远端根目录随有效目标走（上传相对路径 / 远端 cd 的基准）
+            let remote_base = eff_target
+                .as_ref()
+                .and_then(|t| t.work_root.clone())
+                .unwrap_or_default();
+            Ok((eff_target, transport, remote_base))
+        })();
+
+    // creates 守卫（Ansible creates 语义）：产物已存在 → 跳过本步，
+    // 流程重跑时「拉依赖 / 编译」等已完成步骤秒过。检查失败 fail-open 照常执行。
+    if let Ok((eff_target, transport, remote_base)) = &step_ctx {
+        if let Some(creates) = &step.creates {
+            let resolved = resolve(creates, ctx);
+            let remote_dir = resolve_remote_step_dir(step, remote_base);
+            let log = LogHandle::new(log_tx.clone(), index);
+            match check_creates_exists(
+                &resolved,
+                eff_target.as_ref(),
+                transport,
+                &remote_dir,
+                workspace,
+                &log,
+                cancel_rx,
+            )
+            .await
+            {
+                Err(e) if local::is_cancelled(&e) => return StepResult::Cancelled,
+                Err(e) => {
+                    let _ = log_tx
+                        .send(LogEvent::Error {
+                            message: format!(
+                                "步骤 {index} creates 检查失败，按不存在继续执行: {e}"
+                            ),
+                        })
+                        .await;
+                }
+                Ok(true) => {
+                    let _ = log_tx
+                        .send(LogEvent::StepStart {
+                            step_index: index,
+                            name: format!("{step_name}（跳过：creates 已存在 {resolved}）"),
+                            skipped: true,
+                        })
+                        .await;
+                    return skipped();
+                }
+                Ok(false) => {}
+            }
+        }
+    }
+
+    let _ = log_tx
+        .send(LogEvent::StepStart { step_index: index, name: step_name, skipped: false })
+        .await;
+
+    let result = match step_ctx {
+        Err(reason) => StepResult::Failed { exit_code: -1, duration_ms: 0, reason },
+        Ok((eff_target, transport, remote_base)) => {
+            // 变量替换（§6.3 执行前一次性替换）：命令 / 工作目录 / 步骤 env
+            let mut command = resolve(&step.command, ctx);
+
+            // 危险命令静态检查（§14）：不拦截，执行前醒目提醒一次（预览里也有 ⚠）
+            if matches!(step.step_type, StepType::Exec | StepType::K8sApply) {
+                let hits = dangerous_command_hits(&command);
+                if !hits.is_empty() {
+                    let _ = log_tx
+                        .send(LogEvent::Error {
+                            message: format!(
+                                "⚠ 步骤 {index} 命令含危险模式 {}，请确认是有意为之",
+                                hits.join(" / ")
+                            ),
+                        })
+                        .await;
+                }
+            }
+
+            // 自动 corepack（§6.5）：仅本地步骤、仅命令以 pnpm/yarn 开头时包装
+            if pinned_frontend
+                && corepack_ok
+                && matches!(step.step_type, StepType::Exec | StepType::K8sApply)
+                && !is_remote(eff_target.as_ref())
+            {
+                let wrapped = auto_corepack_wrap(&command);
+                if wrapped != command {
+                    let _ = log_tx
+                        .send(LogEvent::Stdout {
+                            step_index: index,
+                            line: "[corepack] 检测到 package.json 的 packageManager 钉版，\
+                                   pnpm/yarn 命令自动经 corepack 执行"
+                                .to_string(),
+                        })
+                        .await;
+                    command = wrapped;
+                }
+            }
+            let step_local_wd = resolve_step_working_dir(step, job_wd);
+            let remote_dir = resolve_remote_step_dir(step, &remote_base);
+
+            // §6.1 优先级：步骤级 env > 工具 env > target env
+            let mut env_map: HashMap<String, String> = eff_target
+                .as_ref()
+                .map(|t| t.env.clone())
+                .unwrap_or_default();
+            if let Some(tool) = merged_tools.get(&step.tool) {
+                env_map.extend(tool.env.clone());
+            }
+            for (k, v) in &step.env {
+                env_map.insert(k.clone(), resolve(v, ctx));
+            }
+
+            // 工具地址落地：tools.yaml / 项目级 tools 的 command 若是完整路径，
+            // 把其所在目录前置到步骤 PATH——命令里的裸名（mvn/node/git…）
+            // 优先解析到这份映射，而不是系统 PATH 里的任意版本（§6.5）
+            if let Some(tool) = merged_tools.get(&step.tool) {
+                let is_path_like = tool.command.contains('\\') || tool.command.contains('/');
+                if is_path_like {
+                    if let Some(parent) = Path::new(&tool.command).parent() {
+                        if parent.exists() {
+                            env_map = crate::transport::with_path_prepended(env_map, parent);
+                        }
+                    }
+                }
+            }
+
+            // 前端工程：node_modules/.bin 前置（vite/jest/tsc 等工程内命令零配置可用）；
+            // 放在工具目录之后，保证工程内命令优先于全局安装
+            let project_bin = workspace.join("node_modules").join(".bin");
+            if project_bin.exists() {
+                env_map = crate::transport::with_path_prepended(env_map, &project_bin);
+            }
+
+            // k8s target：注入 KUBECONFIG（§8.4 走本地 kubectl）
+            if let Some(TargetType::Kubernetes { kubeconfig, .. }) =
+                eff_target.as_ref().map(|t| &t.target_type)
+            {
+                env_map.insert("KUBECONFIG".to_string(), kubeconfig.clone());
+            }
+
+            // step outputs：声明了输出捕获才建 stdout 缓冲
+            let capture = (!step.outputs.is_empty()).then(|| {
+                std::sync::Arc::new(std::sync::Mutex::new(String::new()))
+            });
+
+            let step_timeout =
+                Duration::from_secs(step.timeout.unwrap_or(default_step_timeout));
+            let result = run_step_with_retry(
+                &transport,
+                eff_target.as_ref(),
+                step,
+                &command,
+                &step_local_wd,
+                &remote_dir,
+                &env_map,
+                workspace,
+                step_timeout,
+                job_deadline,
+                capture.as_ref(),
+                cancel_rx,
+                log_tx,
+                index,
+            )
+            .await;
+            // §6.4 步骤间变量传递：产出变量并入 ctx（.env 约定 + step outputs 捕获）
+            if let StepResult::Success { output_vars, .. } = &result {
+                ctx.env.extend(output_vars.clone());
+            }
+            result
+        }
+    };
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -510,11 +783,15 @@ async fn run_step_with_retry(
     workspace: &Path,
     step_timeout: Duration,
     job_deadline: Option<tokio::time::Instant>,
+    capture: Option<&std::sync::Arc<std::sync::Mutex<String>>>,
     cancel_rx: &mut broadcast::Receiver<()>,
     log_tx: &mpsc::Sender<LogEvent>,
     index: usize,
 ) -> StepResult {
-    let log = LogHandle::new(log_tx.clone(), index);
+    let log = match capture {
+        Some(buf) => LogHandle::with_capture(log_tx.clone(), index, std::sync::Arc::clone(buf)),
+        None => LogHandle::new(log_tx.clone(), index),
+    };
     // 重试计划：显式 retry 配置优先；upload 步骤无配置时默认重试 1 次（网络抖动兜底）
     let (attempts, backoff_secs) = step_retry_plan(step);
     let backoff = Duration::from_secs(backoff_secs);
@@ -546,6 +823,7 @@ async fn run_step_with_retry(
             env_map,
             workspace,
             &log,
+            capture,
             cancel_rx,
         );
 
@@ -605,9 +883,13 @@ async fn execute_step(
     env_map: &HashMap<String, String>,
     workspace: &Path,
     log: &LogHandle,
+    capture: Option<&std::sync::Arc<std::sync::Mutex<String>>>,
     cancel_rx: &mut broadcast::Receiver<()>,
 ) -> StepResult {
     let started = Instant::now();
+    // 本步骤是否实际产生变更（notify 登记依据）：upload = 真的传了内容；
+    // exec / wait / pack / k8s 真执行了 = 是（creates/when 跳过根本不会走到这）
+    let mut changed = !matches!(step.step_type, StepType::Upload);
 
     let outcome: anyhow::Result<transport::ExitStatus> = match step.step_type {
         StepType::Exec => {
@@ -616,29 +898,79 @@ async fn execute_step(
             transport.exec(target_dummy(target), command, &wd, env_map, log, cancel_rx).await
         }
         StepType::Wait => {
-            // 轮询执行 check command 直到成功或超时（超时在外层包裹）
+            // 轮询探测直到就绪或超时（总时长由外层包裹）：三种模式（Compose healthcheck 同款）
             let wd = if is_remote(target) { remote_dir.to_string() } else { local_wd.to_string_lossy().to_string() };
+            let probe = step.wait.clone().unwrap_or_default();
+            let interval = if probe.interval_seconds == 0 {
+                transport::WAIT_POLL_SECONDS
+            } else {
+                probe.interval_seconds.max(1)
+            };
             let mut attempt = 0;
             loop {
                 attempt += 1;
-                log.line(
-                    transport::Stream::Stdout,
-                    format!("[wait] 第 {attempt} 次探测: {command}"),
-                );
-                match transport
-                    .exec(target_dummy(target), command, &wd, env_map, log, cancel_rx)
-                    .await
-                {
-                    Ok(st) if st.success => break Ok(st),
-                    // 探测失败不算步骤失败，等待后重试；取消要透传
-                    Ok(_) => {}
-                    Err(e) if local::is_cancelled(&e) => break Err(e),
-                    Err(e) => {
-                        log.line(transport::Stream::Stderr, format!("[wait] 探测失败: {e}"));
+                let hit: Option<transport::ExitStatus> = match probe.mode {
+                    WaitMode::Tcp => {
+                        log.line(
+                            transport::Stream::Stdout,
+                            format!("[wait] 第 {attempt} 次探测 tcp {}", probe.target),
+                        );
+                        if probe_tcp(&probe.target).await {
+                            Some(transport::ExitStatus::from_code(0))
+                        } else {
+                            None
+                        }
                     }
+                    WaitMode::Http => {
+                        log.line(
+                            transport::Stream::Stdout,
+                            format!("[wait] 第 {attempt} 次探测 http {}", probe.target),
+                        );
+                        match probe_http(&probe.target).await {
+                            Ok(ok) => {
+                                if ok {
+                                    Some(transport::ExitStatus::from_code(0))
+                                } else {
+                                    None
+                                }
+                            }
+                            Err(e) => {
+                                log.line(transport::Stream::Stderr, format!("[wait] {e}"));
+                                None
+                            }
+                        }
+                    }
+                    WaitMode::Command => {
+                        // 兼容旧配置：probe.target 空 = 沿用 step.command
+                        let cmd = if probe.target.trim().is_empty() {
+                            command
+                        } else {
+                            probe.target.trim()
+                        };
+                        log.line(
+                            transport::Stream::Stdout,
+                            format!("[wait] 第 {attempt} 次探测: {cmd}"),
+                        );
+                        match transport
+                            .exec(target_dummy(target), cmd, &wd, env_map, log, cancel_rx)
+                            .await
+                        {
+                            Ok(st) if st.success => Some(st),
+                            // 探测失败不算步骤失败，等待后重试；取消要透传
+                            Ok(_) => None,
+                            Err(e) if local::is_cancelled(&e) => break Err(e),
+                            Err(e) => {
+                                log.line(transport::Stream::Stderr, format!("[wait] 探测失败: {e}"));
+                                None
+                            }
+                        }
+                    }
+                };
+                if let Some(st) = hit {
+                    break Ok(st);
                 }
                 tokio::select! {
-                    _ = tokio::time::sleep(Duration::from_secs(transport::WAIT_POLL_SECONDS)) => {}
+                    _ = tokio::time::sleep(Duration::from_secs(interval)) => {}
                     _ = cancel_rx.recv() => {
                         break Err(anyhow::anyhow!("__cancelled__"));
                     }
@@ -646,8 +978,18 @@ async fn execute_step(
             }
         }
         StepType::Upload => {
-            // 命令格式约定：<本地路径或目录> -> <远端路径>；成功统一走下方 Ok 分支
-            upload_step(transport, target, command, workspace, remote_dir, log, cancel_rx).await
+            // 命令格式约定：<本地路径或目录> -> <远端路径>；返回是否真传了内容（变更判断）
+            let res =
+                upload_step(transport, target, command, workspace, remote_dir, log, cancel_rx).await;
+            if let Ok((_, uploaded)) = &res {
+                changed = *uploaded;
+            }
+            res.map(|(st, _)| st)
+        }
+        StepType::Download => {
+            // 命令格式约定：<远端路径> -> <本地路径>（方向与 upload 相反）；
+            // 本地路径相对 workspace 解析，父目录自动创建，单文件下载后 sha256 校验
+            download_step(transport, target, command, workspace, remote_dir, log, cancel_rx).await
         }
         StepType::Pack => {
             // 命令格式约定：<目录或通配> -> <目标.zip>（本地操作，§5.8）
@@ -672,8 +1014,15 @@ async fn execute_step(
 
     match outcome {
         Ok(status) if status.success => {
-            let output_vars = capture_env_file(workspace);
-            StepResult::Success { exit_code: status.code, duration_ms, output_vars }
+            let mut output_vars = capture_env_file(workspace);
+            // step outputs（GHA 语义）：对捕获的 stdout 按声明正则提取运行时变量
+            if !step.outputs.is_empty() {
+                if let Some(buf) = capture {
+                    let stdout = buf.lock().map(|b| b.clone()).unwrap_or_default();
+                    output_vars.extend(apply_step_outputs(&step.outputs, &stdout, log));
+                }
+            }
+            StepResult::Success { exit_code: status.code, duration_ms, output_vars, changed }
         }
         Ok(status) => StepResult::Failed {
             exit_code: status.code,
@@ -688,6 +1037,91 @@ async fn execute_step(
             }
         }
     }
+}
+
+/// wait tcp 探测：从发版机直连 host:port（5 秒连接超时）
+async fn probe_tcp(target: &str) -> bool {
+    tokio::time::timeout(Duration::from_secs(5), tokio::net::TcpStream::connect(target))
+        .await
+        .map(|r| r.is_ok())
+        .unwrap_or(false)
+}
+
+/// wait http 探测：GET 请求状态码 2xx = 就绪（HTTP/1.0 直连，仅 http://；https 用命令模式 curl）
+async fn probe_http(url: &str) -> anyhow::Result<bool> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    let rest = url
+        .strip_prefix("http://")
+        .ok_or_else(|| anyhow::anyhow!("http 模式仅支持 http:// URL（https 请用命令模式 curl -k）"))?;
+    let (hostport, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, "/"),
+    };
+    if hostport.is_empty() {
+        anyhow::bail!("http URL 缺少主机: {url}");
+    }
+    let authority = if hostport.contains(':') {
+        hostport.to_string()
+    } else {
+        format!("{hostport}:80")
+    };
+    let fut = async {
+        let stream = tokio::net::TcpStream::connect(&authority).await?;
+        let mut reader = tokio::io::BufReader::new(stream);
+        reader
+            .write_all(
+                format!("GET {path} HTTP/1.0\r\nHost: {hostport}\r\nConnection: close\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await?;
+        // 状态行在响应最前面（"HTTP/1.x 200 OK"），读到首行即可
+        let mut line = String::new();
+        reader.read_line(&mut line).await?;
+        let status = line
+            .split_whitespace()
+            .nth(1)
+            .and_then(|c| c.parse::<u16>().ok())
+            .unwrap_or(0);
+        Ok((200..300).contains(&status))
+    };
+    tokio::time::timeout(Duration::from_secs(5), fut)
+        .await
+        .map_err(|_| anyhow::anyhow!("http 探测超时（5s）"))?
+}
+
+/// step outputs：每个键对 stdout 取首个正则匹配（有捕获组取组 1，无则整行匹配）。
+/// 未匹配的键留空并告警（GHA：未声明的输出 = 空）。
+fn apply_step_outputs(
+    outputs: &HashMap<String, String>,
+    stdout: &str,
+    log: &LogHandle,
+) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    for (key, pattern) in outputs {
+        let value = regex::Regex::new(pattern)
+            .ok()
+            .and_then(|re| re.captures(stdout))
+            .and_then(|caps| caps.get(1).or_else(|| caps.get(0)))
+            .map(|m| m.as_str().trim().to_string())
+            // cmd 嵌套调用（命令里手写 cmd /C …）常见的引号尾巴清理
+            .map(|v| v.trim_matches('"').to_string());
+        match value {
+            Some(v) => {
+                log.line(
+                    transport::Stream::Stdout,
+                    format!("[outputs] {key} = {v}"),
+                );
+                out.insert(key.clone(), v);
+            }
+            None => {
+                log.line(
+                    transport::Stream::Stderr,
+                    format!("[outputs] 未捕获到 {key}（正则无匹配）: {pattern}"),
+                );
+            }
+        }
+    }
+    out
 }
 
 fn is_remote(target: Option<&Target>) -> bool {
@@ -857,7 +1291,7 @@ fn corepack_available() -> bool {
         .unwrap_or(false)
 }
 
-/// pack 步骤：`<目录或通配> -> <目标.zip>`，路径相对 workspace 解析
+/// pack 步骤：`<目录或通配> -> <目标.zip> [--exclude <glob>]…`，路径相对 workspace 解析
 async fn pack_step(
     command: &str,
     workspace: &Path,
@@ -866,6 +1300,14 @@ async fn pack_step(
     let (src_part, dst_part) = command.split_once("->").ok_or_else(|| {
         anyhow::anyhow!("pack 步骤命令格式应为: <目录或通配> -> <目标.zip>，实际: {command}")
     })?;
+    // dst 段可带 --exclude <模式>…（rsync 语义）：字面量 = 目录/文件名分量，* ? = 通配
+    let mut dst_tokens = dst_part.split("--exclude");
+    let dst_str = dst_tokens.next().unwrap_or("").trim();
+    let excludes: Vec<String> = dst_tokens
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
     let resolve = |p: &str| {
         let path = Path::new(p);
         if path.is_absolute() {
@@ -875,7 +1317,7 @@ async fn pack_step(
         }
     };
     let src = resolve(src_part.trim());
-    let dst = resolve(dst_part.trim());
+    let dst = resolve(dst_str);
     if !dst.to_string_lossy().to_ascii_lowercase().ends_with(".zip") {
         anyhow::bail!("pack 目标必须是 .zip 文件: {}", dst.display());
     }
@@ -884,7 +1326,13 @@ async fn pack_step(
         transport::Stream::Stdout,
         format!("[pack] {} -> {}", src.display(), dst.display()),
     );
-    let (count, bytes) = crate::pack::pack(&src, &dst)?;
+    if !excludes.is_empty() {
+        log.line(
+            transport::Stream::Stdout,
+            format!("[pack] 排除: {}", excludes.join(", ")),
+        );
+    }
+    let (count, bytes) = crate::pack::pack(&src, &dst, &excludes)?;
     let size = human_size(bytes);
     log.line(
         transport::Stream::Stdout,
@@ -932,13 +1380,15 @@ async fn upload_step(
     remote_dir: &str,
     log: &LogHandle,
     cancel_rx: &mut broadcast::Receiver<()>,
-) -> anyhow::Result<transport::ExitStatus> {
+) -> anyhow::Result<(transport::ExitStatus, bool)> {
+    // 返回值第二项 = 是否真的传了内容（变更判断；hash 未变更跳过的映射不计）
     if !is_remote(target) {
         anyhow::bail!("step_type: upload 需要 SSH target，当前 target 不支持上传");
     }
     let target = target.expect("checked above");
     let mappings = parse_upload_mappings(command)?;
     let total = mappings.len();
+    let mut uploaded_any = false;
 
     for (i, (local_part, remote_part)) in mappings.iter().enumerate() {
         let local_path = {
@@ -949,9 +1399,7 @@ async fn upload_step(
                 workspace.join(p)
             }
         };
-        let remote_path = if remote_part.starts_with('/') {
-            remote_part.clone()
-        } else if remote_dir.is_empty() {
+        let remote_path = if remote_part.starts_with('/') || remote_dir.is_empty() {
             remote_part.clone()
         } else {
             format!("{}/{}", remote_dir.trim_end_matches('/'), remote_part)
@@ -1003,6 +1451,7 @@ async fn upload_step(
         transport
             .upload(target, &local_path, &remote_path, log, cancel_rx)
             .await?;
+        uploaded_any = true;
 
         // 上传完整性校验（§5.9）：单文件比对本地/远端 sha256；
         // 目录递归上传跳过（建议先用 pack 打成单文件）。校验失败 → 步骤失败 → 按重试配置重传。
@@ -1028,7 +1477,88 @@ async fn upload_step(
             );
         }
     }
+    Ok((transport::ExitStatus::from_code(0), uploaded_any))
+}
+
+/// download 步骤：`<远端路径> -> <本地路径>` 每行一条（复用 upload 的映射解析，
+/// 方向相反）。本地路径相对 workspace 解析、父目录自动创建；单文件下载后 sha256 校验。
+async fn download_step(
+    transport: &Arc<dyn RemoteTransport>,
+    target: Option<&Target>,
+    command: &str,
+    workspace: &Path,
+    remote_dir: &str,
+    log: &LogHandle,
+    cancel_rx: &mut broadcast::Receiver<()>,
+) -> anyhow::Result<transport::ExitStatus> {
+    if !is_remote(target) {
+        anyhow::bail!("step_type: download 需要 SSH target，当前 target 不支持下载");
+    }
+    let target = target.expect("checked above");
+    let mappings = parse_upload_mappings(command)?;
+    let total = mappings.len();
+    for (i, (remote_part, local_part)) in mappings.iter().enumerate() {
+        let remote_path = if remote_part.starts_with('/') || remote_dir.is_empty() {
+            remote_part.clone()
+        } else {
+            format!("{}/{}", remote_dir.trim_end_matches('/'), remote_part)
+        };
+        let local_path = {
+            let p = Path::new(local_part);
+            if p.is_absolute() { p.to_path_buf() } else { workspace.join(p) }
+        };
+        if let Some(parent) = local_path.parent() {
+            if !parent.exists() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+        log.line(
+            transport::Stream::Stdout,
+            format!("[download {}/{}] {} -> {}", i + 1, total, remote_path, local_path.display()),
+        );
+        transport
+            .download(target, &remote_path, &local_path, log, cancel_rx)
+            .await?;
+        // 下载完整性校验：单文件比对远端/本地 sha256（目录跳过）
+        if local_path.is_file() {
+            let remote_hash = crate::transport::putty::remote_sha256(target, &remote_path)?;
+            let local_hash = crate::transport::putty::sha256_file(&local_path)?;
+            if remote_hash != local_hash {
+                anyhow::bail!(
+                    "下载校验失败：sha256 不一致（远端 {remote_hash} / 本地 {local_hash}）"
+                );
+            }
+            log.line(
+                transport::Stream::Stdout,
+                format!("[verify] sha256 一致 ✓ ({})", &local_hash[..12]),
+            );
+        }
+    }
     Ok(transport::ExitStatus::from_code(0))
+}
+
+/// 危险命令模式（§14 P1 静态检查）：预览 ⚠ + 执行前日志提醒（不拦截，操作者自己判断）
+pub fn dangerous_command_hits(command: &str) -> Vec<&'static str> {
+    const PATTERNS: &[&str] = &[
+        "rm -rf /",
+        "rm -fr /",
+        "rm -rf ~",
+        "rm -rf /*",
+        "chmod -r 777",
+        "chmod 777 /",
+        "mkfs",
+        "dd if=/dev/",
+        "del /f /s /q",
+        "format c:",
+        "shutdown -r",
+        "shutdown /r",
+    ];
+    let lower = command.to_lowercase();
+    PATTERNS
+        .iter()
+        .copied()
+        .filter(|p| lower.contains(p))
+        .collect()
 }
 
 /// §6.4 P0 变量传递约定：步骤成功后读取 workspace/.env 的 KEY=VALUE 行
@@ -1076,6 +1606,12 @@ pub struct StepPreview {
     pub uploads: Vec<(String, String, bool)>,
     /// pack 步骤：解析后的 (源, 目标 zip)
     pub pack: Option<(String, String)>,
+    /// step outputs：捕获声明（键, 正则）
+    pub outputs: Vec<(String, String)>,
+    /// notify 的 handler 名
+    pub notify: Vec<String>,
+    /// wait 探测描述（模式 目标 间隔）
+    pub wait_note: Option<String>,
 }
 
 /// 干跑预览：按真实执行路径解析每个步骤（变量替换、when 条件、creates 守卫、
@@ -1111,6 +1647,16 @@ pub fn preview_job(input: &RunInput) -> Vec<StepPreview> {
             working_dir: resolve_step_working_dir(step, &job_wd),
             uploads: Vec::new(),
             pack: None,
+            outputs: step.outputs.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            notify: step.notify.clone(),
+            wait_note: step.wait.as_ref().map(|wp| {
+                let interval = if wp.interval_seconds == 0 {
+                    transport::WAIT_POLL_SECONDS
+                } else {
+                    wp.interval_seconds.max(1)
+                };
+                format!("{} {} 每 {interval}s", wp.mode.as_str(), wp.target)
+            }),
         };
 
         if !step.enabled {
@@ -1185,6 +1731,14 @@ pub fn preview_job(input: &RunInput) -> Vec<StepPreview> {
             p.warnings
                 .push("命令仍含未解析的变量占位符（检查变量名拼写 / 变量组）".to_string());
         }
+        // 危险命令静态检查（§14）：预览 ⚠，防手滑（执行前引擎也会再提醒一次）
+        if matches!(step.step_type, StepType::Exec | StepType::K8sApply) {
+            let hits = dangerous_command_hits(&command);
+            if !hits.is_empty() {
+                p.warnings
+                    .push(format!("⚠ 危险命令模式: {}（请确认是有意为之）", hits.join(" / ")));
+            }
+        }
         p.command = command.clone();
 
         match step.step_type {
@@ -1222,6 +1776,35 @@ pub fn preview_job(input: &RunInput) -> Vec<StepPreview> {
             StepType::Upload => {
                 p.warnings
                     .push("upload 需要 SSH 目标，当前目标不支持上传".to_string());
+            }
+            StepType::Download if remote => {
+                match parse_upload_mappings(&command) {
+                    Ok(mappings) => {
+                        for (remote_part, local_part) in mappings {
+                            let remote_path = if remote_part.starts_with('/')
+                                || remote_dir.is_empty()
+                            {
+                                remote_part.clone()
+                            } else {
+                                format!("{}/{}", remote_dir.trim_end_matches('/'), remote_part)
+                            };
+                            let local_path = {
+                                let lp = Path::new(&local_part);
+                                if lp.is_absolute() { lp.to_path_buf() } else { workspace.join(lp) }
+                            };
+                            p.uploads.push((
+                                remote_path,
+                                local_path.to_string_lossy().to_string(),
+                                true,
+                            ));
+                        }
+                    }
+                    Err(e) => p.warnings.push(e.to_string()),
+                }
+            }
+            StepType::Download => {
+                p.warnings
+                    .push("download 需要 SSH 目标，当前目标不支持下载".to_string());
             }
             StepType::Pack => match command.split_once("->") {
                 Some((s, d)) => {
@@ -1676,6 +2259,222 @@ mod tests {
             assert!(events.iter().any(|e| matches!(
                 e, LogEvent::Stdout { line, .. } if line.contains("PREFLIGHT_PASSED")
             )));
+        }
+    }
+
+    #[test]
+    fn step_outputs_captured_and_shared() {
+        // GHA step outputs：正则捕获 stdout → 运行时变量 → 后续步骤 ${{ env.X }} 引用
+        let rt = runtime();
+        let (tx, mut rx) = mpsc::channel(1024);
+        let (_cancel_tx, cancel_rx) = broadcast::channel(4);
+        let engine = Engine;
+
+        let mut build = exec_step("cmd /C echo VERSION=9.9.9");
+        build.outputs = [("VER".to_string(), r"VERSION=(\S+)".to_string())]
+            .into_iter()
+            .collect();
+        let use_it = exec_step("echo GOT_${{ env.VER }}");
+
+        let input = simple_job(vec![build, use_it]);
+        let status = rt.block_on(engine.run_job(input, cancel_rx, tx));
+        let events = collect(status, &mut rx);
+
+        assert!(events.iter().any(|e| matches!(
+            e, LogEvent::Stdout { line, .. } if line.contains("GOT_9.9.9")
+        )));
+        assert!(events.iter().any(|e| matches!(
+            e, LogEvent::Stdout { line, .. } if line.contains("[outputs] VER = 9.9.9")
+        )));
+    }
+
+    #[test]
+    fn handlers_run_only_when_notified() {
+        let rt = runtime();
+        let engine = Engine;
+
+        // 触发路径：步骤真执行了 → notify 登记 → job 收尾执行 handler
+        {
+            let (tx, mut rx) = mpsc::channel(1024);
+            let (_c, cancel_rx) = broadcast::channel(4);
+            let mut work = exec_step("echo WORK_DONE");
+            work.notify = vec!["清理".to_string()];
+            let mut cleanup = exec_step("echo HANDLER_RAN");
+            cleanup.name = Some("清理".to_string());
+            let mut input = simple_job(vec![work]);
+            input.job.handlers = vec![cleanup];
+            let status = rt.block_on(engine.run_job(input, cancel_rx, tx));
+            let events = collect(status, &mut rx);
+            assert!(events.iter().any(|e| matches!(
+                e, LogEvent::Stdout { line, .. } if line.contains("HANDLER_RAN")
+            )));
+            assert!(events.iter().any(|e| matches!(
+                e, LogEvent::Stdout { line, .. } if line.contains("[handler] 执行「清理」")
+            )));
+        }
+
+        // 不触发路径：creates 跳过的步骤不算变更 → handler 不执行
+        {
+            let dir = std::env::temp_dir().join(format!("rbs_notify_{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("marker.txt"), "x").unwrap();
+
+            let (tx, mut rx) = mpsc::channel(1024);
+            let (_c, cancel_rx) = broadcast::channel(4);
+            let mut skipped_step = exec_step("echo SKIPPED_WORK");
+            skipped_step.creates = Some("marker.txt".to_string());
+            skipped_step.notify = vec!["清理".to_string()];
+            let mut cleanup = exec_step("echo HANDLER_RAN");
+            cleanup.name = Some("清理".to_string());
+            let mut input = simple_job(vec![skipped_step]);
+            input.job.handlers = vec![cleanup];
+            input.project.local_path = dir.to_string_lossy().to_string();
+            let status = rt.block_on(engine.run_job(input, cancel_rx, tx));
+            let events = collect(status, &mut rx);
+            assert!(!events.iter().any(|e| matches!(
+                e, LogEvent::Stdout { line, .. } if line.contains("HANDLER_RAN")
+            )), "creates 跳过不应触发 handler: {events:?}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn wait_tcp_probe_succeeds() {
+        // wait tcp 模式：监听一个真实端口，探测应立即就绪
+        let (tx_port, rx_port) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            tx_port.send(port).unwrap();
+            for stream in listener.incoming() {
+                drop(stream);
+            }
+        });
+        let port = rx_port.recv().unwrap();
+
+        let rt = runtime();
+        let (tx, mut rx) = mpsc::channel(1024);
+        let (_c, cancel_rx) = broadcast::channel(4);
+        let engine = Engine;
+
+        let mut wait = exec_step("echo unused");
+        wait.step_type = StepType::Wait;
+        wait.wait = Some(crate::models::WaitProbe {
+            mode: crate::models::WaitMode::Tcp,
+            target: format!("127.0.0.1:{port}"),
+            interval_seconds: 0,
+        });
+        let after = exec_step("echo AFTER_WAIT");
+
+        let input = simple_job(vec![wait, after]);
+        let status = rt.block_on(engine.run_job(input, cancel_rx, tx));
+        let events = collect(status, &mut rx);
+        assert!(events.iter().any(|e| matches!(
+            e, LogEvent::Stdout { line, .. } if line.contains("AFTER_WAIT")
+        )));
+        assert!(events.iter().any(|e| matches!(
+            e, LogEvent::Stdout { line, .. } if line.contains("tcp 127.0.0.1")
+        )));
+    }
+
+    #[test]
+    fn partial_success_reports_yellow() {
+        // GHA 黄灯：continue_on_error 步骤失败被跳过 → 成功结论 + 汇总
+        let rt = runtime();
+        let (tx, mut rx) = mpsc::channel(1024);
+        let (_c, cancel_rx) = broadcast::channel(4);
+        let engine = Engine;
+
+        let mut s0 = exec_step("cmd /C exit 3");
+        s0.continue_on_error = true;
+        let s1 = exec_step("echo AFTER_FAIL");
+
+        let input = simple_job(vec![s0, s1]);
+        let status = rt.block_on(engine.run_job(input, cancel_rx, tx));
+        assert!(
+            matches!(
+                &status,
+                JobStatus::SucceededWithFailures { failed_steps } if failed_steps == &vec![0]
+            ),
+            "got: {status:?}"
+        );
+        assert!(status.ok(), "黄灯结论仍是成功: {status:?}");
+        assert!(status.short().contains("失败被跳过"), "{}", status.short());
+
+        let events = collect(status, &mut rx);
+        assert!(events.iter().any(|e| matches!(
+            e, LogEvent::Stdout { line, .. } if line.contains("AFTER_FAIL")
+        )));
+    }
+
+    #[test]
+    fn tools_require_gate_the_run() {
+        // mise 风格：tools_require 偏差 → 零步失败（人话说明）；满足 → 正常执行
+        let rt = runtime();
+        let engine = Engine;
+        let maven = |ver: &str| crate::models::Tool {
+            name: "maven".into(),
+            tool_type: crate::models::ToolType::System,
+            command: "mvn".into(),
+            version: Some(ver.into()),
+            ..Default::default()
+        };
+
+        // 失败路径：要求 >=99，探测 21.0.3
+        {
+            let (tx, mut rx) = mpsc::channel(1024);
+            let (_c, cancel_rx) = broadcast::channel(4);
+            let mut input = simple_job(vec![exec_step("echo NEVER_RAN")]);
+            input.project.tools_require.insert("maven".into(), ">=99".into());
+            input.tools.insert("maven".to_string(), maven("21.0.3"));
+            let status = rt.block_on(engine.run_job(input, cancel_rx, tx));
+            assert!(
+                matches!(
+                    &status,
+                    JobStatus::Failed { step_index, reason }
+                        if *step_index == JobStatus::PRECONDITION_STEP
+                            && reason.contains("工具版本偏差")
+                ),
+                "got: {status:?}"
+            );
+            let mut events = Vec::new();
+            while let Ok(ev) = rx.try_recv() {
+                events.push(ev);
+            }
+            assert!(!events.iter().any(|e| matches!(
+                e, LogEvent::Stdout { line, .. } if line.contains("NEVER_RAN")
+            )));
+        }
+
+        // 通过路径：>=21 满足 → 步骤照常执行
+        {
+            let (tx, mut rx) = mpsc::channel(1024);
+            let (_c, cancel_rx) = broadcast::channel(4);
+            let mut input = simple_job(vec![exec_step("echo TOOL_OK")]);
+            input.project.tools_require.insert("maven".into(), ">=21".into());
+            input.tools.insert("maven".to_string(), maven("21.0.3"));
+            let status = rt.block_on(engine.run_job(input, cancel_rx, tx));
+            let events = collect(status, &mut rx);
+            assert!(events.iter().any(|e| matches!(
+                e, LogEvent::Stdout { line, .. } if line.contains("TOOL_OK")
+            )));
+            assert!(events.iter().any(|e| matches!(
+                e, LogEvent::Stdout { line, .. } if line.contains("满足 >=21")
+            )));
+        }
+
+        // 未定义工具 → 明确报错（而非静默放过）
+        {
+            let (tx, _rx) = mpsc::channel(1024);
+            let (_c, cancel_rx) = broadcast::channel(4);
+            let mut input = simple_job(vec![]);
+            input.project.tools_require.insert("nope".into(), ">=1".into());
+            let status = rt.block_on(engine.run_job(input, cancel_rx, tx));
+            assert!(
+                matches!(&status, JobStatus::Failed { reason, .. } if reason.contains("未定义")),
+                "got: {status:?}"
+            );
         }
     }
 

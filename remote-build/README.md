@@ -1,72 +1,79 @@
-# Remote Build System（P0）
+# Remote Build System
 
 Windows 桌面构建部署工具，覆盖"下载 → 编译 → 打包 → 上传 → 部署"链路。
-架构设计见 `../docs/RemoteBuildSystem架构设计文档_v0.4.md`；变量语法速查见 `../docs/变量速查.md`（GUI 作业编辑器里也有「？ 变量语法」窗口）。
+架构设计见 `../docs/RemoteBuildSystem架构设计文档_v0.4.md`；变量语法速查见 `../docs/变量速查.md`
+（GUI 作业编辑器里也有「？ 变量语法」窗口）；功能路线与完成情况见 `../docs/TODO.md`。
 
 ## 构建与运行
 
 ```powershell
-cargo run          # 开发运行
-cargo test         # 单元测试（models / variables / transport / engine）
+cargo run               # 开发运行（默认启用 sqlite 历史 feature）
+cargo test              # 单元测试（models / variables / transport / engine / sqlite / runlock）
 cargo build --release
+cargo build --no-default-features   # 不带 SQLite 历史的精简构建
 ```
 
 ## 命令行（无头模式，脚本 / CI 可用）
 
 ```powershell
-remote-build set-password <目标名> <密码>   # SSH 密码写入 Windows Credential Manager（不落盘）
-remote-build test-conn <目标名>             # SSH 连接测试（5s 超时）
-remote-build run <项目名> <流程名>          # 无头执行一条流程，实时输出，exit code 即结果
+remote-build set-password <目标名> <密码>        # SSH 密码写入 Windows Credential Manager（不落盘）
+remote-build test-conn <目标名>                  # SSH 连接测试 + 服务器体检（CPU/内存/磁盘）
+remote-build run <项目名> <流程名> [--yes]       # 无头执行（--yes 跳过确认门；非交互终端必加）
+remote-build preview <项目名> <流程名>           # 干跑预览：解析后的命令 / 上传清单 / 将跳过的步骤
 ```
+
+## 步骤类型（step_type）
+
+| 类型 | 说明 |
+|------|------|
+| `exec` | 执行命令（本地 cmd / 远端 plink） |
+| `wait` | 轮询等待就绪：命令 / tcp 可连 / http 2xx 三种探测模式 |
+| `upload` | 上传（多行映射 `本地 -> 远端`；sha256 校验；内容未变自动跳过传输） |
+| `download` | 下载（`远端 -> 本地`；sha256 校验；父目录自动创建） |
+| `pack` | 本地 zip 打包（`目录 -> x.zip [--exclude node_modules --exclude *.map]`） |
+| `k8s-apply` | 本地 kubectl（KUBECONFIG 自动注入；k8s_watch 为 P1.5） |
+
+## 流程级能力（build.yaml）
+
+- **条件与状态**：`when:` 条件（==/!= 比较）、`creates:` 产物守卫（重跑秒过已完成步骤）
+- **运行时变量**：`outputs:` 从 stdout 正则捕获 → 后续步骤 `${{ env.键 }}` 引用
+- **变更才触发**：`notify:` + `handlers:`（只有真的传了新 artifact 才执行重启等收尾步骤）
+- **前置检查**：`preconditions:` 本地断言，失败零秒退出（人话报错）
+- **确认门**：`confirm: prod` —— 运行前要求输入确认词，防手滑上生产
+- **超时**：`timeout:`（作业级总超时）+ 步骤级 `timeout`（config.yaml `default_timeout` 兜底）
+- **失败策略**：`on_failure: stop / continue / retry`（retry = 整个流程从头重跑 N 次）
+- **工具版本要求**：project.yaml `tools_require: { java: ">=21" }`，偏差零步失败
+- **同项目运行互斥**：新运行自动取消旧运行（GUI / CLI 跨进程生效，GHA concurrency 语义）
+
+## 环境与可观测
+
+- **运行历史**：SQLite（`~/.remote-build/data/history.db`，config.yaml `save_history` 开关；
+  设置页「🕘 运行历史」查看最近运行；保留期随 `log_retention_days` 清理）
+- **👀 监听模式**：工作目录文件变化自动重跑当前流程（3s mtime 轮询，排除构建产物目录）
+- **状态可视化**：步骤光圈（运行蓝/等待黄/成功绿/失败红）+ 耗时条 + 重试标注
+- **桌面通知**：作业结束弹 Windows toast（`desktop_notify` 可关）
+- **控制台**：实时流式输出、「只看错误」过滤器、复制 / 导出 .log
+- **危险命令提醒**：`rm -rf /`、`chmod -R 777` 等模式预览 ⚠ + 执行前告警（不拦截）
+
+## 认证与安全
+
+- SSH 密码存 Windows Credential Manager（键 `{项目}/{目标}`），YAML 不落密码；执行经 plink `-pw`
+  （内网可接受；高安全场景用 key / Pageant）。目标编辑器支持用未保存密码直接「🔌 测试连接」。
+- host key 指纹固定（TOFU）：首次连接测试输出指纹 → 填入「主机键指纹」字段即信任。
 
 ## 示例工程（~/.remote-build/projects/）
 
 `yudao-cloud`（Maven 微服务，需 JDK25）/ `yudao-admin-uniapp`（pnpm，corepack 钉版本）/
 `yudao-admin-vben`（turbo + pnpm）三个真实工程，各配 dev-build（本地）与
 prod-deploy（编译 → pack 打 zip → 多行映射 upload 到 prod 目标 → 远端发布脚本）。
-prod 目标：192.168.38.198（密码在凭据管理器，键名 prod）。
-工程源码在 E:\workspace\rbs\project-samples\，配置与代码两层分离（§10.1）。
+工程源码在 `E:\workspace\rbs\project-samples\`，配置与代码两层分离（§10.1）。
 
 > 前置：把 PuTTY 套件 5 个 exe 放入 `tools/putty/`（见 `tools/putty/README.txt`）。
 > 缺失时编译有告警，运行期回退到系统 PATH 中的 PuTTY。
 
-## P0 已实现（对应文档 §18 路线）
-
-- 数据模型与 YAML 配置（serde kebab-case / flatten，v0.4 评审修复全部落地）
-- 首次启动环境探测（JAVA_HOME / MAVEN_HOME / GRADLE_HOME / NODE_HOME / PATH / PuTTY）
-- 执行引擎：步骤链、exec / wait / **upload（多行映射，微服务多 jar）** / **pack（内置 zip 打包，§5.8）** /
-  k8s-apply（P0 退化为本地 kubectl）、超时 / 重试 / 取消（broadcast + kill）、
-  `workspace/.env` 变量传递约定
-- 🎯 目标管理：SSH / Kubernetes / 本地目标增删改（随项目走，存 project.yaml）、SSH 连接测试；
-  SSH 密码存 Windows Credential Manager（不落 YAML）；host key 指纹固定（TOFU，
-  首次测试失败输出指纹 → 填入 host_key 字段即信任）；upload/exec 经 pscp/plink 使用
-- 传输层：本地 `cmd /C` + PuTTY（plink / pscp，禁止 `-pw`，cd 路径单引号转义）
-- egui UI：首启引导页、项目树、步骤编辑器、实时控制台、设置窗口
-- 新建项目向导（＋ 新建项目）：Git 模式（地址/账号/密码/分支 → Clone 到
-  `~/.remote-build/projects/<名称>`，进度实时显示、日志脱敏）与本地目录模式（浏览选择，
-  配置生成在 projects/ 下）；创建后自动生成 project.yaml + 起始 build.yaml 并选中
-- 工具管理（⚙ 设置窗口）：可视化增删改 tools.yaml（command 支持文件浏览），
-  「验证」按钮后台跑 version_check；作业步骤的工具下拉与设置页共用同一份配置
-- 项目目录输入框带「📂 浏览…」，可用系统文件夹选择器直接选取
-- 变量系统：`${{ variables.X }}` / `${{ env.X }}` / `${{ targets.X.field }}` / `${VAR}`
-- 工具链落地：tools.yaml / 项目级 tools（project.yaml `tools:` 段，键相同整体覆盖）的
-  command 完整路径自动前置到步骤 PATH；`node_modules/.bin` 存在时自动前置（前端工程
-  零配置）；私服地址建议走工程内配置文件或 `variables.<env>` 的
-  `NPM_CONFIG_REGISTRY` / `PIP_INDEX_URL`（见设计文档 §6.5）
-
-## P0 明确不做
-
-- SQLite 历史（P1）、k8s_watch 轮询（P1.5）、OpenSshTransport（P1）、
-  密码认证（禁止 `-pw`，用 key / Pageant）、job 级 on_failure=retry（P1）
-
-## upload 步骤命令格式（P0 约定）
-
-```
-<本地路径或目录> -> <远端路径>
-# 例：target/*.jar -> /opt/app/
-```
-
 ## 已知限制
 
 - YAML 变量值请写字符串（`PORT: "8080"` 而非 `PORT: 8080`），flatten 反序列化不收数字
-- 远端工作目录取 `target.work_root`，本地/远端目录映射待确认（文档 §19 问题 1）
+- upload/download 为 pscp 整文件复制（无增量/断点续传）；大量小文件先 pack 成单 zip
+- wait 的 http 探测仅支持 http://（https 请用命令模式 `curl -k`）
+- SQLite 历史在编译期可用 `--no-default-features` 裁掉（UI 显示提示，不建库）

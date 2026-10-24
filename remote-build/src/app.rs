@@ -142,6 +142,29 @@ pub struct MainState {
     pub pull_done: Option<std_mpsc::Receiver<Result<String, String>>>,
     /// 人工确认门弹窗（job.confirm）：输入确认词后才真正启动运行
     pub confirm_gate: ConfirmGate,
+    /// 👀 监听模式（watchexec/WinSCP keep-up-to-date 思路）：工作目录文件变化自动重跑
+    pub watch: Option<WatchState>,
+    /// 下一次 launch_run 的触发来源是否为监听自动重跑（历史入库 trigger=watch）
+    pub run_trigger_watch: bool,
+    /// 运行历史列表缓存（设置页懒加载，None = 需要重读；sqlite 关闭时恒为空）
+    pub history_rows: Option<Vec<crate::storage::HistoryRow>>,
+    /// 本次运行各步骤耗时（ms）：StepEnd 事件收集，步骤卡片渲染耗时条
+    pub run_step_durations: Vec<Option<u64>>,
+    /// 本次运行各步骤重试次数：StepRetryWait 事件收集
+    pub run_step_retries: Vec<u32>,
+}
+
+/// 👀 监听模式状态：盯住项目代码目录，变化后自动重跑指定流程
+#[derive(Clone)]
+pub struct WatchState {
+    pub project: String,
+    pub job: String,
+    /// 监听的工作目录（开启时快照，稳定不受项目列表刷新影响）
+    pub dir: String,
+    /// 监听起点：之后有文件修改才触发重跑（触发后重置）
+    pub since: std::time::SystemTime,
+    /// 上次 mtime 轮询时刻（3 秒节流）
+    pub last_poll: std::time::Instant,
 }
 
 /// 「🔒 人工确认」窗口状态（GHA environment protection 思路）
@@ -197,8 +220,27 @@ impl MainState {
             pull_lines: None,
             pull_done: None,
             confirm_gate: Default::default(),
+            watch: None,
+            run_trigger_watch: false,
+            history_rows: None,
+            run_step_durations: Vec::new(),
+            run_step_retries: Vec::new(),
         };
         s.reload();
+        // 历史保留期清理（后台，log_retention_days 天前的 runs 删除；失败只提示不阻塞启动）
+        if s.global.save_history {
+            let days = s.global.log_retention_days;
+            s.runtime.spawn(async move {
+                #[cfg(feature = "sqlite")]
+                match crate::storage::sqlite::prune_old(days).await {
+                    Ok(0) => {}
+                    Ok(n) => eprintln!("[history] 已清理 {n} 条过期运行记录"),
+                    Err(e) => eprintln!("[history] 清理失败: {e:#}"),
+                }
+                #[cfg(not(feature = "sqlite"))]
+                let _ = days;
+            });
+        }
         s
     }
 
@@ -282,6 +324,7 @@ impl MainState {
         }
         self.drain_events();
         self.drain_pull();
+        self.poll_watch();
 
         // ── 工具栏 ──────────────────────────────────────────────────
         egui::Panel::top("toolbar").show(ui, |ui| {
@@ -308,6 +351,42 @@ impl MainState {
                     .clicked()
                 {
                     self.preview_selected();
+                }
+                // 👀 监听模式（watchexec 思路）：文件变化自动重跑
+                {
+                    let watching = self
+                        .watch
+                        .as_ref()
+                        .map(|w| {
+                            self.selected_project
+                                .and_then(|pi| self.projects.get(pi))
+                                .map(|p| {
+                                    w.project == p.project.name
+                                        && self
+                                            .selected_job
+                                            .and_then(|ji| p.jobs.get(ji))
+                                            .map(|j| w.job == j.job.name)
+                                            .unwrap_or(false)
+                                })
+                                .unwrap_or(false)
+                        })
+                        .unwrap_or(false);
+                    let label = if watching { "👀 监听中 ●" } else { "👀 监听" };
+                    if ui
+                        .add_enabled(has_selection && !running, egui::Button::new(label))
+                        .on_hover_text(
+                            "监听模式：工作目录文件变化后自动重跑当前流程（3 秒轮询 mtime，\n\
+                             排除 .git / node_modules / target / dist 等）。\n\
+                             确认门只在开启时生效一次；再点一次停止监听",
+                        )
+                        .clicked()
+                    {
+                        if watching {
+                            self.stop_watch();
+                        } else {
+                            self.start_watch();
+                        }
+                    }
                 }
                 if ui.add_enabled(running, egui::Button::new("⏹ Stop")).clicked() {
                     if let Some(run) = &self.run {
@@ -369,12 +448,127 @@ impl MainState {
         ui::job_editor::show_var_help_window(&ctx, self);
         show_confirm_gate_window(&ctx, self);
 
-        // 运行中保持帧率：日志流畅上屏 + 蓝黄光圈 1Hz 呼吸动画；更新代码中保持进度上屏
+        // 运行中保持帧率：日志流畅上屏 + 蓝黄光圈 1Hz 呼吸动画；更新代码中保持进度上屏；
+        // 监听模式空闲时也需要定时醒来轮询 mtime
         if running {
             ctx.request_repaint_after(Duration::from_millis(50));
         } else if self.pull_done.is_some() {
             ctx.request_repaint_after(Duration::from_millis(150));
+        } else if self.watch.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(500));
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // 👀 监听模式（watchexec / WinSCP keep-up-to-date 思路）
+    // -----------------------------------------------------------------------
+
+    /// 开启监听：记录当前流程 + 工作目录，立即跑一次首轮（确认门在此生效一次）
+    pub fn start_watch(&mut self) {
+        let (Some(pi), Some(ji)) = (self.selected_project, self.selected_job) else {
+            return;
+        };
+        let Some(entry) = self.projects.get(pi) else { return };
+        let Some(je) = entry.jobs.get(ji) else { return };
+        let dir = entry.project.local_path.trim().to_string();
+        if dir.is_empty() || !std::path::Path::new(&dir).is_dir() {
+            self.status_msg = Some(format!(
+                "⚠ 项目目录不存在，无法监听: {}",
+                entry.project.local_path
+            ));
+            return;
+        }
+        self.watch = Some(WatchState {
+            project: entry.project.name.clone(),
+            job: je.job.name.clone(),
+            dir,
+            since: std::time::SystemTime::now(),
+            last_poll: std::time::Instant::now(),
+        });
+        let label = format!("{}/{}", entry.project.name, je.job.name);
+        self.console.push_line(
+            format!(
+                "==== 👀 监听模式开启: {label} ====\n工作目录文件变化后自动重跑（3 秒轮询 mtime，\
+                 排除 .git / node_modules / target / dist 等）"
+            ),
+            crate::ui::console::Role::Info,
+        );
+        self.status_msg = Some(format!("👀 监听中: {label}"));
+        self.start_run(0, None);
+    }
+
+    /// 停止监听；正在跑的监听目标运行也一并取消
+    pub fn stop_watch(&mut self) {
+        if let Some(w) = self.watch.take() {
+            self.console.push_line(
+                format!("==== 👀 监听已停止: {}/{} ====", w.project, w.job),
+                crate::ui::console::Role::Info,
+            );
+            self.status_msg = Some("👀 监听已停止".to_string());
+        }
+        if self.run_active() {
+            if let Some(run) = &self.run {
+                let _ = run.cancel_tx.send(());
+            }
+        }
+    }
+
+    /// 空闲时轮询工作目录 mtime（3 秒节流），变化则自动重跑
+    fn poll_watch(&mut self) {
+        let Some(w) = self.watch.clone() else { return };
+        // 确认门开着 = 等用户输入，不抢跑；运行中 / 更新代码中不轮询
+        if self.run_active() || self.pull_done.is_some() || self.confirm_gate.open {
+            return;
+        }
+        if w.last_poll.elapsed() < Duration::from_secs(3) {
+            return;
+        }
+        if let Some(w) = self.watch.as_mut() {
+            w.last_poll = std::time::Instant::now();
+        }
+        // 目标流程可能已被删除 → 顺势停止监听
+        let target_exists = self.projects.iter().any(|p| {
+            p.project.name == w.project && p.jobs.iter().any(|j| j.job.name == w.job)
+        });
+        if !target_exists {
+            self.stop_watch();
+            return;
+        }
+        match newest_mtime(std::path::Path::new(&w.dir), 0) {
+            Some(mtime) if mtime > w.since => {
+                if let Some(w) = self.watch.as_mut() {
+                    w.since = std::time::SystemTime::now();
+                }
+                self.console.push_line(
+                    "👀 检测到文件变化，自动重跑…".to_string(),
+                    crate::ui::console::Role::Info,
+                );
+                // 监听重跑 = 已确认过的会话，跳过确认门直达启动
+                self.auto_rerun(&w);
+            }
+            _ => {}
+        }
+    }
+
+    /// 监听触发的重跑：定位监听目标并启动（绕过确认门；目标被选中以保持 UI 一致）
+    fn auto_rerun(&mut self, w: &WatchState) {
+        let Some(pi) = self
+            .projects
+            .iter()
+            .position(|p| p.project.name == w.project)
+        else {
+            self.stop_watch();
+            return;
+        };
+        let Some(ji) = self.projects[pi].jobs.iter().position(|j| j.job.name == w.job) else {
+            self.stop_watch();
+            return;
+        };
+        self.selected_project = Some(pi);
+        self.selected_job = Some(ji);
+        // 监听触发的重跑：历史入库 trigger=watch
+        self.run_trigger_watch = true;
+        self.launch_run(0, None);
     }
 
     /// 项目树「⟳ 更新代码」：对项目代码目录（local_path）后台执行 git pull --ff-only，
@@ -487,7 +681,9 @@ impl MainState {
         let run = self.run.as_ref()?;
         if let Some(status) = &run.finished {
             return Some(match status {
-                JobStatus::Success => StepVisualState::Success,
+                JobStatus::Success | JobStatus::SucceededWithFailures { .. } => {
+                    StepVisualState::Success
+                }
                 JobStatus::Failed { .. } => StepVisualState::Failed,
                 JobStatus::Cancelled | JobStatus::Timeout => StepVisualState::Cancelled,
                 JobStatus::Running => StepVisualState::Running,
@@ -523,7 +719,11 @@ impl MainState {
                         };
                     }
                 }
-                LogEvent::StepEnd { step_index, exit_code, .. } => {
+                LogEvent::StepEnd { step_index, exit_code, duration_ms } => {
+                    // 耗时时间线数据（handlers 的 step_index 超出主流程长度 → 忽略）
+                    if let Some(d) = self.run_step_durations.get_mut(*step_index) {
+                        *d = Some(*duration_ms);
+                    }
                     if let Some(st) = self.run_steps.get_mut(*step_index) {
                         if *st != StepVisualState::Skipped {
                             *st = if *exit_code == 0 {
@@ -535,6 +735,9 @@ impl MainState {
                     }
                 }
                 LogEvent::StepRetryWait { step_index, .. } => {
+                    if let Some(n) = self.run_step_retries.get_mut(*step_index) {
+                        *n += 1;
+                    }
                     if let Some(st) = self.run_steps.get_mut(*step_index) {
                         *st = StepVisualState::Waiting;
                     }
@@ -544,6 +747,27 @@ impl MainState {
                     // 取消/超时：被中断的步骤等不到 StepEnd，兜底落终态，避免永远闪蓝
                     if matches!(status, JobStatus::Cancelled | JobStatus::Timeout) {
                         mark_interrupted_cancelled(&mut self.run_steps);
+                    }
+                    // 桌面通知（toast）：最小化在干别的也能看到结果；watch 自动重跑尤其需要
+                    if self.global.desktop_notify {
+                        let label = self
+                            .run_job
+                            .as_ref()
+                            .map(|(p, j)| format!("{p}/{j}"))
+                            .unwrap_or_default();
+                        desktop_notify(&label, &crate::ui::console::job_label_public(status));
+                    }
+                    // 监听模式：结束即进入等待文件变化的待命态
+                    if let Some(w) = &self.watch {
+                        if self
+                            .run_job
+                            .as_ref()
+                            .map(|(p, j)| p == &w.project && j == &w.job)
+                            .unwrap_or(false)
+                        {
+                            self.status_msg =
+                                Some("👀 监听中：已结束，等待文件变化自动重跑…".to_string());
+                        }
                     }
                 }
                 _ => {}
@@ -605,6 +829,39 @@ impl MainState {
             self.console
                 .push_line(format!("前置检查: {}{msg}", pre.check), Role::Info);
         }
+        if !job.handlers.is_empty() {
+            let names = job
+                .handlers
+                .iter()
+                .map(|h| h.name.clone().unwrap_or_else(|| "（未命名）".into()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            self.console
+                .push_line(format!("handlers（变更才触发）: {names}"), Role::Info);
+        }
+        // 工具版本要求偏差（mise 风格）
+        {
+            let mut reqs: Vec<(&String, &String)> = project.tools_require.iter().collect();
+            reqs.sort();
+            for (name, req) in reqs {
+                let detected = self
+                    .tools
+                    .get(name)
+                    .and_then(|t| t.version.clone())
+                    .unwrap_or_default();
+                match crate::version::version_matches(req, &detected) {
+                    Ok(true) => self.console.push_line(
+                        format!("工具版本: {name} {detected} 满足 {req} ✓"),
+                        Role::Info,
+                    ),
+                    Ok(false) => self.console.push_line(
+                        format!("⚠ 工具版本偏差: {name} 需要 {req}，探测到 {detected}（运行将被拦截）"),
+                        Role::Fail,
+                    ),
+                    Err(e) => self.console.push_line(format!("⚠ {name}: {e}"), Role::Fail),
+                }
+            }
+        }
         let (mut exec_n, mut skip_n) = (0usize, 0usize);
         for p in &previews {
             let tgt = p.target.clone().unwrap_or_else(|| "local".to_string());
@@ -641,6 +898,18 @@ impl MainState {
                 if let Some((s, d)) = &p.pack {
                     self.console
                         .push_line(format!("    ⧉ 打包 {s} -> {d}"), Role::Stdout);
+                }
+                for (k, pat) in &p.outputs {
+                    self.console
+                        .push_line(format!("    ⇩ 捕获输出 {k} ← /{pat}/"), Role::Stdout);
+                }
+                if !p.notify.is_empty() {
+                    self.console
+                        .push_line(format!("    ⇮ notify: {}", p.notify.join(",")), Role::Stdout);
+                }
+                if let Some(w) = &p.wait_note {
+                    self.console
+                        .push_line(format!("    ⏲ 探测: {w}"), Role::Stdout);
                 }
                 if p.working_dir != workspace && !p.working_dir.as_os_str().is_empty() {
                     self.console.push_line(
@@ -748,13 +1017,16 @@ impl MainState {
             );
         }
 
-        // 状态可视化复位：新一次运行所有步骤的光圈回 Idle，并记录运行对象与 wait 步骤
+        // 状态可视化复位：新一次运行所有步骤的光圈回 Idle，并记录运行对象与 wait 步骤；
+        // 耗时/重试数据同步清零（新运行的时间线从零开始）
         self.run_steps = vec![StepVisualState::Idle; job.steps.len()];
         self.run_step_wait = job
             .steps
             .iter()
             .map(|s| matches!(s.step_type, StepType::Wait))
             .collect();
+        self.run_step_durations = vec![None; job.steps.len()];
+        self.run_step_retries = vec![0; job.steps.len()];
         self.run_job = Some((project.name.clone(), job.name.clone()));
 
         // §3.5：项目级目标覆盖全局 targets.yaml（键相同项目优先），并回填凭据键
@@ -776,6 +1048,14 @@ impl MainState {
         // 运行唯一标识：与日志文件同名，引擎经 ${{ run.id }} 透出给步骤命令
         let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
         let run_id = format!("{}-{}", project.name, stamp);
+        let steps_len = job.steps.len();
+        let job_snapshot = yaml_serde::to_string(&job).unwrap_or_default();
+        let project_job_name = job.name.clone();
+        let project_target_name = job.target.clone();
+        let run_id_for_end = run_id.clone();
+        let save_history = self.global.save_history;
+        let trigger: &'static str = if self.run_trigger_watch { "watch" } else { "manual" };
+        self.run_trigger_watch = false;
         let input = crate::engine::RunInput {
             project: project.clone(),
             job,
@@ -804,17 +1084,40 @@ impl MainState {
                 .unwrap_or(JobStatus::Failed { step_index: 0, reason: "引擎任务异常".to_string() });
             let _ = tok_tx
                 .send(LogEvent::JobEnd {
-                    run_id,
+                    run_id: run_id_for_end,
                     status: status.clone(),
                     total_duration_ms: started.elapsed().as_millis() as u64,
                 })
                 .await;
         });
 
-        // 转发任务：tokio mpsc → std mpsc（UI）+ 追加日志文件
+        // 转发任务：tokio mpsc → std mpsc（UI）+ 追加日志文件 + 运行历史入库（save_history 开）
+        let history_meta = crate::storage::sqlite::RunMeta {
+            run_id: run_id.clone(),
+            project: project.name.clone(),
+            job: project_job_name.clone(),
+            target: project_target_name,
+            trigger,
+            log_path: Some(log_path.to_string_lossy().to_string()),
+        };
         self.runtime.spawn(async move {
+            #[cfg(feature = "sqlite")]
+            let recorder = if save_history {
+                crate::storage::sqlite::RunRecorder::start(
+                    &history_meta,
+                    &job_snapshot,
+                    steps_len,
+                )
+                .await
+            } else {
+                None
+            };
             let mut file = std::fs::File::create(&log_path).ok();
             while let Some(ev) = tok_rx.recv().await {
+                #[cfg(feature = "sqlite")]
+                if let Some(rec) = &recorder {
+                    rec.on_event(&ev).await;
+                }
                 if let Some(f) = file.as_mut() {
                     use std::io::Write;
                     if let Some(text) = format_event(&ev) {
@@ -824,6 +1127,10 @@ impl MainState {
                 if std_tx.send(ev).is_err() {
                     break; // UI 已关闭
                 }
+            }
+            #[cfg(feature = "sqlite")]
+            if let Some(rec) = recorder {
+                rec.close().await;
             }
         });
 
@@ -934,6 +1241,70 @@ fn show_confirm_gate_window(ctx: &egui::Context, main: &mut MainState) {
     }
 }
 
+/// Windows 桌面通知（toast）：零 Rust 依赖——起隐藏 PowerShell 用 WinRT Toast
+/// （Win10/11 自带，无需装模块）。spawn 即忘（PowerShell 启动 ~300ms 在后台）。
+fn desktop_notify(title: &str, body: &str) {
+    let esc = |s: &str| s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+    let title = esc(title);
+    let body = esc(body);
+    let script = format!(
+        r#"
+[Windows.UI.Notifications.ToastNotificationManager,Windows.UI.Notifications,ContentType=WindowsRuntime] | Out-Null
+[Windows.Data.Xml.Dom.XmlDocument,Windows.Data.Xml.Dom.XmlDocument,ContentType=WindowsRuntime] | Out-Null
+$x = [Windows.Data.Xml.Dom.XmlDocument]::new()
+$x.LoadXml('<toast><visual><binding template="ToastText02"><text id="1">{title}</text><text id="2">{body}</text></binding></visual></toast>')
+$t = [Windows.UI.Notifications.ToastNotification]::new($x)
+[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('Remote Build System').Show($t)
+"#
+    );
+    let mut cmd = std::process::Command::new("powershell");
+    cmd.args(["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", &script]);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    let _ = cmd.spawn();
+}
+
+/// 监听扫描时跳过的目录（构建产物 / 依赖 / IDE 元数据——它们变化不代表源码变了）
+const WATCH_SKIP_DIRS: &[&str] = &[
+    ".git", ".svn", ".idea", ".vscode", "node_modules", "target", "dist", "build", "out",
+    ".next", "coverage", "__pycache__",
+];
+
+/// 递归取目录下最新文件 mtime（depth 为递归层级，防符号链接环 / 异常深树）
+fn newest_mtime(dir: &std::path::Path, depth: usize) -> Option<std::time::SystemTime> {
+    if depth > 12 {
+        return None;
+    }
+    let entries = std::fs::read_dir(dir).ok()?;
+    let mut max: Option<std::time::SystemTime> = None;
+    let mut consider = |t: Option<std::time::SystemTime>| {
+        if let Some(t) = t {
+            if max.map(|m| t > m).unwrap_or(true) {
+                max = Some(t);
+            }
+        }
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        if WATCH_SKIP_DIRS.contains(&name.as_str()) {
+            continue;
+        }
+        match entry.file_type() {
+            Ok(ft) if ft.is_dir() => consider(newest_mtime(&path, depth + 1)),
+            Ok(_) => consider(entry.metadata().ok().and_then(|m| m.modified().ok())),
+            Err(_) => {}
+        }
+    }
+    max
+}
+
 /// 取消/超时/异常退出时，仍在运行的步骤等不到 StepEnd，兜底落中性终态（避免永远闪蓝）
 fn mark_interrupted_cancelled(steps: &mut [StepVisualState]) {
     for st in steps.iter_mut() {
@@ -967,5 +1338,36 @@ fn format_event(ev: &LogEvent) -> Option<String> {
             Some(format!("==== {} ({total_duration_ms}ms) ====", status.short()))
         }
         LogEvent::Error { message } => Some(format!("[error] {message}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn newest_mtime_scans_and_skips_junk_dirs() {
+        let dir = std::env::temp_dir().join(format!("rbs_watch_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::create_dir_all(dir.join("node_modules/pkg")).unwrap();
+        let f1 = dir.join("src/main.rs");
+        std::fs::write(&f1, "fn main() {}").unwrap();
+        let f2 = dir.join("node_modules/pkg/index.js");
+        std::fs::write(&f2, "module.exports = 1").unwrap();
+
+        // 扫描到源码文件的 mtime（node_modules 被剪枝也无所谓，文件存在即可）
+        let m = newest_mtime(&dir, 0);
+        assert!(m.is_some(), "应至少发现一个文件");
+        // 最近 mtime 不早于任一文件自身的 mtime
+        let file_m = std::fs::metadata(&f1).unwrap().modified().unwrap();
+        assert!(m.unwrap() >= file_m);
+
+        // 空目录 → None
+        let empty = dir.join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        assert!(newest_mtime(&empty, 0).is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

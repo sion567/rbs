@@ -166,8 +166,35 @@ fn run(args: &[String]) {
 
     let rt = tokio::runtime::Runtime::new().expect("创建 tokio runtime 失败");
     let (tx, mut rx) = mpsc::channel(8192);
+    let save_history = config::load_global()
+        .map(|g| g.save_history)
+        .unwrap_or(true);
+    let steps_len = je.job.steps.len();
+    let snapshot = yaml_serde::to_string(&je.job).unwrap_or_default();
+    let history_meta = crate::storage::sqlite::RunMeta {
+        run_id: format!(
+            "{}-{}",
+            entry.project.name,
+            chrono::Local::now().format("%Y%m%d-%H%M%S")
+        ),
+        project: entry.project.name.clone(),
+        job: je.job.name.clone(),
+        target: je.job.target.clone(),
+        trigger: "cli",
+        log_path: None,
+    };
     let printer = rt.spawn(async move {
+        #[cfg(feature = "sqlite")]
+        let recorder = if save_history {
+            crate::storage::sqlite::RunRecorder::start(&history_meta, &snapshot, steps_len).await
+        } else {
+            None
+        };
         while let Some(ev) = rx.recv().await {
+            #[cfg(feature = "sqlite")]
+            if let Some(rec) = &recorder {
+                rec.on_event(&ev).await;
+            }
             match ev {
                 LogEvent::Stdout { line, .. } => println!("{line}"),
                 LogEvent::Stderr { line, .. } => eprintln!("[stderr] {line}"),
@@ -182,6 +209,10 @@ fn run(args: &[String]) {
                 LogEvent::Error { message } => eprintln!("[error] {message}"),
                 LogEvent::JobEnd { .. } => {}
             }
+        }
+        #[cfg(feature = "sqlite")]
+        if let Some(rec) = recorder {
+            rec.close().await;
         }
     });
 
@@ -207,7 +238,17 @@ fn run(args: &[String]) {
         cancel_tx: Some(cancel_tx),
     };
 
+    let started = std::time::Instant::now();
+    let end_tx = tx.clone();
+    let cli_run_id = input.run_id.clone();
     let status = rt.block_on(engine.run_job(input, cancel_rx, tx));
+    // CLI 没有外层包装任务：这里补发 JobEnd（历史入库收尾 / 与 GUI 事件协议对齐）
+    let _ = rt.block_on(end_tx.send(LogEvent::JobEnd {
+        run_id: cli_run_id,
+        status: status.clone(),
+        total_duration_ms: started.elapsed().as_millis() as u64,
+    }));
+    drop(end_tx); // 通道关闭 → printer 循环退出
     let _ = rt.block_on(printer);
     println!("==== {} ====", status.short());
     if !status.ok() {
@@ -264,6 +305,32 @@ fn preview(args: &[String]) {
         };
         println!("前置检查: {}{msg}", pre.check);
     }
+    if !je.job.handlers.is_empty() {
+        let names = je
+            .job
+            .handlers
+            .iter()
+            .map(|h| h.name.clone().unwrap_or_else(|| "（未命名）".into()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("handlers（变更才触发）: {names}");
+    }
+    // 工具版本要求偏差（mise 风格）
+    {
+        let tools = config::load_tools().map(|t| t.tools).unwrap_or_default();
+        let mut reqs: Vec<(&String, &String)> = entry.project.tools_require.iter().collect();
+        reqs.sort();
+        for (name, req) in reqs {
+            let detected = tools.get(name).and_then(|t| t.version.clone()).unwrap_or_default();
+            match crate::version::version_matches(req, &detected) {
+                Ok(true) => println!("工具版本: {name} {detected} 满足 {req} ✓"),
+                Ok(false) => println!(
+                    "⚠ 工具版本偏差: {name} 需要 {req}，探测到 {detected}（运行将被拦截）"
+                ),
+                Err(e) => println!("⚠ {name}: {e}"),
+            }
+        }
+    }
     let (mut exec_n, mut skip_n) = (0usize, 0usize);
     for p in &previews {
         let tgt = p.target.clone().unwrap_or_else(|| "local".to_string());
@@ -281,6 +348,15 @@ fn preview(args: &[String]) {
             }
             if let Some((s, d)) = &p.pack {
                 println!("    ⧉ 打包 {s} -> {d}");
+            }
+            for (k, pat) in &p.outputs {
+                println!("    ⇩ 捕获输出 {k} ← /{pat}/");
+            }
+            if !p.notify.is_empty() {
+                println!("    ⇮ notify: {}", p.notify.join(","));
+            }
+            if let Some(w) = &p.wait_note {
+                println!("    ⏲ 探测: {w}");
             }
         }
         for w in &p.warnings {

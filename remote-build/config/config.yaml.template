@@ -1,7 +1,9 @@
 # 全局配置（首次启动自动生成，此文件为参考模板）
 default_timeout: 600        # 步骤默认超时（秒）：步骤未配 step.timeout 时生效；整个流程的超时用 build.yaml 的 job.timeout
 max_concurrent_jobs: 3
-log_retention_days: 30
+log_retention_days: 30        # 日志与运行历史保留天数
+save_history: true           # 保留运行历史（SQLite ~/.remote-build/data/history.db）
+desktop_notify: true         # 作业结束时弹 Windows 桌面通知
 workspace_root: ~/.remote-build/projects
 auto_update_tools: false
 theme: dark

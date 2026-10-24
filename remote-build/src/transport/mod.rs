@@ -23,26 +23,48 @@ pub enum Stream {
 
 /// LogSink 的 mpsc 实现：把每行输出包装成 LogEvent 推给引擎/UI。
 /// UI 侧在 RunHandle 里持有 receiver 逐帧消费。
+/// 可选附带 stdout 捕获缓冲（step outputs：正则从全文捕获运行时变量）。
 #[derive(Clone)]
 pub struct LogHandle {
     pub tx: mpsc::Sender<LogEvent>,
     pub step_index: usize,
+    /// stdout 全文缓冲（None = 不捕获）
+    capture: Option<std::sync::Arc<std::sync::Mutex<String>>>,
 }
 
 impl LogHandle {
     pub fn new(tx: mpsc::Sender<LogEvent>, step_index: usize) -> Self {
-        Self { tx, step_index }
+        Self { tx, step_index, capture: None }
+    }
+
+    /// 附带 stdout 捕获缓冲的构造（step.outputs 非空时由引擎创建）
+    pub fn with_capture(
+        tx: mpsc::Sender<LogEvent>,
+        step_index: usize,
+        capture: std::sync::Arc<std::sync::Mutex<String>>,
+    ) -> Self {
+        Self { tx, step_index, capture: Some(capture) }
     }
 
     pub fn line(&self, stream: Stream, text: impl Into<String>) {
+        let line_text = text.into();
+        // stdout 捕获（step outputs）：先入缓冲再发事件，缓冲满/锁失败不影响主流程
+        if matches!(stream, Stream::Stdout) {
+            if let Some(buf) = &self.capture {
+                if let Ok(mut b) = buf.lock() {
+                    b.push_str(&line_text);
+                    b.push('\n');
+                }
+            }
+        }
         let ev = match stream {
             Stream::Stdout => LogEvent::Stdout {
                 step_index: self.step_index,
-                line: text.into(),
+                line: line_text,
             },
             Stream::Stderr => LogEvent::Stderr {
                 step_index: self.step_index,
-                line: text.into(),
+                line: line_text,
             },
         };
         // 通道满时丢弃最不关键的输出行，绝不阻塞执行

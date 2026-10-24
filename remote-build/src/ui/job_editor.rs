@@ -40,10 +40,11 @@ impl ToolMenu {
     }
 }
 
-const STEP_TYPES: [&str; 5] = [
+const STEP_TYPES: [&str; 6] = [
     "exec（执行命令）",
     "wait（轮询等待）",
     "upload（上传文件）",
+    "download（下载文件）",
     "pack（打包 zip）",
     "k8s-apply（kubectl 应用）",
 ];
@@ -57,8 +58,9 @@ fn step_type_index(st: &StepType) -> usize {
         StepType::Exec => 0,
         StepType::Wait => 1,
         StepType::Upload => 2,
-        StepType::Pack => 3,
-        StepType::K8sApply => 4,
+        StepType::Download => 3,
+        StepType::Pack => 4,
+        StepType::K8sApply => 5,
     }
 }
 
@@ -67,8 +69,39 @@ fn step_type_from_index(i: usize) -> StepType {
         0 => StepType::Exec,
         1 => StepType::Wait,
         2 => StepType::Upload,
-        3 => StepType::Pack,
+        3 => StepType::Download,
+        4 => StepType::Pack,
         _ => StepType::K8sApply,
+    }
+}
+
+const WAIT_MODES: [&str; 3] = ["命令", "tcp", "http"];
+
+fn wait_mode_index(m: crate::models::WaitMode) -> usize {
+    match m {
+        crate::models::WaitMode::Command => 0,
+        crate::models::WaitMode::Tcp => 1,
+        crate::models::WaitMode::Http => 2,
+    }
+}
+
+fn wait_mode_from_index(i: usize) -> crate::models::WaitMode {
+    match i {
+        0 => crate::models::WaitMode::Command,
+        1 => crate::models::WaitMode::Tcp,
+        _ => crate::models::WaitMode::Http,
+    }
+}
+
+/// 耗时展示：< 1s 用毫秒，否则秒（1 位小数），≥ 60s 用「x分y秒」
+fn human_duration(ms: u64) -> String {
+    if ms < 1000 {
+        format!("{ms}ms")
+    } else if ms < 60_000 {
+        format!("{:.1}s", ms as f64 / 1000.0)
+    } else {
+        let total = ms / 1000;
+        format!("{}分{}秒", total / 60, total % 60)
     }
 }
 
@@ -125,6 +158,9 @@ pub fn show(main: &mut MainState, ui: &mut egui::Ui) {
     let dark = !matches!(main.global.theme, crate::models::Theme::Light);
     let (run_proj, run_job_name) = main.run_job.clone().unwrap_or_default();
     let step_states = main.run_steps.clone();
+    // 耗时时间线 / 重试标注（GHA 式）：仅「正在显示 = 正在运行」的作业展示
+    let step_durations = main.run_step_durations.clone();
+    let step_retries = main.run_step_retries.clone();
 
     // 同一 ProjectEntry 的两个字段分别借用（字段级借用拆分）
     let entry = &mut main.projects[pi];
@@ -223,6 +259,20 @@ pub fn show(main: &mut MainState, ui: &mut egui::Ui) {
                     ui.selectable_value(&mut job.on_failure, FailureAction::Continue, "continue");
                     ui.selectable_value(&mut job.on_failure, FailureAction::Retry, "retry");
                 });
+            // job 级整体重试参数（on_failure: retry 时生效）
+            if matches!(job.on_failure, FailureAction::Retry) {
+                let r = job.retry.get_or_insert(crate::models::RetryConfig {
+                    max_attempts: 2,
+                    backoff_seconds: 5,
+                });
+                ui.weak("重试:");
+                ui.add(
+                    egui::DragValue::new(&mut r.max_attempts)
+                        .suffix("次")
+                        .range(1..=10),
+                );
+                ui.add(egui::DragValue::new(&mut r.backoff_seconds).suffix("s").range(0..=600));
+            }
 
             ui.separator();
             // 人工确认门（GHA environment protection）：防手滑上生产
@@ -362,11 +412,31 @@ pub fn show(main: &mut MainState, ui: &mut egui::Ui) {
                 ui.disable();
             }
             for si in 0..job.steps.len() {
-                // 光圈只挂在「正在显示的作业 = 正在运行的作业」上
-                let state = if run_proj == project.name && run_job_name == job.name {
+                // 光圈/耗时条只挂在「正在显示的作业 = 正在运行的作业」上
+                let is_active_job = run_proj == project.name && run_job_name == job.name;
+                let state = if is_active_job {
                     step_states.get(si).copied().unwrap_or_default()
                 } else {
                     StepVisualState::Idle
+                };
+                // 耗时时间线：(耗时 ms, 相对最慢步骤的占比, 重试次数)，由 show 统一算好
+                let timeline = if is_active_job {
+                    step_durations.get(si).copied().flatten().map(|ms| {
+                        let max = step_durations
+                            .iter()
+                            .flatten()
+                            .copied()
+                            .max()
+                            .unwrap_or(ms)
+                            .max(1);
+                        (
+                            ms,
+                            (ms as f32 / max as f32).clamp(0.03, 1.0),
+                            step_retries.get(si).copied().unwrap_or(0),
+                        )
+                    })
+                } else {
+                    None
                 };
                 actions.push(edit_step(
                     ui,
@@ -378,6 +448,7 @@ pub fn show(main: &mut MainState, ui: &mut egui::Ui) {
                     job_target_display.as_str(),
                     state,
                     dark,
+                    timeline,
                 ));
             }
 
@@ -552,6 +623,8 @@ fn create_job(main: &mut MainState) {
         timeout: Some(60),
         confirm: None,
         preconditions: Vec::new(),
+        handlers: Vec::new(),
+        retry: None,
         on_failure: FailureAction::Stop,
         steps,
         working_dir: None,
@@ -688,7 +761,22 @@ pub fn show_var_help_window(ctx: &egui::Context, main: &mut MainState) {
             ui.monospace("  - check: java -version");
             ui.monospace("    message: JDK 未安装");
             ui.monospace("timeout: 600             # 作业级总超时（秒）；步骤级用 step.timeout");
+            ui.monospace("tools_require:           # 工具版本要求（project.yaml，mise 风格）");
+            ui.monospace("  java: \">=21\"           # 运行前校验，偏差零步失败；预览显示对比");
             ui.weak("同项目运行互斥（GHA concurrency）：新运行自动取消旧运行，无需配置。");
+
+            ui.add_space(8.0);
+            ui.separator();
+            ui.add_space(4.0);
+            ui.strong("五、运行时变量与变更触发（handlers / outputs / wait）");
+            ui.monospace("outputs:                 # 步骤 stdout 按正则捕获 → ${{ env.键 }}");
+            ui.monospace("  VER: 'VERSION=(\\S+)'   # 有捕获组取组 1，无则取整行匹配");
+            ui.monospace("notify: [重启服务]       # 本步骤真的执行/真传了新内容 → 登记通知");
+            ui.monospace("handlers:                # 流程成功收尾后按定义顺序执行被通知到的");
+            ui.monospace("  - name: 重启服务");
+            ui.monospace("    command: systemctl restart app");
+            ui.monospace("wait: { mode: tcp, target: 1.2.3.4:8080 }");
+            ui.weak("wait 探测三模式：命令 / tcp 可连 / http 2xx（部署后验证可达，从发版机直连）。");
 
             ui.add_space(8.0);
             ui.weak("完整说明见 docs/变量速查.md（设计文档 §6）。");
@@ -724,6 +812,7 @@ fn delete_current_job(main: &mut MainState) {
 /// running = 有作业在跑（此时单步运行按钮禁用）。
 /// target_names = 本项目可用的目标名；job_target_display = 流程默认目标的展示文本。
 /// state = 本步骤的运行状态（卡片外围光圈：运行蓝闪/等待黄闪/成功绿/失败红，见 ui::status）。
+/// timeline = Some((耗时 ms, 相对最慢步骤占比, 重试次数)) —— GHA 式耗时时间线，Idle 作业为 None。
 #[allow(clippy::too_many_arguments)]
 fn edit_step(
     ui: &mut egui::Ui,
@@ -735,6 +824,7 @@ fn edit_step(
     job_target_display: &str,
     state: StepVisualState,
     dark: bool,
+    timeline: Option<(u64, f32, u32)>,
 ) -> StepAction {
     let mut action = StepAction::None;
 
@@ -870,10 +960,89 @@ fn edit_step(
                     .desired_width(f32::INFINITY)
                     .font(egui::TextStyle::Monospace)
                     .hint_text(match step.step_type {
-                        StepType::Pack => "目录或通配 -> 目标.zip，如 target/ -> dist/app.zip",
+                        StepType::Pack => "目录或通配 -> 目标.zip [--exclude node_modules --exclude *.map]",
+                        StepType::Download => "远端路径 -> 本地路径（每行一条；本地相对项目目录）",
                         _ => "命令，支持 ${{ variables.X }} / ${{ env.X }} / ${VAR}",
                     }),
             );
+        }
+
+        // wait 步骤探测模式（Compose healthcheck 同款：命令 / tcp / http）
+        if matches!(step.step_type, StepType::Wait) {
+            ui.horizontal(|ui| {
+                match &mut step.wait {
+                    Some(p) => {
+                        ui.label("探测:").on_hover_text(
+                            "wait 步骤的探测方式：命令（退出码 0 = 就绪，空则用上方命令）、\
+                             tcp（从发版机直连 host:port）、http（GET 状态码 2xx；仅 http://）",
+                        );
+                        let mut m_idx = wait_mode_index(p.mode);
+                        egui::ComboBox::from_id_salt(format!("waitmode_{si}"))
+                            .selected_text(WAIT_MODES[m_idx])
+                            .width(70.0)
+                            .show_ui(ui, |ui| {
+                                for (i, label) in WAIT_MODES.iter().enumerate() {
+                                    ui.selectable_value(&mut m_idx, i, *label);
+                                }
+                            });
+                        p.mode = wait_mode_from_index(m_idx);
+                        let hint = match p.mode {
+                            crate::models::WaitMode::Command => "探测命令（空 = 用上方命令）",
+                            crate::models::WaitMode::Tcp => "host:port，如 10.0.0.5:8080",
+                            crate::models::WaitMode::Http => "http://host[:port]/path",
+                        };
+                        ui.add(
+                            egui::TextEdit::singleline(&mut p.target)
+                                .desired_width(220.0)
+                                .hint_text(hint),
+                        );
+                        ui.label("间隔");
+                        ui.add(
+                            egui::DragValue::new(&mut p.interval_seconds)
+                                .suffix("s")
+                                .range(0..=120),
+                        );
+                        if ui.small_button("×").clicked() {
+                            step.wait = None;
+                        }
+                    }
+                    None => {
+                        ui.weak("探测:命令轮询");
+                        if ui
+                            .small_button("⏲ 模式")
+                            .on_hover_text(
+                                "切换探测方式：命令 / tcp 可连 / http 2xx\n\
+                                 （部署后验证服务可达，http/tcp 从发版机直连）",
+                            )
+                            .clicked()
+                        {
+                            step.wait = Some(crate::models::WaitProbe {
+                                mode: crate::models::WaitMode::Tcp,
+                                target: String::new(),
+                                interval_seconds: 0,
+                            });
+                        }
+                    }
+                }
+            });
+        }
+
+        // 耗时时间线（GHA 式）：耗时条（相对全流程最慢步骤）+ 重试次数标注
+        if let Some((ms, frac, retries)) = timeline {
+            ui.horizontal(|ui| {
+                ui.monospace(format!("⏱ {}", human_duration(ms)));
+                ui.add(
+                    egui::ProgressBar::new(frac)
+                        .desired_width(140.0)
+                        .desired_height(8.0),
+                );
+                if retries > 0 {
+                    ui.colored_label(
+                        Color32::from_rgb(229, 192, 123),
+                        format!("⟳ 重试 {retries} 次"),
+                    );
+                }
+            });
         }
 
         ui.horizontal(|ui| {
@@ -958,6 +1127,37 @@ fn edit_step(
                     {
                         step.creates = Some(String::new());
                     }
+                }
+            }
+            // notify（Ansible handlers）：本步骤实际产生变更时，通知对应 handler 收尾执行
+            if step.notify.is_empty() {
+                if ui
+                    .small_button("＋notify")
+                    .on_hover_text(
+                        "变更才触发：本步骤真的执行/真的传了新内容时，流程成功收尾后执行\n\
+                         build.yaml handlers 表里的同名步骤（如「重启服务」）。多个用逗号分隔",
+                    )
+                    .clicked()
+                {
+                    step.notify.push("重启服务".to_string());
+                }
+            } else {
+                ui.label("notify:").on_hover_text(
+                    "变更才触发：流程成功收尾后执行 handlers 表里的同名步骤；\n\
+                     creates / when 跳过或上传内容未变都不算变更。多个用逗号分隔",
+                );
+                let mut buf = step.notify.join(",");
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut buf).desired_width(110.0),
+                );
+                if resp.changed() {
+                    step.notify = buf.split(',').map(|s| s.trim().to_string()).collect();
+                }
+                if resp.lost_focus() {
+                    step.notify.retain(|s| !s.is_empty());
+                }
+                if ui.small_button("×").clicked() {
+                    step.notify.clear();
                 }
             }
             if let Some(cond) = &mut step.condition {
