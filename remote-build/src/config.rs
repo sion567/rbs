@@ -525,6 +525,7 @@ pub fn create_example_project() -> Result<()> {
                     mode: WaitMode::Tcp,
                     target: "${{ targets.demo-server.host }}:8080".to_string(),
                     interval_seconds: 5,
+                    fail_exit_code: None,
                 }),
                 ..demo_step("等待端口就绪（wait tcp，从发版机探测）", "")
             },
@@ -534,6 +535,7 @@ pub fn create_example_project() -> Result<()> {
                     mode: WaitMode::Http,
                     target: "http://${{ targets.demo-server.host }}:8080/health".to_string(),
                     interval_seconds: 5,
+                    fail_exit_code: None,
                 }),
                 ..demo_step("HTTP 健康探测（wait http，2xx 即就绪）", "")
             },
@@ -543,6 +545,7 @@ pub fn create_example_project() -> Result<()> {
                     mode: WaitMode::Command,
                     target: "curl -sf http://127.0.0.1:8080/health".to_string(),
                     interval_seconds: 10,
+                    fail_exit_code: None,
                 }),
                 ..demo_step("命令探测（wait command，在目标机上执行）", "")
             },
@@ -614,6 +617,7 @@ pub fn create_example_project() -> Result<()> {
                     mode: WaitMode::Tcp,
                     target: "${{ targets.demo-server.host }}:8080".to_string(),
                     interval_seconds: 5,
+                    fail_exit_code: None,
                 }),
                 ..demo_step("等待健康检查通过（总限 2 分钟）", "")
             },

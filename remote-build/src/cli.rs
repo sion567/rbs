@@ -27,6 +27,10 @@ pub fn dispatch(args: &[String]) -> Option<()> {
             run(args.get(1..).unwrap_or_default());
             Some(())
         }
+        Some("run-group") => {
+            run_group(args.get(1..).unwrap_or_default());
+            Some(())
+        }
         Some("preview") => {
             preview(args.get(1..).unwrap_or_default());
             Some(())
@@ -46,6 +50,8 @@ fn print_help() {
          remote-build set-password <目标名> <密码>     写入系统凭据管理器（不落盘）\n  \
          remote-build test-conn <目标名>               SSH 连接测试\n  \
          remote-build run <项目名> <流程名> [--yes]    无头执行一条流程（--yes 跳过确认门）\n  \
+         remote-build run-group <项目名> <组名> [--yes] [--from <流程名>]\n  \
+         [...]                                         组运行：组内流程串行·失败即停（--from 从指定流程续跑）\n  \
          remote-build preview <项目名> <流程名>        干跑预览（展示解析后的命令，不执行）"
     );
 }
@@ -198,20 +204,7 @@ fn run(args: &[String]) {
             if let Some(rec) = &recorder {
                 rec.on_event(&ev).await;
             }
-            match ev {
-                LogEvent::Stdout { line, .. } => println!("{line}"),
-                LogEvent::Stderr { line, .. } => eprintln!("[stderr] {line}"),
-                LogEvent::StepStart { step_index, name, .. } => {
-                    println!("── Step {} ── {name}", step_index + 1)
-                }
-                LogEvent::StepEnd { step_index, exit_code, duration_ms } => {
-                    println!("── Step {} 退出码 {exit_code} ({duration_ms}ms)", step_index + 1)
-                }
-                // 退避等待期已有失败告警行，不重复输出
-                LogEvent::StepRetryWait { .. } => {}
-                LogEvent::Error { message } => eprintln!("[error] {message}"),
-                LogEvent::JobEnd { .. } => {}
-            }
+            print_cli_event(&ev);
         }
         #[cfg(feature = "sqlite")]
         if let Some(rec) = recorder {
@@ -250,6 +243,196 @@ fn run(args: &[String]) {
     let _ = rt.block_on(printer);
     println!("==== {} ====", status.short());
     if !status.ok() {
+        std::process::exit(1);
+    }
+}
+
+/// CLI 控制台事件打印（run / run-group 共用）
+fn print_cli_event(ev: &LogEvent) {
+    match ev {
+        LogEvent::Stdout { line, .. } => println!("{line}"),
+        LogEvent::Stderr { line, .. } => eprintln!("[stderr] {line}"),
+        LogEvent::StepStart { step_index, name, .. } => {
+            println!("── Step {} ── {name}", step_index + 1)
+        }
+        LogEvent::StepEnd { step_index, exit_code, duration_ms } => {
+            println!("── Step {} 退出码 {exit_code} ({duration_ms}ms)", step_index + 1)
+        }
+        // 退避等待期已有失败告警行，不重复输出
+        LogEvent::StepRetryWait { .. } => {}
+        LogEvent::Error { message } => eprintln!("[error] {message}"),
+        LogEvent::JobEnd { .. } => {}
+        // 组运行边界（run-group）
+        LogEvent::GroupJobBegin { job, index, total, .. } => {
+            println!("──── 组运行 {index}/{total} ── 启动流程 {job} ────")
+        }
+        LogEvent::GroupJobEnd { job, status, duration_ms, .. } => {
+            println!("──── 组流程 {job}: {}（{duration_ms}ms）────", status.short())
+        }
+    }
+}
+
+/// run-group 的组级事件出口：直接打印（历史入库与日志落盘在 runner 内）
+struct CliSink;
+
+#[async_trait::async_trait]
+impl crate::group::GroupSink for CliSink {
+    async fn on_event(&self, ev: LogEvent) {
+        print_cli_event(&ev);
+    }
+}
+
+/// `remote-build run-group <项目名> <组名> [--yes] [--from <流程名>]`：
+/// 组内流程按项目树顺序串行执行，任一失败即停（金丝雀分批语义）；
+/// 确认门统一收口——组内（--from 则剩余）流程的全部确认词一次输入包含才放行。
+fn run_group(args: &[String]) {
+    let mut yes_flag = false;
+    let mut from_name: Option<String> = None;
+    let mut positional: Vec<&String> = Vec::new();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--yes" => yes_flag = true,
+            "--from" => {
+                from_name = Some(it.next().context("--from 需要流程名").cloned().unwrap_or_default());
+            }
+            _ => positional.push(a),
+        }
+    }
+    if positional.len() != 2 {
+        eprintln!("用法: remote-build run-group <项目名> <组名> [--yes] [--from <流程名>]");
+        std::process::exit(2);
+    }
+    let (project_name, group_name) = (positional[0].clone(), positional[1].clone());
+
+    let (projects, warnings) = crate::storage::files::discover_with_errors(&config::projects_dir());
+    for w in &warnings {
+        eprintln!("⚠ {w}");
+    }
+    let entry = match projects.into_iter().find(|p| p.project.name == project_name) {
+        Some(e) => e,
+        None => {
+            eprintln!("❌ 未找到项目: {project_name}");
+            std::process::exit(2);
+        }
+    };
+    let jobs: Vec<crate::group::GroupJob> = entry
+        .jobs
+        .iter()
+        .filter(|je| je.job.group.as_deref() == Some(group_name.as_str()))
+        .map(|je| crate::group::GroupJob { name: je.job.name.clone(), job: je.job.clone() })
+        .collect();
+    if jobs.is_empty() {
+        eprintln!("❌ 项目 {project_name} 下没有分组「{group_name}」或分组为空");
+        std::process::exit(2);
+    }
+    let from = match &from_name {
+        None => 0,
+        Some(n) => match jobs.iter().position(|gj| &gj.name == n) {
+            Some(i) => i,
+            None => {
+                eprintln!(
+                    "❌ --from 流程不在组内: {n}（组内现有: {:?}）",
+                    jobs.iter().map(|gj| gj.name.clone()).collect::<Vec<_>>()
+                );
+                std::process::exit(2);
+            }
+        },
+    };
+
+    let tools = config::load_tools().map(|t| t.tools).unwrap_or_default();
+    let all_targets = config::effective_targets(&entry.project);
+    let default_timeout = config::load_global()
+        .map(|g| g.default_timeout)
+        .unwrap_or(crate::engine::DEFAULT_STEP_TIMEOUT);
+    let save_history = config::load_global().map(|g| g.save_history).unwrap_or(true);
+
+    // 组级预览：剩余流程干跑连展（与 GUI 确认门同一份内容）
+    println!(
+        "==== 组运行 {}/{}（{} 个流程，串行·失败即停{}）====",
+        project_name,
+        group_name,
+        jobs.len() - from,
+        if from > 0 { format!("，从第 {} 个流程继续", from + 1) } else { String::new() }
+    );
+    for line in crate::group::plan_lines(&entry.project, &jobs[from..], &tools, &all_targets, default_timeout) {
+        println!("{line}");
+    }
+
+    // 确认门：剩余流程的全部确认词（非交互终端必须 --yes）
+    let mut distinct: Vec<String> = Vec::new();
+    for gj in &jobs[from..] {
+        if let Some(w) = gj.job.confirm.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            if !distinct.iter().any(|x| x == w) {
+                distinct.push(w.to_string());
+            }
+        }
+    }
+    if !distinct.is_empty() {
+        use std::io::IsTerminal as _;
+        if yes_flag {
+            println!("ℹ 已跳过确认门（--yes，确认词: {}）", distinct.join(" "));
+        } else if !std::io::stdin().is_terminal() {
+            eprintln!(
+                "❌ 组内流程设置了确认门（需包含: {}）：非交互终端请追加 --yes",
+                distinct.join(" ")
+            );
+            std::process::exit(1);
+        } else {
+            print!("🔒 组确认门：输入确认词（需包含: {}）: ", distinct.join(" "));
+            use std::io::Write as _;
+            std::io::stdout().flush().ok();
+            let mut line = String::new();
+            let _ = std::io::stdin().read_line(&mut line);
+            if !crate::group::confirm_words_match(&line, &distinct) {
+                eprintln!("❌ 确认词不匹配，已取消");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    let rt = tokio::runtime::Runtime::new().expect("创建 tokio runtime 失败");
+    // run_id 只取一次：成员流程 run_id = {group_id}-{序号}，历史同前缀 = 同一次组发布
+    let group_id = format!(
+        "{}-grp-{}",
+        project_name,
+        chrono::Local::now().format("%Y%m%d-%H%M%S%3f")
+    );
+    let agg_run_id = group_id.clone();
+    let (cancel_tx, _keepalive) = broadcast::channel(4);
+    let spec = crate::group::GroupSpec {
+        project: entry.project.clone(),
+        group: group_name.clone(),
+        jobs,
+        tools,
+        all_targets,
+        default_step_timeout: default_timeout,
+        group_id,
+        cancel_tx: Some(cancel_tx),
+        from_job: from,
+        save_history,
+        log_dir: None,
+        trigger: "group",
+    };
+    let sink = CliSink;
+    let started = std::time::Instant::now();
+    let outcome = rt.block_on(crate::group::run_group_serial(spec, &sink));
+    let agg = outcome.status();
+    rt.block_on(crate::group::GroupSink::on_event(
+        &sink,
+        LogEvent::JobEnd {
+            run_id: agg_run_id,
+            status: agg.clone(),
+            total_duration_ms: started.elapsed().as_millis() as u64,
+        },
+    ));
+    let summary: Vec<String> = outcome
+        .results
+        .iter()
+        .map(|(name, st)| format!("{name}={}", st.short()))
+        .collect();
+    println!("==== 组运行结束: {}（{}）====", agg.short(), summary.join(", "));
+    if !outcome.ok() {
         std::process::exit(1);
     }
 }

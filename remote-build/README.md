@@ -19,6 +19,8 @@ cargo build --no-default-features   # 不带 SQLite 历史的精简构建
 remote-build set-password <目标名> <密码>        # SSH 密码写入 Windows Credential Manager（不落盘）
 remote-build test-conn <目标名>                  # SSH 连接测试 + 服务器体检（CPU/内存/磁盘）
 remote-build run <项目名> <流程名> [--yes]       # 无头执行（--yes 跳过确认门；非交互终端必加）
+remote-build run-group <项目名> <组名> [--yes] [--from <流程名>]
+                                                # 组运行：组内流程串行·失败即停（--from 从指定流程续跑）
 remote-build preview <项目名> <流程名>           # 干跑预览：解析后的命令 / 上传清单 / 将跳过的步骤
 ```
 
@@ -27,7 +29,7 @@ remote-build preview <项目名> <流程名>           # 干跑预览：解析�
 | 类型 | 说明 |
 |------|------|
 | `exec` | 执行命令（本地 cmd / 远端 plink） |
-| `wait` | 轮询等待就绪：命令 / tcp 可连 / http 2xx 三种探测模式 |
+| `wait` | 轮询等待就绪：命令 / tcp 可连 / http 2xx 三种探测模式；`fail_exit_code` 让"任务已死"立即失败（长任务配方） |
 | `upload` | 上传（多行映射 `本地 -> 远端`；sha256 校验；内容未变自动跳过传输） |
 | `download` | 下载（`远端 -> 本地`；sha256 校验；父目录自动创建） |
 | `pack` | 本地 zip 打包（`目录 -> x.zip [--exclude node_modules --exclude *.map]`） |
@@ -38,12 +40,31 @@ remote-build preview <项目名> <流程名>           # 干跑预览：解析�
 - **条件与状态**：`when:` 条件（==/!= 比较）、`creates:` 产物守卫（重跑秒过已完成步骤）
 - **运行时变量**：`outputs:` 从 stdout 正则捕获 → 后续步骤 `${{ env.键 }}` 引用
 - **变更才触发**：`notify:` + `handlers:`（只有真的传了新 artifact 才执行重启等收尾步骤）
+- **长任务（fire-and-poll）**：远端 `nohup` 后台跑 + 状态文件 + `wait` 轮询 +
+  `fail_exit_code` 致命退出码——备份/迁移跑 2 小时不怕 SSH 断，任务死了秒失败
+  不烧超时（配方见 `../docs/长任务配方.md`）
 - **前置检查**：`preconditions:` 本地断言，失败零秒退出（人话报错）
 - **确认门**：`confirm: prod` —— 运行前要求输入确认词，防手滑上生产
 - **超时**：`timeout:`（作业级总超时）+ 步骤级 `timeout`（config.yaml `default_timeout` 兜底）
 - **失败策略**：`on_failure: stop / continue / retry`（retry = 整个流程从头重跑 N 次）
 - **工具版本要求**：project.yaml `tools_require: { java: ">=21" }`，偏差零步失败
 - **同项目运行互斥**：新运行自动取消旧运行（GUI / CLI 跨进程生效，GHA concurrency 语义）
+
+## 组运行（金丝雀分批语义）
+
+分组从「项目树展示单位」升级为**执行单位**：工具栏「▶ 运行组」（选中流程所属组）或
+右键分组头「▶ 运行组」——组内流程按项目树顺序**串行**执行，**任一失败即停**
+（后续流程不启动 = 金丝雀"任一批失败不碰剩余机器"）。
+
+- **确认门统一收口**：组级预览（各流程干跑连展）→ 一次输入**全部**确认词
+  （组内任一流程配了 `confirm:` 就要输入，连跑不降级防线）；`preconditions` 照常逐流程把关
+- **续跑**：失败后右键分组「↪ 从失败处继续」（GUI 会话内记忆失败位置）；
+  CLI 用 `--from <流程名>`
+- **并行不做**：运行锁是项目级 cancel-in-progress（新运行接管 → 旧运行自杀），
+  组内并行会互杀；且多机同时发 = 全量发布，与金丝雀目标相悖
+- 历史：每个流程一条运行记录，run_id 同前缀（`{项目}-grp-时间戳-序号`）= 同一次组发布
+- 典型结构：① 打包 → ② 金丝雀（上传 prod-01 → 重启 → wait 健康检查）→ ③ 铺开
+  （prod-02、prod-03 同款三步，步骤级 `target` 覆盖）；job 边界 = 人工 / 审核间隔
 
 ## 环境与可观测
 

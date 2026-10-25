@@ -704,69 +704,66 @@ pub fn show_var_help_window(ctx: &egui::Context, main: &mut MainState) {
         .order(egui::Order::Foreground)
         .default_width(720.0)
         .default_height(520.0)
+        // 内容超过屏幕高度时滚动可达：此前底部几节（wait / 长任务配方）不可见也不可滚
+        .vscroll(true)
         .show(ctx, |ui| {
             ui.weak("可用于步骤命令、步骤 env、工作目录、条件字段。执行前一次性替换；未解析的占位符原样保留。");
             ui.add_space(6.0);
 
             ui.strong("一、取值形态");
-            egui::Grid::new("var_help_grid")
-                .num_columns(3)
-                .spacing([12.0, 4.0])
-                .show(ui, |ui| {
-                    ui.strong("写法");
-                    ui.strong("来源");
-                    ui.strong("示例");
-                    ui.end_row();
-
-                    let rows: Vec<(String, &str, &str)> = vec![
-                        (
-                            "${{ variables.X }}".into(),
-                            "project.yaml 的 variables.<组名>（「变量组」下拉选中的表）",
-                            "选 prod 组时 ${{ variables.DEPLOY_DIR }} → /opt/yudao/prod",
-                        ),
-                        (
-                            "${{ variables.X || 默认值 }}".into(),
-                            "X 未定义时取默认值（Jinja2 default 语义；默认值可带引号）",
-                            "${{ variables.PORT || 8080 }} → 未定义时展开为 8080",
-                        ),
-                        (
-                            "${{ env.X }}".into(),
-                            "前序步骤产出（往 workspace/.env 写 KEY=VALUE，步骤成功后自动捕获）",
-                            "docker build -t app:${{ env.VERSION }}",
-                        ),
-                        (
-                            "${{ targets.名.字段 }}".into(),
-                            "targets.yaml 目标字段（host/port/user/kubeconfig/context/namespace/registry/work_root）",
-                            "${{ targets.prod.host }} → 192.168.40.198",
-                        ),
-                        (
-                            "${{ now }}".into(),
-                            "运行启动时刻（引擎侧生成，一次运行所有步骤同值，备份后缀场景）",
-                            "cp app.jar app.jar.${{ now }} → app.jar.20261023153045",
-                        ),
-                        (
-                            "${{ now.date }} / ${{ now.time }} / ${{ now.iso }}".into(),
-                            "同上的日期 / 时间 / 可读格式",
-                            "20261023 · 153045 · 2026-10-23 15:30:45",
-                        ),
-                        (
-                            "${{ run.id }}".into(),
-                            "本次运行唯一标识（与控制台日志文件同名）",
-                            "echo ${{ run.id }} >> /opt/release.log",
-                        ),
-                        (
-                            "${VAR}".into(),
-                            "步骤产出 env → 环境变量表 → 系统环境变量（依次查找）",
-                            "${JAVA_HOME}",
-                        ),
-                    ];
-                    for (syn, src, ex) in rows {
-                        ui.monospace(syn);
-                        ui.label(src);
-                        ui.monospace(ex);
-                        ui.end_row();
-                    }
+            // 不用 Grid：窗口按内容自适应宽度时，Grid 末列宽度 = 剩余空间（受 max_col_width
+            // 封顶），与窗口宽度互相反馈会塌缩成几个字符宽。改为「写法一行 + 来源/示例缩进
+            // 两行」的纵向堆叠，宽度只受窗口约束，永不互相挤压
+            let rows: Vec<(String, &str, &str)> = vec![
+                (
+                    "${{ variables.X }}".into(),
+                    "project.yaml 的 variables.<组名>（「变量组」下拉选中的表）",
+                    "选 prod 组时 ${{ variables.DEPLOY_DIR }} → /opt/yudao/prod",
+                ),
+                (
+                    "${{ variables.X || 默认值 }}".into(),
+                    "X 未定义时取默认值（Jinja2 default 语义；默认值可带引号）",
+                    "${{ variables.PORT || 8080 }} → 未定义时展开为 8080",
+                ),
+                (
+                    "${{ env.X }}".into(),
+                    "前序步骤产出（往 workspace/.env 写 KEY=VALUE，步骤成功后自动捕获）",
+                    "docker build -t app:${{ env.VERSION }}",
+                ),
+                (
+                    "${{ targets.名.字段 }}".into(),
+                    "targets.yaml 目标字段（host/port/user/kubeconfig/context/namespace/registry/work_root）",
+                    "${{ targets.prod.host }} → 192.168.40.198",
+                ),
+                (
+                    "${{ now }}".into(),
+                    "运行启动时刻（引擎侧生成，一次运行所有步骤同值，备份后缀场景）",
+                    "cp app.jar app.jar.${{ now }} → app.jar.20261023153045",
+                ),
+                (
+                    "${{ now.date }} / ${{ now.time }} / ${{ now.iso }}".into(),
+                    "同上的日期 / 时间 / 可读格式",
+                    "20261023 · 153045 · 2026-10-23 15:30:45",
+                ),
+                (
+                    "${{ run.id }}".into(),
+                    "本次运行唯一标识（与控制台日志文件同名）",
+                    "echo ${{ run.id }} >> /opt/release.log",
+                ),
+                (
+                    "${VAR}".into(),
+                    "步骤产出 env → 环境变量表 → 系统环境变量（依次查找）",
+                    "${JAVA_HOME}",
+                ),
+            ];
+            for (syn, src, ex) in rows {
+                ui.add(egui::Label::new(egui::RichText::new(&syn).monospace()));
+                ui.indent("var_help_indent", |ui| {
+                    ui.add(egui::Label::new(egui::RichText::new(src).weak()).wrap());
+                    ui.add(egui::Label::new(egui::RichText::new(ex).monospace()).wrap());
                 });
+                ui.add_space(4.0);
+            }
 
             ui.add_space(8.0);
             ui.separator();
@@ -810,6 +807,11 @@ pub fn show_var_help_window(ctx: &egui::Context, main: &mut MainState) {
             ui.monospace("    command: systemctl restart app");
             ui.monospace("wait: { mode: tcp, target: 1.2.3.4:8080 }");
             ui.weak("wait 探测三模式：命令 / tcp 可连 / http 2xx（部署后验证可达，从发版机直连）。");
+            ui.monospace("wait: { mode: command, target: 探测命令, fail_exit_code: 2 }");
+            ui.weak(
+                "fail_exit_code：探测命令返回该退出码 = 任务已死，立即失败不再傻等\n\
+                 （长任务配方：远端 nohup 起任务写 status 文件，探测读它，failed 以约定码退出）",
+            );
 
             ui.add_space(8.0);
             ui.weak("完整说明见 docs/变量速查.md（设计文档 §6）。");
@@ -1042,6 +1044,20 @@ fn edit_step(
                                 .suffix("s")
                                 .range(0..=120),
                         );
+                        // 致命退出码（fire-and-poll 配方）：仅 command 模式有意义
+                        if matches!(p.mode, crate::models::WaitMode::Command) {
+                            let mut fatal = p.fail_exit_code.unwrap_or(0);
+                            ui.label("失败码");
+                            ui.add(
+                                egui::DragValue::new(&mut fatal).range(0..=255),
+                            )
+                            .on_hover_text(
+                                "探测命令返回该退出码 = 任务已死，立即失败停止轮询\n\
+                                 （长任务配方：远端脚本 status=failed 时 exit 2，这里配 2）\n\
+                                 0 = 不启用（非 0 一律视为还没就绪，继续等待）",
+                            );
+                            p.fail_exit_code = (fatal != 0).then_some(fatal);
+                        }
                         if ui.small_button("×").clicked() {
                             step.wait = None;
                         }
@@ -1060,6 +1076,7 @@ fn edit_step(
                                 mode: crate::models::WaitMode::Tcp,
                                 target: String::new(),
                                 interval_seconds: 0,
+                                fail_exit_code: None,
                             });
                         }
                     }
@@ -1205,7 +1222,9 @@ fn edit_step(
                     "when / condition：条件不满足则跳过本步。\n\
                      例：${{ variables.ENV }} == prod、${{ env.VERSION != '' }}",
                 );
-                ui.add(egui::TextEdit::singleline(cond).desired_width(220.0));
+                // 吃掉行内剩余宽度（给 × 留位）：定宽 220 在窄窗口下会把 × 挤出卡片右缘
+                let cond_w = (ui.available_width() - 34.0).max(80.0);
+                ui.add(egui::TextEdit::singleline(cond).desired_width(cond_w));
                 if ui.small_button("×").clicked() {
                     step.condition = None;
                 }

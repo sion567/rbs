@@ -136,6 +136,26 @@ impl ConsoleState {
             LogEvent::Error { message } => {
                 self.push(format!("⚠ {message}"), Role::Error);
             }
+            // 组运行边界（第五批）：单流程结束只发组事件，整个组结束才走 JobEnd 臂
+            LogEvent::GroupJobBegin { job, index, total, .. } => {
+                self.push(
+                    format!("──── 组运行 {index}/{total} ── 启动流程 {job} ────"),
+                    Role::Info,
+                );
+            }
+            LogEvent::GroupJobEnd { job, status, duration_ms, .. } => {
+                let role = if status.ok() {
+                    Role::Ok
+                } else if matches!(status, JobStatus::Cancelled) {
+                    Role::Cancelled
+                } else {
+                    Role::Fail
+                };
+                self.push(
+                    format!("──── 组流程 {job}: {}（{duration_ms}ms）────", job_label(status)),
+                    role,
+                );
+            }
         }
     }
 

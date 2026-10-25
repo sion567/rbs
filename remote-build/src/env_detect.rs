@@ -207,12 +207,38 @@ pub fn run_version_check(cmd: &str) -> Option<String> {
     probe(exe, &args)
 }
 
+/// 「验证 version_check」按工具的真实执行语义解析：注入工具 env、command 为完整路径时
+/// 把所在目录前置到 PATH（与引擎步骤注入一致，见 engine.rs 工具注入 + transport
+/// 的 with_path_prepended / merged_env）。否则裸名命令解析到系统 PATH 上的同名程序，
+/// 验出来的版本可能与工具实际指向不符（例：java-25 验出系统 PATH 的 jdk-17）。
+pub fn run_version_check_for_tool(check: &str, tool: &crate::models::Tool) -> Option<String> {
+    let mut parts = check.split_whitespace();
+    let exe = parts.next()?;
+    let args: Vec<&str> = parts.collect();
+
+    let mut env = tool.env.clone();
+    let path_like = tool.command.contains('\\') || tool.command.contains('/');
+    if path_like {
+        if let Some(parent) = std::path::Path::new(&tool.command).parent() {
+            if parent.exists() {
+                env = crate::transport::with_path_prepended(env, parent);
+            }
+        }
+    }
+    probe_with(exe, &args, &crate::transport::merged_env(&env))
+}
+
 /// 带超时地运行版本命令，取第一条非空输出行（java -version 输出在 stderr，一并考虑）
 fn probe(exe: &str, args: &[&str]) -> Option<String> {
+    probe_with(exe, args, &Default::default())
+}
+
+fn probe_with(exe: &str, args: &[&str], env: &std::collections::HashMap<String, String>) -> Option<String> {
     const TIMEOUT: Duration = Duration::from_secs(3);
 
     let mut cmd = Command::new(exe);
     cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;

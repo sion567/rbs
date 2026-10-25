@@ -725,6 +725,9 @@ fn local_machine_panel(ui: &mut egui::Ui, main: &mut MainState) {
             egui::Grid::new("local_tools_grid")
                 .num_columns(4)
                 .spacing([12.0, 4.0])
+                // 「命令 / 路径」列有 wrap，配 max_col_width 才会在面板内换行而不是把
+                // 表格顶出窗口右缘（版本列另做字符截断）
+                .max_col_width(280.0)
                 .show(ui, |ui| {
                     ui.strong("工具");
                     ui.strong("版本");
@@ -734,7 +737,17 @@ fn local_machine_panel(ui: &mut egui::Ui, main: &mut MainState) {
                     for n in &names {
                         let Some(t) = main.tools.get(n) else { continue };
                         ui.label(n);
-                        ui.label(t.version.as_deref().unwrap_or("—"));
+                        // 版本串可能极长（如 mvn 带 commit hash），不截断会把后续列挤出
+                        // 窗口右缘（Grid 列宽取最宽单元格）；截断展示 + 悬停看全量
+                        let version = t.version.as_deref().unwrap_or("—");
+                        let version_cell = if version.chars().count() > 26 {
+                            let cut: String = version.chars().take(24).collect();
+                            format!("{cut}…")
+                        } else {
+                            version.to_string()
+                        };
+                        ui.add(egui::Label::new(egui::RichText::new(&version_cell).weak()))
+                            .on_hover_text(version);
                         ui.weak(t.detected_from.as_deref().unwrap_or("手动"));
                         // 路径可选中复制：配步骤引用工具时方便对照
                         ui.add(

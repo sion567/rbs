@@ -119,8 +119,56 @@ pub fn show(main: &mut MainState, ui: &mut egui::Ui) {
                                 ui.weak("（空分组：右键 → ＋ 添加任务）");
                             }
                         });
-                        // 分组右键（暂只有添加任务一项，按需求分期）
+                        // 分组右键：组运行（第五批）/ 添加任务 / 删除
                         group_body.header_response.context_menu(|ui| {
+                            // ▶ 运行组：组内流程按树中顺序串行，任一失败即停
+                            if ui
+                                .add_enabled(
+                                    !member_idx.is_empty(),
+                                    egui::Button::new("▶ 运行组"),
+                                )
+                                .on_hover_text(
+                                    "组内流程按树中顺序串行执行，任一失败即停（金丝雀分批语义）；\n\
+                                     确认词取组内最严（一次输入全部确认词）",
+                                )
+                                .clicked()
+                            {
+                                main.selected_project = Some(pi);
+                                main.start_group_run(pi, gname, None);
+                                ui.close();
+                            }
+                            // ↪ 续跑：上次组运行在本组未通过 → 从该流程继续
+                            let resume = main
+                                .last_group_failure
+                                .as_ref()
+                                .filter(|r| {
+                                    r.project == main.projects[pi].project.name && r.group == *gname
+                                })
+                                .cloned();
+                            let mut resume_btn =
+                                ui.add_enabled(resume.is_some(), egui::Button::new("↪ 从失败处继续"));
+                            if let Some(r) = &resume {
+                                resume_btn = resume_btn.on_hover_text(format!(
+                                    "上次组运行在「{}」未通过，从它继续（跳过之前的流程）",
+                                    r.job
+                                ));
+                            } else {
+                                resume_btn = resume_btn
+                                    .on_hover_text("上次组运行在本组全部通过（或没有失败记录）");
+                            }
+                            if resume_btn.clicked() {
+                                if let Some(r) = &resume {
+                                    // 组内顺序下标：member_idx 里找该流程的位置
+                                    if let Some(member_pos) = member_idx
+                                        .iter()
+                                        .position(|&ji| main.projects[pi].jobs[ji].job.name == r.job)
+                                    {
+                                        main.start_group_run(pi, gname, Some(member_pos));
+                                    }
+                                }
+                                ui.close();
+                            }
+                            ui.separator();
                             if ui
                                 .add_enabled(!main.run_active(), egui::Button::new("＋ 添加任务"))
                                 .on_hover_text("在本分组下新建流程（可复制当前流程步骤）")

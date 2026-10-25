@@ -308,3 +308,79 @@
 - k8s_watch 轮询（§8.3，需要 k8s 环境验证）；步骤级并行（§12.1，单人桌面暂不痛）；
   OpenSshTransport（P1）；全局 variables.yaml 兜底（§3.7）；watch 跟随模式增强、
   trace 导出；传输队列面板（需文件粒度事件）；Capistrano 回滚 + Argo 自动回滚（等目录约定设计）。
+
+## 第五批（Spinnaker / Octopus Deploy 参照）
+
+> 背景：参照讨论"Spinnaker / Octopus 是大厂平台，学思路不抄工具"。两家本体均否：
+> Spinnaker 要专门养一套平台（政务内网没条件）；Octopus 是商业 Server 软件（内网装不了）。
+> 按性价比只吸收了以下几条。
+
+### ✅ 长任务 fire-and-poll（wait fail_exit_code，已实现）
+
+- 痛点：1.5T 备份 / 迁移一跑两小时，`exec` 阻塞挂 plink 上必死——步骤超时杀 plink，
+  远端进程收 SIGHUP 一起死；SSH 断一次任务也废。
+- 实现：`WaitProbe.fail_exit_code`（command 模式专属）——探测命令返回约定退出码
+  （如 2）= 任务已死，**立即失败停止轮询**；未配置保持旧行为（非 0 = 还没就绪继续等）。
+  引擎 `engine.rs` wait Command 分支 + UI「失败码」DragValue（0 = 关）；
+  单测 `wait_command_fail_exit_code_fails_fast` 覆盖 fail-fast 秒失败 / 未配置等到超时两条路径。
+- 完整配方（远端 nohup + status 文件三态 + 轮询间隔 30~60s + grep 退出码陷阱提醒）：
+  **docs/长任务配方.md**。
+
+### ✅ OpenSSH 传输硬化参数（P1 起步件，已固化）
+
+- `openssh.rs::build_ssh_args`：`ConnectTimeout=10`（连接黑洞快速失败）/
+  `ServerAliveInterval=15`（闲置保活，防 NAT/防火墙掐空闲连接——长任务轮询场景必需）/
+  `BatchMode=yes`（等价 plink -batch）；单测锁死三参数必须在场。
+- 密码目标构建期即报人话错误（BatchMode 无法传密码）；P1 取舍：密码走 plink、key 走 OpenSSH。
+- plink 没有 CLI 保活参数，现状由步骤超时兜底，不专门改。
+
+### 备份校验三件套（并入 Capistrano 回滚线，未单独做）
+
+- 存在 + 大小>0 + 魔数对（zip `PK` / gzip `1f 8b`），全过才写 status=success——
+  样例在 docs/长任务配方.md §三；做 releases/current 回滚时把它定为"备份步骤"的验收约定：
+  校验不过的备份等于没有备份，回滚的前提是备份真的可用。
+
+### 多机分批金丝雀（远期记一笔，暂不做）
+
+- Spinnaker 金丝雀的裸机版 = **机器分批**（先 1 台 → 健康检查 → 再铺其余），不需要 LB。
+  但我们 Target 是单机模型、当前场景单机为主；真有多台 prod 时再设计目标组
+  （hosts + canary + batch_size）+ 分批执行循环（任一批失败即停，不碰剩余机器）。
+- 流量百分比金丝雀（split_clients 那套）没有负载均衡就是自欺，不做；
+  审批流 / 指标自动判定 / 多环境权限体系同前批结论，不做。
+- 单机的安全网 = 长任务配方（备份可校验）+ wait 健康检查 + 回滚（Capistrano 线）。
+
+### ✅ 组运行（选组一次跑完：串行 + 失败即停 + 确认合并开始前，已实现）
+
+- 形态：工具栏「▶ 运行组」（选中流程所属组）+ 项目树分组右键「▶ 运行组」/「↪ 从失败处继续」
+  + CLI `run-group <项目名> <组名> [--yes] [--from <流程名>]`——组内 job 按拖拽顺序**串行**执行。
+  启动前组级预览（各 job 干跑预览连展：最终命令 / 上传清单 / 将跳过的步骤）+
+  一次确认门，**确认词取组内最严的**（全部确认词一次输入包含才放行，
+  连跑不降级防线）；job 级 preconditions 照常各自把关（自动断言不打扰人）。
+- 规则：任一 job 失败（或被取消）→ 后续不启动（金丝雀"任一批失败即停"）；
+  续跑 = GUI 右键「↪ 从失败处继续」（会话内记忆 `last_group_failure`）/ CLI `--from <流程名>`；
+  历史里每 job 一条记录、run_id 同前缀（`{项目}-grp-时间戳-序号`）= 同一次组发布（trigger=group）。
+- **并行第一版不做**：运行锁是项目级 cancel-in-progress（新 run 接管 → 旧 run 自杀），
+  组内并行会互杀，需先改锁模型（组持锁 + 子运行不抢）；且并行对金丝雀有害
+  （= 全量发布，爆炸半径没缩小），仅"多个无关服务同发"才正当，等真有需求再设计。
+- 实现要点：**引擎零改动**——锁由每次 run_job 获取/释放，串行天然安全（并行才互杀）；
+  新增 `src/group.rs` 共享执行循环（GUI/CLI 共用：调度、失败即停、历史入库、日志落盘、
+  取消传播），GUI = UiSink 转 UI 通道，CLI = CliSink 直接打印；
+  新事件 `GroupJobBegin / GroupJobEnd`（组内单流程结束不发 JobEnd——UI 的 run.finished
+  只在组级聚合 JobEnd 时置位，桌面通知显示组标签）；组运行中自动切换选中流程并复位步骤可视化。
+- 打包 job → 发布 job 的衔接不发明新机制（outputs 不跨 run 共享）：产物带版本命名
+  （`${{ now.date }}`）+ 发布 job preconditions 断言版本对，防拿旧包发。
+- 背景讨论结论：分组 = 一次发布的工作集；审核场景（外部系统卡中间，job 必须分开）与
+  金丝雀场景（目标不同的多个发布 job）统一为同一模型——job = 一口气能跑完的原子段，
+  job 边界 = 人工 / 审核间隔；审核挪到组运行开始前（预览 + 确认）后，串行连跑自然成立。
+- 单测：`group_runs_in_order_and_stops_on_failure`（失败即停 + 组边界事件）/
+  `group_resume_skips_leading_jobs`（续跑跳过头部）/
+  `group_continue_on_error_job_does_not_stop_group`（黄灯不停组）/ confirm_words_match。
+
+### 与现有 TODO 的咬合
+
+1. ✅ fail-fast 已落地（本批唯一引擎改动，长任务轮询的地基）；
+2. ✅ 组运行（串行 + 失败即停 + 确认合并开始前）——已实现，金丝雀的第一个具体落点：
+   组内目标不同的发布 job 串行走，配合单 job 内 step.target 序列即可裸机金丝雀；
+3. 备份校验三件套 → 随 Capistrano 回滚线走（第三批 PM2/Argo 优先级 4 的配套）；
+4. OpenSSH 硬化 → P1 传输替换时直接用（第五批候选的 OpenSshTransport 项）；
+5. 目标组 batch_size 循环（引擎级分批）与并行组运行，等真实多机 / 无关服务批量需求再启动。

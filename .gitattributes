@@ -1,0 +1,2 @@
+# shell 脚本必须保持 LF 行尾，否则在 Linux 服务器上会报 '\r' 错误
+*.sh text eol=lf

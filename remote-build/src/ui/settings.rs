@@ -75,6 +75,9 @@ fn reset_editor(main: &mut MainState) {
 /// 从作业编辑器一键打开「本项目」工具覆盖页
 pub fn open_project_scope(main: &mut MainState) {
     main.show_settings = true;
+    // 作用域和窗口 tab 要一起切：只切作用域不切 tab 时，窗口停在上次的
+    // 「运行历史」等页，用户点「工具覆盖」看到的却是不相干页面
+    main.settings_tab = SettingsTab::Tools;
     if main.tool_editor.scope != ToolScope::Project {
         main.tool_editor.scope = ToolScope::Project;
         reset_editor(main);
@@ -670,11 +673,18 @@ fn start_verify(main: &mut MainState) {
         ));
         return;
     };
+    // 连同工具本体一起带过去：验证要按工具的 env / command 所在目录解析，
+    // 否则裸名命令解析到系统 PATH 上的同名程序，结果与工具实际版本不符
+    let tool = scope_map_ref(main).and_then(|m| m.get(&name)).cloned();
     main.tool_editor.verify = None;
     let (tx, rx) = std::sync::mpsc::channel();
     main.tool_editor.verify_rx = Some(rx);
     std::thread::spawn(move || {
-        let _ = tx.send(crate::env_detect::run_version_check(&check));
+        let result = match tool {
+            Some(t) => crate::env_detect::run_version_check_for_tool(&check, &t),
+            None => crate::env_detect::run_version_check(&check),
+        };
+        let _ = tx.send(result);
     });
 }
 

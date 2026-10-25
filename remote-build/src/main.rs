@@ -8,6 +8,7 @@ mod cli;
 mod config;
 mod engine;
 mod env_detect;
+mod group;
 mod k8s;
 mod models;
 mod pack;

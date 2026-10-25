@@ -45,10 +45,10 @@ pub struct RunInput {
 
 pub struct Engine;
 
-/// 无 cancel_tx 场景（单测 / 干跑）的占位接收端。发送端必须保活：
+/// 无 cancel_tx 场景（单测 / 干跑 / 组运行无锁测试）的占位接收端。发送端必须保活：
 /// broadcast 的 Closed（全部发送端 drop）在引擎里被当作取消信号，
 /// 占位通道若不保活，重试第二轮会立刻「被取消」而非重跑。
-fn detached_cancel_rx() -> broadcast::Receiver<()> {
+pub(crate) fn detached_cancel_rx() -> broadcast::Receiver<()> {
     let (tx, rx) = broadcast::channel(1);
     std::mem::forget(tx);
     rx
@@ -977,6 +977,18 @@ async fn execute_step(
                             .await
                         {
                             Ok(st) if st.success => Some(st),
+                            // 致命退出码（fire-and-poll 配方）：探测判定远端任务已死，
+                            // 立即以该退出码结束步骤，不再傻等烧完整个超时
+                            Ok(st) if probe.fail_exit_code == Some(st.code) => {
+                                log.line(
+                                    transport::Stream::Stderr,
+                                    format!(
+                                        "[wait] 探测退出码 {} 命中 fail_exit_code：任务已失败，停止等待",
+                                        st.code
+                                    ),
+                                );
+                                Some(st)
+                            }
                             // 探测失败不算步骤失败，等待后重试；取消要透传
                             Ok(_) => None,
                             Err(e) if transport::is_cancelled(&e) => break Err(e),
@@ -1812,6 +1824,7 @@ mod tests {
             mode: crate::models::WaitMode::Tcp,
             target: format!("127.0.0.1:{port}"),
             interval_seconds: 0,
+            fail_exit_code: None,
         });
         let after = exec_step("echo AFTER_WAIT");
 
@@ -1824,6 +1837,65 @@ mod tests {
         assert!(events.iter().any(|e| matches!(
             e, LogEvent::Stdout { line, .. } if line.contains("tcp 127.0.0.1")
         )));
+    }
+
+    #[test]
+    fn wait_command_fail_exit_code_fails_fast() {
+        // fire-and-poll 配方核心语义：探测命令返回 fail_exit_code = 任务已死，
+        // 立即失败停止轮询；未配置时同一退出码只是"还没就绪"，会一直等到超时
+        let rt = runtime();
+        let engine = Engine;
+
+        // ① 命中 fail_exit_code：首个探测（cmd /C exit 2）即失败，不用烧完超时
+        {
+            let (tx, mut rx) = mpsc::channel(1024);
+            let (_c, cancel_rx) = broadcast::channel(4);
+            let mut wait = exec_step("");
+            wait.step_type = StepType::Wait;
+            wait.timeout = Some(60);
+            wait.wait = Some(crate::models::WaitProbe {
+                mode: crate::models::WaitMode::Command,
+                target: "cmd /C exit 2".to_string(),
+                interval_seconds: 1,
+                fail_exit_code: Some(2),
+            });
+            let started = std::time::Instant::now();
+            let status = rt.block_on(engine.run_job(simple_job(vec![wait]), cancel_rx, tx));
+            assert!(
+                matches!(&status, JobStatus::Failed { reason, .. } if reason.contains("退出码 2")),
+                "got: {status:?}"
+            );
+            assert!(
+                started.elapsed().as_secs() < 10,
+                "fail-fast 应在首个探测周期内失败，实际耗时 {:?}",
+                started.elapsed()
+            );
+            let mut events = Vec::new();
+            while let Ok(ev) = rx.try_recv() {
+                events.push(ev);
+            }
+            assert!(events.iter().any(|e| matches!(
+                e, LogEvent::Stderr { line, .. } if line.contains("fail_exit_code")
+            )));
+        }
+
+        // ② 未配置 fail_exit_code：退出码 2 一律视为未就绪，继续轮询直到步骤超时
+        {
+            let (tx, mut rx) = mpsc::channel(1024);
+            let (_c, cancel_rx) = broadcast::channel(4);
+            let mut wait = exec_step("");
+            wait.step_type = StepType::Wait;
+            wait.timeout = Some(2);
+            wait.wait = Some(crate::models::WaitProbe {
+                mode: crate::models::WaitMode::Command,
+                target: "cmd /C exit 2".to_string(),
+                interval_seconds: 1,
+                fail_exit_code: None,
+            });
+            let status = rt.block_on(engine.run_job(simple_job(vec![wait]), cancel_rx, tx));
+            assert!(matches!(status, JobStatus::Timeout), "got: {status:?}");
+            while rx.try_recv().is_ok() {}
+        }
     }
 
     #[test]
@@ -2273,6 +2345,7 @@ mod tests {
                 mode: crate::models::WaitMode::Tcp,
                 target: "${{ variables.HOST }}".to_string(),
                 interval_seconds: 0,
+                fail_exit_code: None,
             });
             s
         }]);

@@ -240,6 +240,11 @@ pub struct WaitProbe {
     /// 轮询间隔秒（0 = 默认 5）
     #[serde(default)]
     pub interval_seconds: u64,
+    /// command 模式专属：探测命令返回该退出码 = 致命失败，立即结束步骤不再轮询
+    /// （长任务 fire-and-poll 配方：远端脚本对 status=failed 以约定码退出，如 2）。
+    /// None（默认）= 关闭：非 0 退出码一律视为"还没就绪"继续等待。
+    #[serde(default)]
+    pub fail_exit_code: Option<i32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -671,6 +676,11 @@ pub enum LogEvent {
     StepRetryWait { step_index: usize, attempt: u32 },
     JobEnd { run_id: String, status: JobStatus, total_duration_ms: u64 },
     Error { message: String },
+    /// 组运行（第五批）：组内一个流程开始——UI 自动切到该流程并复位步骤可视化。
+    /// 整个组结束才发 JobEnd（聚合状态），单流程结束只发 GroupJobEnd。
+    GroupJobBegin { run_id: String, group: String, project: String, job: String, index: usize, total: usize },
+    /// 组运行：组内一个流程结束（UI 更新汇总与续跑指针，不置 run.finished）
+    GroupJobEnd { run_id: String, group: String, project: String, job: String, index: usize, total: usize, status: JobStatus, duration_ms: u64 },
 }
 
 /// 落 SQLite 时用 `.short()` 转字符串：running / success / failed / cancelled / timeout。
