@@ -1076,8 +1076,10 @@ impl MainState {
         let (std_tx, std_rx) = std_mpsc::channel();
 
         let engine = crate::engine::Engine;
-        // 运行唯一标识：与日志文件同名，引擎经 ${{ run.id }} 透出给步骤命令
-        let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+        // 运行唯一标识：与日志文件同名，引擎经 ${{ run.id }} 透出给步骤命令。
+        // 精确到毫秒：同秒内重跑（连点 / 脚本触发）若 run_id 相同，日志文件会互写、
+        // SQLite runs.run_id UNIQUE 冲突导致历史不入库
+        let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S%3f");
         let run_id = format!("{}-{}", project.name, stamp);
         let steps_len = job.steps.len();
         let job_snapshot = yaml_serde::to_string(&job).unwrap_or_default();
@@ -1275,7 +1277,14 @@ fn show_confirm_gate_window(ctx: &egui::Context, main: &mut MainState) {
 /// Windows 桌面通知（toast）：零 Rust 依赖——起隐藏 PowerShell 用 WinRT Toast
 /// （Win10/11 自带，无需装模块）。spawn 即忘（PowerShell 启动 ~300ms 在后台）。
 fn desktop_notify(title: &str, body: &str) {
-    let esc = |s: &str| s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+    // XML 转义（& < >）+ PowerShell 单引号转义（' → ''）：XML 模板包在 PS
+    // 单引号字符串里，项目名 / 失败原因带撇号时会破坏脚本导致通知弹不出
+    let esc = |s: &str| {
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('\'', "''")
+    };
     let title = esc(title);
     let body = esc(body);
     let script = format!(
@@ -1345,7 +1354,6 @@ fn mark_interrupted_cancelled(steps: &mut [StepVisualState]) {
     }
 }
 
-/// 日志文件的行格式（控制台渲染走 ConsoleLine 带色，文件存纯文本）
 /// 应用主题（明亮/暗黑；System 视同暗黑——egui 无法直接感知系统主题）
 pub(crate) fn apply_theme(ctx: &egui::Context, theme: &crate::models::Theme) {
     match theme {
@@ -1353,6 +1361,8 @@ pub(crate) fn apply_theme(ctx: &egui::Context, theme: &crate::models::Theme) {
         _ => ctx.set_visuals(egui::Visuals::dark()),
     }
 }
+
+/// 日志文件的行格式（控制台渲染走 ConsoleLine 带色，文件存纯文本）
 fn format_event(ev: &LogEvent) -> Option<String> {
     match ev {
         LogEvent::Stdout { line, .. } => Some(line.clone()),
@@ -1375,6 +1385,15 @@ fn format_event(ev: &LogEvent) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn run_id_stamp_has_millisecond_precision() {
+        // 同秒重跑防冲突：run_id 时间戳必须带毫秒
+        // （18 位 = yyyyMMdd(8) + '-' + HHmmss(6) + 毫秒(3)）
+        let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S%3f").to_string();
+        assert_eq!(stamp.len(), 18, "stamp: {stamp}");
+        assert!(stamp.chars().all(|c| c.is_ascii_digit() || c == '-'), "stamp: {stamp}");
+    }
 
     #[test]
     fn newest_mtime_scans_and_skips_junk_dirs() {

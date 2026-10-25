@@ -164,9 +164,9 @@ impl Engine {
         // ── 解析变量（§4.3 第一步）────────────────────────────────────────
         let mut ctx = build_var_context(&input);
 
-        // 工作目录解析（§4.5）
+        // 工作目录解析（§4.5；working_dir 支持变量替换，与命令同一批占位符）
         let workspace = PathBuf::from(&input.project.local_path);
-        let job_wd = resolve_job_working_dir(&input.job, &workspace);
+        let job_wd = resolve_job_working_dir(&input.job, &workspace, &ctx);
 
         // 整个 job 的取消信号由本任务独享消费：步骤间也检查
         let mut cancelled = false;
@@ -379,7 +379,8 @@ impl Engine {
                             failed_skipped.push(index);
                             continue;
                         }
-                        // job 级 retry 为 P1（§13.2），P0 按 stop 处理
+                        // on_failure: retry 的整体重跑由 run_job 外层循环处理，
+                        // 这里只返回 Failed，外层据此决定是否从头重跑
                         FailureAction::Stop | FailureAction::Retry => {
                             return JobStatus::Failed { step_index: index, reason };
                         }
@@ -510,10 +511,7 @@ async fn run_single_step(
         }
     };
 
-    let step_name = step
-        .name
-        .clone()
-        .unwrap_or_else(|| step.command.lines().next().unwrap_or("").to_string());
+    let step_name = step_display_name(step);
 
     if !step.enabled {
         let _ = log_tx
@@ -587,7 +585,7 @@ async fn run_single_step(
     if let Ok((eff_target, transport, remote_base)) = &step_ctx {
         if let Some(creates) = &step.creates {
             let resolved = resolve(creates, ctx);
-            let remote_dir = resolve_remote_step_dir(step, remote_base);
+            let remote_dir = resolve_remote_step_dir(step, remote_base, ctx);
             let log = LogHandle::new(log_tx.clone(), index);
             match steps::check_creates_exists(
                 &resolved,
@@ -669,8 +667,14 @@ async fn run_single_step(
                     command = wrapped;
                 }
             }
-            let step_local_wd = resolve_step_working_dir(step, job_wd);
-            let remote_dir = resolve_remote_step_dir(step, &remote_base);
+            let step_local_wd = resolve_step_working_dir(step, job_wd, ctx);
+            let remote_dir = resolve_remote_step_dir(step, &remote_base, ctx);
+            // wait 探测目标与命令同批变量替换（tcp/http 常写 ${{ targets.x.host }}:port）
+            let resolved_wait = step.wait.as_ref().map(|w| {
+                let mut w = w.clone();
+                w.target = resolve(&w.target, ctx);
+                w
+            });
 
             // §6.1 优先级：步骤级 env > 工具 env > target env
             let mut env_map: HashMap<String, String> = eff_target
@@ -731,6 +735,7 @@ async fn run_single_step(
                 step_timeout,
                 job_deadline,
                 capture.as_ref(),
+                resolved_wait.as_ref(),
                 cancel_rx,
                 log_tx,
                 index,
@@ -767,16 +772,16 @@ pub(crate) fn build_var_context(input: &RunInput) -> VarContext {
     }
 }
 
-pub fn resolve_job_working_dir(job: &Job, workspace: &Path) -> PathBuf {
+pub fn resolve_job_working_dir(job: &Job, workspace: &Path, ctx: &VarContext) -> PathBuf {
     match &job.working_dir {
-        Some(wd) => workspace.join(wd),
+        Some(wd) => workspace.join(resolve(wd, ctx)),
         None => workspace.to_path_buf(),
     }
 }
 
-pub fn resolve_step_working_dir(step: &Step, job_wd: &Path) -> PathBuf {
+pub fn resolve_step_working_dir(step: &Step, job_wd: &Path, ctx: &VarContext) -> PathBuf {
     match &step.working_dir {
-        Some(wd) => job_wd.join(wd),
+        Some(wd) => job_wd.join(resolve(wd, ctx)),
         None => job_wd.to_path_buf(),
     }
 }
@@ -798,6 +803,7 @@ async fn run_step_with_retry(
     step_timeout: Duration,
     job_deadline: Option<tokio::time::Instant>,
     capture: Option<&std::sync::Arc<std::sync::Mutex<String>>>,
+    wait: Option<&WaitProbe>,
     cancel_rx: &mut broadcast::Receiver<()>,
     log_tx: &mpsc::Sender<LogEvent>,
     index: usize,
@@ -810,10 +816,7 @@ async fn run_step_with_retry(
     let (attempts, backoff_secs) = step_retry_plan(step);
     let backoff = Duration::from_secs(backoff_secs);
     // 恢复执行时补发 StepStart 的名字（与主循环同一推导：优先自定义名，否则命令首行）
-    let step_name = step
-        .name
-        .clone()
-        .unwrap_or_else(|| step.command.lines().next().unwrap_or("").to_string());
+    let step_name = step_display_name(step);
 
     // 每次尝试独立的步骤级 deadline（TODO「问题3」：重试不再共享总时长——
     // 旧实现 2 次尝试均摊一半预算，慢上传必被误杀）；作业级 deadline 更早到则取更早者
@@ -830,6 +833,7 @@ async fn run_step_with_retry(
             remote_dir,
             env_map,
             workspace,
+            wait,
             &log,
             capture,
             cancel_rx,
@@ -897,6 +901,7 @@ async fn execute_step(
     remote_dir: &str,
     env_map: &HashMap<String, String>,
     workspace: &Path,
+    wait: Option<&WaitProbe>,
     log: &LogHandle,
     capture: Option<&std::sync::Arc<std::sync::Mutex<String>>>,
     cancel_rx: &mut broadcast::Receiver<()>,
@@ -913,9 +918,10 @@ async fn execute_step(
             transport.exec(target_dummy(target), command, &wd, env_map, log, cancel_rx).await
         }
         StepType::Wait => {
-            // 轮询探测直到就绪或超时（总时长由外层包裹）：三种模式（Compose healthcheck 同款）
+            // 轮询探测直到就绪或超时（总时长由外层包裹）：三种模式（Compose healthcheck 同款）。
+            // probe.target 已在 run_single_step 完成变量替换；空 = 沿用旧行为执行 step.command
             let wd = if is_remote(target) { remote_dir.to_string() } else { local_wd.to_string_lossy().to_string() };
-            let probe = step.wait.clone().unwrap_or_default();
+            let probe = wait.cloned().unwrap_or_default();
             let interval = if probe.interval_seconds == 0 {
                 transport::WAIT_POLL_SECONDS
             } else {
@@ -1146,13 +1152,14 @@ pub(crate) fn is_remote(target: Option<&Target>) -> bool {
     matches!(target.map(|t| &t.target_type), Some(TargetType::Ssh { .. }))
 }
 
-/// 远端步骤工作目录：work_root 基准 + 步骤 working_dir（上传相对路径 / 远端 cd 的基准）
-pub(crate) fn resolve_remote_step_dir(step: &Step, remote_base: &str) -> String {
+/// 远端步骤工作目录：work_root 基准 + 步骤 working_dir（上传相对路径 / 远端 cd 的基准）。
+/// working_dir 支持变量替换（与命令同一批占位符）。
+pub(crate) fn resolve_remote_step_dir(step: &Step, remote_base: &str, ctx: &VarContext) -> String {
     match &step.working_dir {
         Some(wd) if !remote_base.is_empty() => {
-            format!("{remote_base}/{}", wd.trim_matches('/'))
+            format!("{remote_base}/{}", resolve(wd, ctx).trim_matches('/'))
         }
-        Some(wd) => wd.clone(),
+        Some(wd) => resolve(wd, ctx),
         None => remote_base.to_string(),
     }
 }
@@ -1168,6 +1175,9 @@ async fn run_local_check(command: &str, working_dir: &Path) -> Result<(), String
         .stderr(Stdio::piped());
     #[cfg(windows)]
     cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW（tokio Command 自带该方法）
+    // 30s 超时丢弃 output() future 时杀掉直接子进程，不留孤儿
+    // （与 local.rs 同类问题；整树终止对前置检查无必要——检查命令应为短命令）
+    cmd.kill_on_drop(true);
     let output = tokio::time::timeout(Duration::from_secs(30), cmd.output())
         .await
         .map_err(|_| "执行超时（30s）".to_string())?
@@ -1204,6 +1214,17 @@ fn step_retry_plan(step: &Step) -> (u32, u64) {
         None if step.step_type == StepType::Upload => (2, 3),
         None => (1, 0),
     }
+}
+
+/// 步骤展示名：显式配置的非空 name 优先，否则回退命令首行。
+/// 注意 name = Some("") 视为未配置（UI 编辑器会把空输入落成 Some("")，不能让展示名变空）。
+pub(crate) fn step_display_name(step: &Step) -> String {
+    step.name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| step.command.lines().next().unwrap_or("").to_string())
 }
 
 /// 前端工程自动 corepack（§6.5）：命令里以 pnpm / yarn 开头的行自动加 corepack 前缀，
@@ -2222,5 +2243,111 @@ mod tests {
         (0..z.len())
             .map(|i| z.by_index(i).unwrap().name().to_string())
             .collect()
+    }
+
+    #[test]
+    fn wait_probe_target_resolves_variables() {
+        // 回归：wait 探测目标（tcp/http/command）此前不做变量替换，
+        // 示例工程 ${{ targets.demo-server.host }}:8080 这类写法永远探测失败
+        let (tx_port, rx_port) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            tx_port.send(port).unwrap();
+            for stream in listener.incoming() {
+                drop(stream);
+            }
+        });
+        let port = rx_port.recv().unwrap();
+
+        let rt = runtime();
+        let (tx, mut rx) = mpsc::channel(1024);
+        let (_c, cancel_rx) = broadcast::channel(4);
+        let engine = Engine;
+
+        // 探测目标经 variables 间接给出（含 ${{ }} 占位符）
+        let mut input = simple_job(vec![{
+            let mut s = exec_step("");
+            s.step_type = StepType::Wait;
+            s.wait = Some(crate::models::WaitProbe {
+                mode: crate::models::WaitMode::Tcp,
+                target: "${{ variables.HOST }}".to_string(),
+                interval_seconds: 0,
+            });
+            s
+        }]);
+        input.project.variables.insert(
+            "staging".to_string(),
+            crate::models::EnvironmentVariables {
+                vars: [("HOST".to_string(), format!("127.0.0.1:{port}"))]
+                    .into_iter()
+                    .collect(),
+            },
+        );
+
+        let status = rt.block_on(engine.run_job(input, cancel_rx, tx));
+        let events = collect(status, &mut rx);
+        // 探测日志应出现解析后的真实地址，而非 ${{ variables.HOST }} 字面量
+        assert!(events.iter().any(|e| matches!(
+            e, LogEvent::Stdout { line, .. } if line.contains(&format!("tcp 127.0.0.1:{port}"))
+        )));
+    }
+
+    #[test]
+    fn working_dir_resolves_variables() {
+        // 回归：working_dir 支持 ${{ }} 变量（UI 变量语法帮助早已承诺）
+        let dir = std::env::temp_dir().join(format!("rbs_wdvar_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let sub = dir.join("mysubdir");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        let rt = runtime();
+        let (tx, mut rx) = mpsc::channel(1024);
+        let (_c, cancel_rx) = broadcast::channel(4);
+        let engine = Engine;
+
+        let mut input = simple_job(vec![{
+            let mut s = exec_step("cd");
+            s.working_dir = Some("${{ variables.SUB }}".to_string());
+            s
+        }]);
+        input.project.local_path = dir.to_string_lossy().to_string();
+        input.project.variables.insert(
+            "staging".to_string(),
+            crate::models::EnvironmentVariables {
+                vars: [("SUB".to_string(), "mysubdir".to_string())]
+                    .into_iter()
+                    .collect(),
+            },
+        );
+
+        let status = rt.block_on(engine.run_job(input, cancel_rx, tx));
+        let events = collect(status, &mut rx);
+        assert!(events.iter().any(|e| matches!(
+            e, LogEvent::Stdout { line, .. } if line.contains("mysubdir")
+        )), "cd 应输出解析后的工作目录: {events:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn empty_step_name_falls_back_to_command() {
+        // 回归：UI 编辑器把空名字落成 Some("")，展示名应回退命令首行而非空白
+        let rt = runtime();
+        let (tx, mut rx) = mpsc::channel(1024);
+        let (_c, cancel_rx) = broadcast::channel(4);
+        let engine = Engine;
+
+        let input = simple_job(vec![Step {
+            name: Some("   ".to_string()),
+            command: "echo NAMED_FALLBACK".to_string(),
+            step_type: StepType::Exec,
+            enabled: true,
+            ..Default::default()
+        }]);
+        let status = rt.block_on(engine.run_job(input, cancel_rx, tx));
+        let events = collect(status, &mut rx);
+        assert!(events.iter().any(|e| matches!(
+            e, LogEvent::StepStart { name, .. } if name.contains("NAMED_FALLBACK")
+        )), "空步骤名应回退到命令首行: {events:?}");
     }
 }

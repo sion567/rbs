@@ -29,41 +29,56 @@ pub async fn open() -> anyhow::Result<SqlitePool> {
         .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
         .foreign_keys(true);
     let pool = SqlitePoolOptions::new().max_connections(2).connect_with(opts).await?;
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS runs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            run_id TEXT NOT NULL UNIQUE,
-            project_name TEXT NOT NULL,
-            job_name TEXT NOT NULL,
-            target TEXT,
-            trigger_type TEXT NOT NULL DEFAULT 'manual',
-            status TEXT NOT NULL DEFAULT 'running',
-            started_at TEXT NOT NULL,
-            finished_at TEXT,
-            duration_ms INTEGER,
-            log_path TEXT,
-            config_snapshot TEXT NOT NULL
-        )",
-    )
-    .execute(&pool)
-    .await?;
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS step_runs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            run_id INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
-            step_index INTEGER NOT NULL,
-            step_name TEXT,
-            status TEXT NOT NULL DEFAULT 'running',
-            exit_code INTEGER,
-            duration_ms INTEGER,
-            started_at TEXT NOT NULL,
-            finished_at TEXT,
-            UNIQUE(run_id, step_index)
-        )",
-    )
-    .execute(&pool)
-    .await?;
+    migrate(&pool).await?;
     Ok(pool)
+}
+
+/// 轻量迁移：PRAGMA user_version 记录 schema 版本，逐版本向前滚。
+/// v0（空库）→ v1：初始两张表。此后加字段/加表都在这里追加 `if ver < N` 分支，
+/// 不要改旧分支——老库按版本逐级升级，新库一次到位。
+async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
+    let ver: i64 = sqlx::query_scalar("PRAGMA user_version")
+        .fetch_one(pool)
+        .await
+        .unwrap_or(0);
+    if ver < 1 {
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT NOT NULL UNIQUE,
+                project_name TEXT NOT NULL,
+                job_name TEXT NOT NULL,
+                target TEXT,
+                trigger_type TEXT NOT NULL DEFAULT 'manual',
+                status TEXT NOT NULL DEFAULT 'running',
+                started_at TEXT NOT NULL,
+                finished_at TEXT,
+                duration_ms INTEGER,
+                log_path TEXT,
+                config_snapshot TEXT NOT NULL
+            )",
+        )
+        .execute(pool)
+        .await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS step_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+                step_index INTEGER NOT NULL,
+                step_name TEXT,
+                status TEXT NOT NULL DEFAULT 'running',
+                exit_code INTEGER,
+                duration_ms INTEGER,
+                started_at TEXT NOT NULL,
+                finished_at TEXT,
+                UNIQUE(run_id, step_index)
+            )",
+        )
+        .execute(pool)
+        .await?;
+        sqlx::query("PRAGMA user_version = 1").execute(pool).await?;
+    }
+    Ok(())
 }
 
 /// JobStatus → 库内状态键（短、稳定，别用带中文的 short()）

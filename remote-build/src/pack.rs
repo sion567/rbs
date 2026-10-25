@@ -76,7 +76,7 @@ fn entry_name_for(src: &Path, path: &Path) -> Result<String> {
 fn collect_files(src: &Path, excludes: &[String]) -> Result<Vec<PathBuf>> {
     let mut out = Vec::new();
     if src.is_dir() {
-        walk(src, src, excludes, &mut out);
+        walk(src, src, excludes, &mut out, 0);
         if out.is_empty() {
             anyhow::bail!("目录为空: {}（或全部被 --exclude 排除）", src.display());
         }
@@ -148,28 +148,50 @@ fn is_excluded(path: &Path, src_base: &Path, excludes: &[String]) -> bool {
     false
 }
 
-fn walk(dir: &Path, src_base: &Path, excludes: &[String], out: &mut Vec<PathBuf>) {
+/// 递归深度上限：防 junction / 符号链接环把栈打爆（正常工程树远达不到此深度）
+const MAX_WALK_DEPTH: usize = 64;
+
+fn walk(dir: &Path, src_base: &Path, excludes: &[String], out: &mut Vec<PathBuf>, depth: usize) {
+    if depth > MAX_WALK_DEPTH {
+        return;
+    }
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
         let p = entry.path();
-        // 目录整棵剪枝：字面量排除匹配目录名时不再下钻（node_modules 大目录性能）
-        if p.is_dir() {
-            let dir_name = p
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_default();
-            let pruned = excludes.iter().any(|ex| {
-                let ex = ex.trim();
-                !ex.is_empty() && !ex.contains('*') && !ex.contains('?') && ex == dir_name
-            });
-            if pruned {
-                continue;
+        // entry.file_type() 不跟随链接：真目录才下钻；指向目录的符号链接 / junction
+        // 整棵跳过（防环，rsync 默认语义）；指向文件的链接按内容打包
+        match entry.file_type() {
+            Ok(ft) if ft.is_dir() => {
+                // 目录整棵剪枝：字面量排除匹配目录名时不再下钻（node_modules 大目录性能）
+                let dir_name = p
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                let pruned = excludes.iter().any(|ex| {
+                    let ex = ex.trim();
+                    !ex.is_empty() && !ex.contains('*') && !ex.contains('?') && ex == dir_name
+                });
+                if pruned {
+                    continue;
+                }
+                walk(&p, src_base, excludes, out, depth + 1);
             }
-            walk(&p, src_base, excludes, out);
-        } else if !is_excluded(&p, src_base, excludes) {
-            out.push(p);
+            Ok(ft) if ft.is_symlink() => {
+                if p.is_dir() {
+                    continue; // 目录链接（junction 环风险），跳过
+                }
+                if !is_excluded(&p, src_base, excludes) {
+                    out.push(p);
+                }
+            }
+            Ok(_) => {
+                if !is_excluded(&p, src_base, excludes) {
+                    out.push(p);
+                }
+            }
+            Err(_) => {}
         }
     }
 }

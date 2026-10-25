@@ -113,11 +113,9 @@ pub fn merge_detection(report: &DetectionReport) -> Result<usize> {
                 name: dt.name.clone(),
                 tool_type: ToolType::System,
                 command: String::new(),
-                install_path: None,
                 version: None,
                 version_check: None,
                 detected_from: None,
-                install: None,
                 env: HashMap::new(),
             });
         entry.command = dt.command.clone();
@@ -134,15 +132,12 @@ pub fn merge_detection(report: &DetectionReport) -> Result<usize> {
                 name: "putty".to_string(),
                 tool_type: ToolType::Custom,
                 command: String::new(),
-                install_path: None,
                 version: None,
                 version_check: None,
                 detected_from: None,
-                install: None,
                 env: HashMap::new(),
             });
         entry.command = report.putty.pscp.to_string_lossy().to_string();
-        entry.install_path = Some(report.putty.dir.to_string_lossy().to_string());
         entry.version = report.putty.version.clone();
         entry.detected_from = Some(report.putty.source.clone());
         count += 1;
@@ -196,7 +191,6 @@ pub fn create_project_entry(name: &str, local_path: &Path) -> Result<PathBuf> {
         targets: crate::config::local_targets_map(),
         tools_require: HashMap::new(),
         groups: Vec::new(),
-        env_file: None,
     };
     crate::storage::files::save_yaml(&dir.join("project.yaml"), &project)?;
 
@@ -338,7 +332,6 @@ pub fn create_example_project() -> Result<()> {
         // 分组演示：本地构建 / 远端发布 各放两本
         groups: vec!["本地构建".to_string(), "远端发布".to_string()],
         targets,
-        env_file: None,
     };
     crate::storage::files::save_yaml(&dir.join("project.yaml"), &project)?;
 

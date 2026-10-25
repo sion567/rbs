@@ -1,2 +1,5 @@
 # 第三方样例工程（不提交）
 project-samples/
+
+# 本地留存的 PuTTY 二进制副本（内置套件以 remote-build/tools/putty/ 为准，已提交）
+putty/

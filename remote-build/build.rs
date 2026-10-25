@@ -1,8 +1,8 @@
-//! 编译时校验捆绑的 PuTTY 工具是否存在（见设计文档 §16 / §5.4）。
+//! 编译时校验捆绑的 PuTTY 工具是否齐全（见设计文档 §16 / §5.4）。
 //!
-//! 仓库不跟踪二进制文件：开发者需手动将 plink/pscp/psftp/puttygen/pageant.exe
-//! 放入 tools/putty/（见 tools/putty/README.txt）。缺失只告警不失败，
-//! 运行期 detect_putty_tools() 会回退到系统 PATH。
+//! 套件随仓库提交在 tools/putty/（plink/pscp/psftp/puttygen/pageant.exe + VERSION）。
+//! 本脚本只做存在性提醒：文件缺失不失败，运行期 detect_putty_tools()
+//! 会回退到系统 PATH / 常见安装路径。
 
 use std::path::Path;
 

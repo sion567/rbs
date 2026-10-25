@@ -20,20 +20,11 @@ pub struct TargetEditorState {
     /// 名称输入缓冲（重命名用）
     pub name_buf: String,
     pub kind_idx: usize,
-    pub host: String,
-    pub port: u16,
-    pub user: String,
     pub auth_idx: usize,
-    pub key_path: String,
     /// 新密码输入（写时才读；留空 = 不修改已存密码）
     pub password_buf: String,
     /// Credential Manager 里是否已存密码
     pub password_saved: bool,
-    pub kubeconfig: String,
-    pub context: String,
-    pub namespace: String,
-    pub registry: String,
-    pub work_root: String,
     /// 连接测试（后台线程）
     pub test_rx: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
     pub test_result: Option<(bool, String)>,
@@ -43,6 +34,9 @@ pub struct TargetEditorState {
     /// 「重新探测系统工具」后台任务（结果合并回 tools.yaml）
     pub redetect_rx: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
     pub unsaved: bool,
+    // 注意：host/port/user 等字段值不在编辑器状态里暂存——表单控件直接绑定
+    // project.yaml targets 表的 Target 字段，改即内存副本（保存时落盘）。
+    // 曾有一份冗余缓冲（host/user/kubeconfig…）只写不读，已删。
 }
 
 /// 当前项目的目标表（可变）；未选项目返回 None
@@ -241,11 +235,36 @@ fn target_list_and_form(ui: &mut egui::Ui, main: &mut MainState) {
         }
         if ui.button("🗑 删除").clicked() {
             if let Some(name) = main.target_editor.selected.take() {
+                // 引用检查：仍有流程引用时只提醒、不清除引用——
+                // 静默回退（None = 本地执行）会让发布步骤跑错机器，宁可运行/预览时明确报错
+                let referencing: Vec<String> = main
+                    .selected_project
+                    .and_then(|pi| main.projects.get(pi))
+                    .map(|entry| {
+                        entry
+                            .jobs
+                            .iter()
+                            .filter(|je| {
+                                je.job.target.as_deref() == Some(name.as_str())
+                                    || je.job.steps.iter().any(|s| {
+                                        s.target.as_deref() == Some(name.as_str())
+                                    })
+                            })
+                            .map(|je| je.job.name.clone())
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 if let Some(map) = scope_map_mut(main) {
                     map.remove(&name);
                 }
                 crate::secrets::delete_password(&cred_key_for(main, &name));
                 main.target_editor.unsaved = true;
+                if !referencing.is_empty() {
+                    main.status_msg = Some(format!(
+                        "⚠ 目标「{name}」已删除，但仍有流程引用它（预览/运行会报「目标未定义」）：{}",
+                        referencing.join("、")
+                    ));
+                }
             }
         }
         if ui
@@ -557,6 +576,47 @@ fn edit_form(ui: &mut egui::Ui, main: &mut MainState) {
             let _ = crate::secrets::set_password(&new_key, &pwd);
             crate::secrets::delete_password(&old_key);
         }
+        // 引用同步：job.target / step.target 指向旧名的一并改掉，
+        // 否则流程运行时报「目标未定义」（凭据与引用都迁，语义才完整）
+        if let Some(pi) = main.selected_project {
+            let mut job_updates: Vec<(std::path::PathBuf, crate::models::Job)> = Vec::new();
+            {
+                let entry = &mut main.projects[pi];
+                for je in &mut entry.jobs {
+                    let mut changed = false;
+                    if je.job.target.as_deref() == Some(selected.as_str()) {
+                        je.job.target = Some(new.clone());
+                        changed = true;
+                    }
+                    for s in &mut je.job.steps {
+                        if s.target.as_deref() == Some(selected.as_str()) {
+                            s.target = Some(new.clone());
+                            changed = true;
+                        }
+                    }
+                    if changed {
+                        job_updates.push((je.path.clone(), je.job.clone()));
+                    }
+                }
+            }
+            for (path, job) in &job_updates {
+                if let Err(e) = crate::storage::files::save_yaml(path, job) {
+                    main.status_msg =
+                        Some(format!("目标改名同步流程失败（{}）: {e}", path.display()));
+                }
+            }
+            if !job_updates.is_empty() {
+                let names = job_updates
+                    .iter()
+                    .map(|(_, j)| j.name.clone())
+                    .collect::<Vec<_>>()
+                    .join("、");
+                main.status_msg = Some(format!(
+                    "已同步 {} 个流程的目标引用: {names}",
+                    job_updates.len()
+                ));
+            }
+        }
         main.target_editor.selected = Some(new);
         main.target_editor.unsaved = true;
     }
@@ -772,29 +832,17 @@ fn load_buffers(main: &mut MainState, name: &str) {
         return;
     };
     match &t.target_type {
-        TargetType::Ssh { host, port, user, auth, .. } => {
+        TargetType::Ssh { auth, .. } => {
             main.target_editor.kind_idx = 0;
-            main.target_editor.host = host.clone();
-            main.target_editor.port = *port;
-            main.target_editor.user = user.clone();
             main.target_editor.auth_idx = auth_index(auth);
-            main.target_editor.key_path = match auth {
-                AuthMethod::Key { path } => path.clone(),
-                _ => String::new(),
-            };
         }
-        TargetType::Kubernetes { kubeconfig, context, namespace, registry } => {
+        TargetType::Kubernetes { .. } => {
             main.target_editor.kind_idx = 1;
-            main.target_editor.kubeconfig = kubeconfig.clone();
-            main.target_editor.context = context.clone().unwrap_or_default();
-            main.target_editor.namespace = namespace.clone().unwrap_or_default();
-            main.target_editor.registry = registry.clone().unwrap_or_default();
         }
         TargetType::Local => {
             main.target_editor.kind_idx = 2;
         }
     }
-    main.target_editor.work_root = t.work_root.clone().unwrap_or_default();
     main.target_editor.password_buf.clear();
     main.target_editor.password_saved =
         crate::secrets::get_password(&key).map(|p| p.is_some()).unwrap_or(false);

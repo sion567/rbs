@@ -902,6 +902,17 @@ fn rename_project(main: &mut MainState, pi: usize, new_name: &str) {
         main.status_msg = Some(format!("改名失败（目录重命名）: {e}"));
         return;
     }
+    // 4. 凭据迁移：密码键 = {项目}/{目标}，项目改名后按新键取不到旧密码。
+    //    逐目标搬移（best-effort：失败不阻断改名，大不了在目标管理里重新输入）
+    for tname in project.targets.keys() {
+        let old_key = format!("{old_name}/{tname}");
+        let new_key = format!("{new_name}/{tname}");
+        if let Ok(Some(pwd)) = crate::secrets::get_password(&old_key) {
+            if crate::secrets::set_password(&new_key, &pwd).is_ok() {
+                crate::secrets::delete_password(&old_key);
+            }
+        }
+    }
     main.reload();
     main.select_project_by_name(&new_name);
     main.status_msg = Some(format!("项目已改名: {old_name} → {new_name} ✅"));

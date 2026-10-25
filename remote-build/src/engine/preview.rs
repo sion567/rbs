@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use super::{
     auto_corepack_wrap, build_var_context, corepack_available, dangerous_command_hits,
     is_remote, resolve_job_working_dir, resolve_remote_step_dir, resolve_step_working_dir,
-    RunInput,
+    step_display_name, RunInput,
 };
 
 /// 单个步骤的预览结果（preview_job 产出；UI 控制台 / CLI 直接渲染）
@@ -48,7 +48,7 @@ pub struct StepPreview {
 pub fn preview_job(input: &RunInput) -> Vec<StepPreview> {
     let ctx = build_var_context(input);
     let workspace = PathBuf::from(&input.project.local_path);
-    let job_wd = resolve_job_working_dir(&input.job, &workspace);
+    let job_wd = resolve_job_working_dir(&input.job, &workspace, &ctx);
 
     // 与 run_job 同一判定：前端工程 corepack 钉版（预览展示包装后的最终命令）
     let pinned_frontend = {
@@ -65,10 +65,18 @@ pub fn preview_job(input: &RunInput) -> Vec<StepPreview> {
 
     let mut out = Vec::new();
     for (index, step) in input.job.steps.iter().enumerate() {
-        let step_name = step
-            .name
-            .clone()
-            .unwrap_or_else(|| step.command.lines().next().unwrap_or("").to_string());
+        let step_name = step_display_name(step);
+        // wait 探测目标与执行路径同批变量替换（引擎 run_single_step 里同一 resolve）；
+        // 解析后仍含占位符 → 记录下来在构造完 p 后补 ⚠
+        let wait_resolved = step.wait.as_ref().map(|wp| {
+            let interval = if wp.interval_seconds == 0 {
+                crate::transport::WAIT_POLL_SECONDS
+            } else {
+                wp.interval_seconds.max(1)
+            };
+            let target = resolve(&wp.target, &ctx);
+            (format!("{} {} 每 {interval}s", wp.mode.as_str(), target), target.contains("${{"))
+        });
         let mut p = StepPreview {
             index,
             name: step_name,
@@ -84,20 +92,18 @@ pub fn preview_job(input: &RunInput) -> Vec<StepPreview> {
                 })
                 .flatten(),
             command: String::new(),
-            working_dir: resolve_step_working_dir(step, &job_wd),
+            working_dir: resolve_step_working_dir(step, &job_wd, &ctx),
             uploads: Vec::new(),
             pack: None,
             outputs: step.outputs.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
             notify: step.notify.clone(),
-            wait_note: step.wait.as_ref().map(|wp| {
-                let interval = if wp.interval_seconds == 0 {
-                    crate::transport::WAIT_POLL_SECONDS
-                } else {
-                    wp.interval_seconds.max(1)
-                };
-                format!("{} {} 每 {interval}s", wp.mode.as_str(), wp.target)
-            }),
+            wait_note: wait_resolved.as_ref().map(|(s, _)| s.clone()),
         };
+        if let Some((_, unresolved)) = &wait_resolved {
+            if *unresolved {
+                p.warnings.push("wait 探测目标仍含未解析的变量占位符（检查变量名拼写）".to_string());
+            }
+        }
 
         if !step.enabled {
             p.skipped = true;
@@ -147,7 +153,7 @@ pub fn preview_job(input: &RunInput) -> Vec<StepPreview> {
             .as_ref()
             .and_then(|t| t.work_root.clone())
             .unwrap_or_default();
-        let remote_dir = resolve_remote_step_dir(step, &remote_base);
+        let remote_dir = resolve_remote_step_dir(step, &remote_base, &ctx);
 
         // creates：本地实际校验；远端路径干跑不发起 SSH 往返，仅标注
         if let Some(creates) = &step.creates {

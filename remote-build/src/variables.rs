@@ -111,6 +111,9 @@ fn lookup_double(expr: &str, ctx: &VarContext) -> Option<String> {
 /// 取值表达式求值：在 `variables.X` 等形态之上支持 `expr || 默认值`
 /// （Jinja2 `| default()` 语义）。左侧解析成功（含"定义了但为空串"）直接用；
 /// 未定义 / 不可解析时取右侧默认值（可带引号，按原样文本注入）。
+///
+/// 已知局限（按需再扩展，勿过度设计）：按首个 `||` 切分，默认值本身含 `||`
+/// 时会被再次切分；`||` 不区分"未定义"与"值为字面 `||` 场景"。
 pub fn lookup_expr(expr: &str, ctx: &VarContext) -> Option<String> {
     if let Some((left, default)) = expr.split_once("||") {
         if let Some(v) = lookup_double(left.trim(), ctx) {
@@ -221,6 +224,12 @@ fn lookup_single(name: &str, ctx: &VarContext) -> String {
 ///   ${{ variables.ENV }} == prod           与字面量比较（可带引号）
 ///   variables.A == variables.B             与另一取值表达式比较（支持 || 默认值）
 /// 其他表达式 → None，由调用方决定策略（fail-open + 告警）。
+///
+/// 已知局限（低频、文档化即可）：
+/// - 按首个 `!=` / `==` 切分，比较值本身含 `!=`（如 `== 'a!=b'`）会切错——
+///   值比较仅面向简单的环境名 / 开关类字面量；
+/// - 两侧都是**未定义**的取值表达式（`variables.A == variables.B`）时，右侧会
+///   退化为字面量 "variables.B" 参与比较 → 结果 false，而非"两个空串相等"的 true。
 pub fn eval_condition(condition: &str, ctx: &VarContext) -> Option<bool> {
     let trimmed = condition.trim();
     // 两种形态：

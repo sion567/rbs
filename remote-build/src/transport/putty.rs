@@ -25,7 +25,6 @@ pub struct PuttyDetection {
     pub found: bool,
     /// custom / builtin / PATH / Program Files
     pub source: String,
-    pub dir: PathBuf,
     pub plink: PathBuf,
     pub pscp: PathBuf,
     pub psftp: PathBuf,
@@ -103,7 +102,6 @@ fn detect_putty_tools_uncached() -> PuttyDetection {
                 puttygen: Some(dir.join("puttygen.exe")).filter(|p| p.exists()),
                 pageant: Some(dir.join("pageant.exe")).filter(|p| p.exists()),
                 version: read_version(),
-                dir,
             };
         }
     }
@@ -385,6 +383,7 @@ impl RemoteTransport for PuttyTransport {
         if !local.exists() {
             anyhow::bail!("上传源不存在: {}", local.display());
         }
+        warn_risky_remote_path(remote, log);
         let (dest, mut args) = Self::build_ssh_args(target)?;
         args.push("-r".to_string()); // 递归
         args.push("-p".to_string()); // 保持权限
@@ -407,6 +406,7 @@ impl RemoteTransport for PuttyTransport {
         log: &LogHandle,
         cancel: &mut broadcast::Receiver<()>,
     ) -> anyhow::Result<()> {
+        warn_risky_remote_path(remote, log);
         let (dest, mut args) = Self::build_ssh_args(target)?;
         args.push(format!("{}:{}", dest, remote));
         args.push(local.to_string_lossy().to_string());
@@ -423,6 +423,27 @@ impl RemoteTransport for PuttyTransport {
 /// POSIX 单引号转义：' → '\''
 pub fn escape_posix_single_quote(s: &str) -> String {
     s.replace('\'', "'\\''")
+}
+
+/// pscp 远端路径告警：SCP 协议下远端路径会被远端 shell 解释（SFTP 则按字面处理），
+/// 路径含空格 / shell 元字符时行为不可预期且难以排查。只提醒不拦截——
+/// 加引号会破坏 SFTP 模式（引号会被当成路径字面量），提前提示用户避开最稳妥。
+fn warn_risky_remote_path(remote: &str, log: &LogHandle) {
+    let risky = remote.chars().any(|c| {
+        c.is_whitespace()
+            || matches!(
+                c,
+                ';' | '|' | '&' | '$' | '`' | '(' | ')' | '*' | '?' | '"' | '\''
+            )
+    });
+    if risky {
+        log.line(
+            super::Stream::Stderr,
+            format!(
+                "⚠ 远端路径含空格或 shell 特殊字符，pscp 可能传输失败或被远端 shell 解释: {remote}"
+            ),
+        );
+    }
 }
 
 /// 批量取远端文件 sha256：一条 plink 往返执行 `sha256sum p1 p2 …`（异步，30s 超时）。
@@ -482,8 +503,10 @@ pub fn parse_sha256sum_batch(output: &str) -> HashMap<String, String> {
 }
 
 fn parse_sha256sum_line(line: &str) -> Option<(String, String)> {
-    // 哈希固定 64 个十六进制字符且顶行首
-    if line.len() < 67 {
+    // 哈希固定 64 个十六进制字符且顶行首。len 检查之外还要确认字节 64 在 UTF-8
+    // 字符边界上：plink 输出里混着服务器 MOTD 横幅，中文横幅一行 ≥23 字时
+    // 字节 64 会落在多字节字符中间，直接 split_at(64) 会 panic（实测复现）
+    if line.len() < 67 || !line.is_char_boundary(64) {
         return None;
     }
     let (hash, rest) = line.split_at(64);
@@ -580,6 +603,23 @@ pub fn probe_server_with(
     let mut child = cmd.spawn().map_err(|e| format!("启动 plink 失败: {e}"))?;
     let deadline = started + Duration::from_secs(8);
 
+    // stdout/stderr 交给独立线程排空：若在 try_wait 轮询期间不读管道，
+    // MOTD / 大输出超过管道缓冲（64KB）会让 plink 写阻塞，直到 8s 被误判为超时
+    let stdout_drain = child.stdout.take().map(|mut s| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = s.read_to_end(&mut buf);
+            buf
+        })
+    });
+    let stderr_drain = child.stderr.take().map(|mut s| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = s.read_to_end(&mut buf);
+            buf
+        })
+    });
+
     let status = loop {
         match child.try_wait() {
             Ok(Some(st)) => break Some(st),
@@ -594,14 +634,15 @@ pub fn probe_server_with(
         }
     };
 
-    let mut out = String::new();
-    let mut err = String::new();
-    if let Some(mut o) = child.stdout.take() {
-        let _ = o.read_to_string(&mut out);
-    }
-    if let Some(mut e) = child.stderr.take() {
-        let _ = e.read_to_string(&mut err);
-    }
+    // kill 后管道关闭，排空线程随即结束；join 拿完整输出
+    let out = stdout_drain
+        .and_then(|h| h.join().ok())
+        .map(|b| crate::transport::decode_console_bytes(&b))
+        .unwrap_or_default();
+    let err = stderr_drain
+        .and_then(|h| h.join().ok())
+        .map(|b| crate::transport::decode_console_bytes(&b))
+        .unwrap_or_default();
     let elapsed_ms = started.elapsed().as_millis();
 
     match status {
@@ -1009,6 +1050,19 @@ mod tests {
         assert_eq!(map.get("/opt/My Projects/app.jar").map(String::as_str), Some(h2.as_str()));
         // 全错误输出 → 空 map（调用方按失败处理）
         assert!(parse_sha256sum_batch("sh: sha256sum: command not found").is_empty());
+    }
+
+    #[test]
+    fn sha256sum_batch_survives_multibyte_motd() {
+        // 回归：服务器 MOTD 含长中文行（≥23 个汉字时字节 64 落在多字节字符中间），
+        // 旧实现 split_at(64) 直接 panic 崩掉整个运行任务；现在应忽略横幅行、正常解析
+        let motd = "欢迎使用构建服务器，请勿随意登录本机器谢谢配合".repeat(2);
+        assert!(motd.len() >= 67);
+        let h1 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let out = format!("{motd}\n{h1}  /opt/app/app.jar\n");
+        let map = parse_sha256sum_batch(&out);
+        assert_eq!(map.len(), 1, "{map:?}");
+        assert_eq!(map.get("/opt/app/app.jar").map(String::as_str), Some(h1));
     }
 
     #[test]

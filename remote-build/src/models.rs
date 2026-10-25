@@ -85,8 +85,6 @@ pub struct Project {
     /// 空分组因此可以持久存在（先建组、后往里加任务）。
     #[serde(default)]
     pub groups: Vec<String>,
-    /// 可选：加载额外 .env 文件
-    pub env_file: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -294,13 +292,10 @@ pub struct Tool {
     pub tool_type: ToolType,
     /// 可执行文件名或完整路径
     pub command: String,
-    pub install_path: Option<String>,
     pub version: Option<String>,
     pub version_check: Option<String>,
     /// 首次启动时从哪个环境变量探测到
     pub detected_from: Option<String>,
-    /// type=archive 时的下载安装配置
-    pub install: Option<ToolInstall>,
     /// 工具级环境变量（如 JAVA_HOME）
     pub env: HashMap<String, String>,
 }
@@ -323,13 +318,6 @@ kebab_string_enum!(ToolType {
     Custom => "custom",
     Script => "script",
 });
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ToolInstall {
-    pub url: String,
-    pub extract_to: String,
-    pub checksum: Option<String>,
-}
 
 /// tools.yaml 的文件根结构
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -601,7 +589,6 @@ impl<'de> Deserialize<'de> for AuthMethod {
 pub struct GlobalConfig {
     /// 步骤默认超时（秒）：步骤未显式配 step.timeout 时的兜底（引擎接线）
     pub default_timeout: u64,
-    pub max_concurrent_jobs: u32,
     /// 日志与运行历史的保留天数（SQLite runs 按 started_at 清理）
     pub log_retention_days: u32,
     /// 是否保留运行历史（SQLite ~/.remote-build/data/history.db；关掉则完全不建库）
@@ -609,7 +596,6 @@ pub struct GlobalConfig {
     /// 作业结束时弹 Windows 桌面通知（toast，最小化时也能看到结果）
     pub desktop_notify: bool,
     pub workspace_root: String,
-    pub auto_update_tools: bool,
     pub theme: Theme,
     /// PuTTY 配置
     pub putty: PuttyConfig,
@@ -619,12 +605,10 @@ impl Default for GlobalConfig {
     fn default() -> Self {
         Self {
             default_timeout: 600,
-            max_concurrent_jobs: 3,
             log_retention_days: 30,
             save_history: true,
             desktop_notify: true,
             workspace_root: String::new(), // 由 config::default_global() 填充实际路径
-            auto_update_tools: false,
             theme: Theme::Dark,
             putty: PuttyConfig {
                 use_builtin: true,
@@ -1031,7 +1015,11 @@ targets:
 
         // 缺字段时用 Default
         let g: GlobalConfig = yaml_serde::from_str("{}").unwrap();
-        assert_eq!(g.max_concurrent_jobs, 3);
+        assert_eq!(g.log_retention_days, 30);
+        // 旧版 config.yaml 的已删除字段（max_concurrent_jobs / auto_update_tools）应被忽略
+        let old: GlobalConfig =
+            yaml_serde::from_str("max_concurrent_jobs: 3\nauto_update_tools: false").unwrap();
+        assert_eq!(old.default_timeout, 600);
     }
 
     #[test]

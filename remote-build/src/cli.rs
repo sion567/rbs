@@ -171,12 +171,15 @@ fn run(args: &[String]) {
         .unwrap_or(true);
     let steps_len = je.job.steps.len();
     let snapshot = yaml_serde::to_string(&je.job).unwrap_or_default();
+    // run_id 只取一次：历史入库与引擎 ${{ run.id }} 必须一致（分两次取时间跨秒会错开）；
+    // 精确到毫秒，避免同秒重跑与 GUI/CLI 并发时日志同名、SQLite UNIQUE 冲突
+    let run_id = format!(
+        "{}-{}",
+        entry.project.name,
+        chrono::Local::now().format("%Y%m%d-%H%M%S%3f")
+    );
     let history_meta = crate::storage::sqlite::RunMeta {
-        run_id: format!(
-            "{}-{}",
-            entry.project.name,
-            chrono::Local::now().format("%Y%m%d-%H%M%S")
-        ),
+        run_id: run_id.clone(),
         project: entry.project.name.clone(),
         job: je.job.name.clone(),
         target: je.job.target.clone(),
@@ -218,11 +221,6 @@ fn run(args: &[String]) {
 
     let (cancel_tx, cancel_rx) = broadcast::channel(4);
     let engine = Engine;
-    let run_id = format!(
-        "{}-{}",
-        entry.project.name,
-        chrono::Local::now().format("%Y%m%d-%H%M%S")
-    );
     let input = RunInput {
         project: entry.project.clone(),
         job: je.job.clone(),

@@ -772,9 +772,6 @@ fn global_section(
             ui.label("默认超时:");
             ui.label(format!("{}s", global.default_timeout));
             ui.end_row();
-            ui.label("最大并发作业:");
-            ui.label(global.max_concurrent_jobs.to_string());
-            ui.end_row();
             ui.label("日志保留:");
             ui.label(format!("{} 天（日志文件与运行历史共用）", global.log_retention_days));
             ui.end_row();
