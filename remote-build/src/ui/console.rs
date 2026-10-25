@@ -2,7 +2,7 @@
 
 use crate::models::{JobStatus, LogEvent};
 use eframe::egui;
-use egui::{Color32, RichText};
+use egui::Color32;
 
 /// 日志行的语义角色：渲染时按当前主题映射为具体颜色（切换主题全量重新着色）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,11 +68,25 @@ pub struct ConsoleState {
     pub auto_scroll: bool,
     /// 只看错误（gh run view --log-failed 同款）：隐藏 stdout/提示噪音行，保留步骤头尾与错误
     pub errors_only: bool,
+    // ── 虚拟化渲染缓存 ──────────────────────────────────────────────
+    /// 每行在 measured_width 下量得的高度（Fonts::layout 逐行排版太贵，
+    /// 5000 行全量重排每帧会卡顿；缓存后每帧只排版可视区几十行）
+    heights: Vec<f32>,
+    measured_width: f32,
+    /// 行集结构性变化（上限裁剪 / 清空）使 heights 索引失效 → 全量重测
+    heights_dirty: bool,
 }
 
 impl Default for ConsoleState {
     fn default() -> Self {
-        Self { lines: Vec::new(), auto_scroll: true, errors_only: false }
+        Self {
+            lines: Vec::new(),
+            auto_scroll: true,
+            errors_only: false,
+            heights: Vec::new(),
+            measured_width: 0.0,
+            heights_dirty: true,
+        }
     }
 }
 
@@ -130,12 +144,20 @@ impl ConsoleState {
         if self.lines.len() > MAX_LINES {
             let drop = self.lines.len() - MAX_LINES;
             self.lines.drain(0..drop);
+            // 前段裁剪让 heights 索引整体错位，标脏全量重测
+            self.heights_dirty = true;
         }
     }
 
     /// 非引擎事件的普通提示行
     pub fn push_line(&mut self, text: impl Into<String>, role: Role) {
         self.push(text.into(), role);
+    }
+
+    pub fn clear(&mut self) {
+        self.lines.clear();
+        self.heights.clear();
+        self.heights_dirty = true;
     }
 
     pub fn all_text(&self) -> String {
@@ -203,7 +225,7 @@ pub fn show(console: &mut ConsoleState, ui: &mut egui::Ui, running: bool, dark: 
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("清空").clicked() {
-                        console.lines.clear();
+                        console.clear();
                     }
                     if ui.button("📋 复制").clicked() {
                         let text = console.all_text();
@@ -236,27 +258,78 @@ pub fn show(console: &mut ConsoleState, ui: &mut egui::Ui, running: bool, dark: 
             });
             ui.separator();
 
+            // 虚拟化渲染：每行为一个可换行 galley，高度按宽度缓存；逐帧只排版/绘制
+            // 可视区内的行（此前 5000 行 × 每帧全量 Label 布局是控制台卡顿的主因）。
+            // 行本身无交互（悬停/选中），painter 直绘不损失任何行为。
             egui::ScrollArea::vertical()
                 .id_salt("console_scroll")
                 .auto_shrink([false, false])
                 .stick_to_bottom(console.auto_scroll)
-                .show(ui, |ui| {
-                    // 紧凑行距；左对齐（不能用 add_sized——它会把文字在整行里居中）
-                    ui.spacing_mut().item_spacing.y = 2.0;
-                    for line in &console.lines {
-                        // 只看错误：stdout 与系统提示是噪音大头，步骤头尾 / stderr / 错误保留
-                        if console.errors_only
-                            && matches!(line.role, Role::Stdout | Role::Info)
-                        {
-                            continue;
+                .show_viewport(ui, |ui, viewport| {
+                    const ROW_SPACING: f32 = 2.0;
+                    let wrap_width = ui.max_rect().width().max(1.0);
+                    let font_id = egui::TextStyle::Monospace.resolve(ui.style());
+
+                    // 行高同步：宽度变化/裁剪/清空 → 全量重测；纯追加 → 只测新增尾部
+                    if console.heights_dirty
+                        || console.measured_width != wrap_width
+                        || console.heights.len() > console.lines.len()
+                    {
+                        console.heights.clear();
+                        console.measured_width = wrap_width;
+                        console.heights_dirty = false;
+                    }
+                    if console.heights.len() < console.lines.len() {
+                        let start = console.heights.len();
+                        for line in &console.lines[start..] {
+                            let h = ui.fonts_mut(|f| {
+                                f.layout(
+                                    line.text.clone(),
+                                    font_id.clone(),
+                                    Color32::PLACEHOLDER,
+                                    wrap_width,
+                                )
+                                .size()
+                                .y
+                            });
+                            console.heights.push(h);
                         }
-                        let color = palette::color_for(line.role, dark);
-                        ui.add(
-                            egui::Label::new(
-                                RichText::new(&line.text).monospace().color(color),
-                            )
-                            .wrap(),
-                        );
+                    }
+
+                    // 只看错误的可见行索引（O(n) 过滤扫描，无控件开销）
+                    let visible_idx: Vec<usize> = if console.errors_only {
+                        console
+                            .lines
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, l)| !matches!(l.role, Role::Stdout | Role::Info))
+                            .map(|(i, _)| i)
+                            .collect()
+                    } else {
+                        (0..console.lines.len()).collect()
+                    };
+
+                    let total_h: f32 = visible_idx.iter().map(|i| console.heights[*i]).sum::<f32>()
+                        + ROW_SPACING * visible_idx.len().saturating_sub(1) as f32;
+                    let origin = ui.cursor().min; // 内容左上角（此刻 cursor 未被推进）
+                    ui.set_min_height(total_h);
+
+                    let mut y = 0.0f32;
+                    for &i in &visible_idx {
+                        let h = console.heights[i];
+                        // 与可视区相交才排版绘制；行序自上而下，越界即可停止
+                        if y + h >= viewport.min.y && y <= viewport.max.y {
+                            let line = &console.lines[i];
+                            let color = palette::color_for(line.role, dark);
+                            let galley = ui.fonts_mut(|f| {
+                                f.layout(line.text.clone(), font_id.clone(), color, wrap_width)
+                            });
+                            ui.painter().galley(egui::pos2(origin.x, origin.y + y), galley, color);
+                        }
+                        y += h + ROW_SPACING;
+                        if y > viewport.max.y {
+                            break;
+                        }
                     }
                 });
         });

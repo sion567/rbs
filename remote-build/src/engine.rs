@@ -4,13 +4,18 @@
 //! 按 step_type 分发、超时/重试/取消包裹）→ LogEvent 流式输出 → on_failure 策略。
 
 use crate::models::*;
-use crate::transport::{self, local, LogHandle, RemoteTransport};
+use crate::transport::{self, LogHandle, RemoteTransport};
 use crate::variables::{eval_condition, resolve, VarContext};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc};
+
+mod preview;
+mod steps;
+
+pub use preview::preview_job;
 
 /// 单步默认超时（秒，§3.3）
 pub const DEFAULT_STEP_TIMEOUT: u64 = 300;
@@ -39,6 +44,15 @@ pub struct RunInput {
 }
 
 pub struct Engine;
+
+/// 无 cancel_tx 场景（单测 / 干跑）的占位接收端。发送端必须保活：
+/// broadcast 的 Closed（全部发送端 drop）在引擎里被当作取消信号，
+/// 占位通道若不保活，重试第二轮会立刻「被取消」而非重跑。
+fn detached_cancel_rx() -> broadcast::Receiver<()> {
+    let (tx, rx) = broadcast::channel(1);
+    std::mem::forget(tx);
+    rx
+}
 
 impl Engine {
     pub async fn run_job(
@@ -99,7 +113,7 @@ impl Engine {
                     .cancel_tx
                     .as_ref()
                     .map(|tx| tx.subscribe())
-                    .unwrap_or_else(|| broadcast::channel(1).1)
+                    .unwrap_or_else(detached_cancel_rx)
             });
 
             let status = self.run_job_inner(input.clone(), rx, log_tx.clone()).await;
@@ -126,7 +140,7 @@ impl Engine {
                 .cancel_tx
                 .as_ref()
                 .map(|tx| tx.subscribe())
-                .unwrap_or_else(|| broadcast::channel(1).1);
+                .unwrap_or_else(detached_cancel_rx);
             tokio::select! {
                 _ = tokio::time::sleep(backoff) => {}
                 _ = wait_rx.recv() => {
@@ -575,7 +589,7 @@ async fn run_single_step(
             let resolved = resolve(creates, ctx);
             let remote_dir = resolve_remote_step_dir(step, remote_base);
             let log = LogHandle::new(log_tx.clone(), index);
-            match check_creates_exists(
+            match steps::check_creates_exists(
                 &resolved,
                 eff_target.as_ref(),
                 transport,
@@ -586,7 +600,7 @@ async fn run_single_step(
             )
             .await
             {
-                Err(e) if local::is_cancelled(&e) => return StepResult::Cancelled,
+                Err(e) if transport::is_cancelled(&e) => return StepResult::Cancelled,
                 Err(e) => {
                     let _ = log_tx
                         .send(LogEvent::Error {
@@ -736,7 +750,7 @@ async fn run_single_step(
 // 变量上下文（§4.1 ExecutionContext 的变量部分）
 // ---------------------------------------------------------------------------
 
-fn build_var_context(input: &RunInput) -> VarContext {
+pub(crate) fn build_var_context(input: &RunInput) -> VarContext {
     let mut variables = HashMap::new();
     if let Some(env_name) = &input.job.environment {
         if let Some(evs) = input.project.variables.get(env_name) {
@@ -801,14 +815,8 @@ async fn run_step_with_retry(
         .clone()
         .unwrap_or_else(|| step.command.lines().next().unwrap_or("").to_string());
 
-    // 步骤级 deadline；作业级 deadline（job.timeout）更早到则取更早者
-    let mut deadline = tokio::time::Instant::now() + step_timeout;
-    if let Some(jd) = job_deadline {
-        if jd < deadline {
-            deadline = jd;
-        }
-    }
-
+    // 每次尝试独立的步骤级 deadline（TODO「问题3」：重试不再共享总时长——
+    // 旧实现 2 次尝试均摊一半预算，慢上传必被误杀）；作业级 deadline 更早到则取更早者
     let mut attempt = 0;
     loop {
         // 取消语义：fut 内部（子进程 wait / 上传）select cancel 并 kill；
@@ -828,6 +836,13 @@ async fn run_step_with_retry(
         );
 
         let result = {
+            let deadline = {
+                let d = tokio::time::Instant::now() + step_timeout;
+                match job_deadline {
+                    Some(jd) if jd < d => jd,
+                    _ => d,
+                }
+            };
             // deadline 是绝对时刻，tokio::time::timeout 需要 Duration
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             match tokio::time::timeout(remaining, fut).await {
@@ -958,7 +973,7 @@ async fn execute_step(
                             Ok(st) if st.success => Some(st),
                             // 探测失败不算步骤失败，等待后重试；取消要透传
                             Ok(_) => None,
-                            Err(e) if local::is_cancelled(&e) => break Err(e),
+                            Err(e) if transport::is_cancelled(&e) => break Err(e),
                             Err(e) => {
                                 log.line(transport::Stream::Stderr, format!("[wait] 探测失败: {e}"));
                                 None
@@ -972,15 +987,15 @@ async fn execute_step(
                 tokio::select! {
                     _ = tokio::time::sleep(Duration::from_secs(interval)) => {}
                     _ = cancel_rx.recv() => {
-                        break Err(anyhow::anyhow!("__cancelled__"));
+                        break Err(anyhow::Error::new(transport::Cancelled));
                     }
                 }
             }
         }
         StepType::Upload => {
             // 命令格式约定：<本地路径或目录> -> <远端路径>；返回是否真传了内容（变更判断）
-            let res =
-                upload_step(transport, target, command, workspace, remote_dir, log, cancel_rx).await;
+            let res = steps::upload_step(transport, target, command, workspace, remote_dir, log, cancel_rx)
+                .await;
             if let Ok((_, uploaded)) = &res {
                 changed = *uploaded;
             }
@@ -989,11 +1004,11 @@ async fn execute_step(
         StepType::Download => {
             // 命令格式约定：<远端路径> -> <本地路径>（方向与 upload 相反）；
             // 本地路径相对 workspace 解析，父目录自动创建，单文件下载后 sha256 校验
-            download_step(transport, target, command, workspace, remote_dir, log, cancel_rx).await
+            steps::download_step(transport, target, command, workspace, remote_dir, log, cancel_rx).await
         }
         StepType::Pack => {
             // 命令格式约定：<目录或通配> -> <目标.zip>（本地操作，§5.8）
-            pack_step(command, workspace, log).await
+            steps::pack_step(command, workspace, log).await
         }
         StepType::K8sApply => {
             // §8.3 P0 简化：执行 kubectl 命令（本地 + KUBECONFIG 注入在引擎层完成）；
@@ -1011,6 +1026,9 @@ async fn execute_step(
     };
 
     let duration_ms = started.elapsed().as_millis() as u64;
+
+    // 输出洪峰丢行上报（通道满时 LogHandle 静默丢行；这里把累计数亮出来可诊断）
+    log.report_dropped();
 
     match outcome {
         Ok(status) if status.success => {
@@ -1030,7 +1048,7 @@ async fn execute_step(
             reason: format!("退出码 {}", status.code),
         },
         Err(e) => {
-            if local::is_cancelled(&e) {
+            if transport::is_cancelled(&e) {
                 StepResult::Cancelled
             } else {
                 StepResult::Failed { exit_code: -1, duration_ms, reason: e.to_string() }
@@ -1124,12 +1142,12 @@ fn apply_step_outputs(
     out
 }
 
-fn is_remote(target: Option<&Target>) -> bool {
+pub(crate) fn is_remote(target: Option<&Target>) -> bool {
     matches!(target.map(|t| &t.target_type), Some(TargetType::Ssh { .. }))
 }
 
 /// 远端步骤工作目录：work_root 基准 + 步骤 working_dir（上传相对路径 / 远端 cd 的基准）
-fn resolve_remote_step_dir(step: &Step, remote_base: &str) -> String {
+pub(crate) fn resolve_remote_step_dir(step: &Step, remote_base: &str) -> String {
     match &step.working_dir {
         Some(wd) if !remote_base.is_empty() => {
             format!("{remote_base}/{}", wd.trim_matches('/'))
@@ -1137,60 +1155,6 @@ fn resolve_remote_step_dir(step: &Step, remote_base: &str) -> String {
         Some(wd) => wd.clone(),
         None => remote_base.to_string(),
     }
-}
-
-/// creates 守卫的存在性检查（TODO「Ansible 参考 #1」）：
-/// - 本地步骤：相对 workspace 解析，支持 `*` `?` 通配（任一匹配存在即算）
-/// - SSH 步骤：远端 `test -e` 退出码判定（相对路径随 work_root / working_dir 展开）
-///
-/// 检查失败（如连不上远端）返回 Err，调用方 fail-open 照常执行步骤。
-async fn check_creates_exists(
-    pattern: &str,
-    target: Option<&Target>,
-    transport: &Arc<dyn RemoteTransport>,
-    remote_dir: &str,
-    workspace: &Path,
-    log: &LogHandle,
-    cancel_rx: &mut broadcast::Receiver<()>,
-) -> anyhow::Result<bool> {
-    if is_remote(target) {
-        let path = if pattern.starts_with('/') || remote_dir.is_empty() {
-            pattern.to_string()
-        } else {
-            format!("{}/{}", remote_dir.trim_end_matches('/'), pattern)
-        };
-        log.line(
-            transport::Stream::Stdout,
-            format!("[creates] 检查远端路径: {path}"),
-        );
-        let cmd = format!(
-            "test -e '{}'",
-            crate::transport::putty::escape_posix_single_quote(&path)
-        );
-        let st = transport
-            .exec(target_dummy(target), &cmd, "", &HashMap::new(), log, cancel_rx)
-            .await?;
-        Ok(st.success)
-    } else {
-        Ok(local_creates_exists(workspace, pattern))
-    }
-}
-
-/// 本地 creates 检查：字面量路径直接 exists；含通配符的展开后任一匹配存在即算
-fn local_creates_exists(workspace: &Path, pattern: &str) -> bool {
-    let p = Path::new(pattern);
-    let absolute = if p.is_absolute() { p.to_path_buf() } else { workspace.join(p) };
-    if absolute.exists() {
-        return true;
-    }
-    if pattern.contains('*') || pattern.contains('?') {
-        // glob 模式统一用 / 分隔，避免 Windows 反斜杠被当转义符
-        let norm = absolute.to_string_lossy().replace('\\', "/");
-        if let Ok(paths) = glob::glob(&norm) {
-            return paths.filter_map(Result::ok).any(|p| p.exists());
-        }
-    }
-    false
 }
 
 /// 前置检查执行：发版机本地 cmd /C，退出码 0 = 通过（30 秒超时；失败取输出末尾几行）
@@ -1242,21 +1206,10 @@ fn step_retry_plan(step: &Step) -> (u32, u64) {
     }
 }
 
-/// 人类可读的文件大小
-fn human_size(bytes: u64) -> String {
-    if bytes >= 1024 * 1024 * 1024 {
-        format!("{:.2} GB", bytes as f64 / 1024.0 / 1024.0 / 1024.0)
-    } else if bytes >= 1024 * 1024 {
-        format!("{:.1} MB", bytes as f64 / 1024.0 / 1024.0)
-    } else {
-        format!("{:.1} KB", bytes as f64 / 1024.0)
-    }
-}
-
 /// 前端工程自动 corepack（§6.5）：命令里以 pnpm / yarn 开头的行自动加 corepack 前缀，
 /// 其余行原样保留（保留原始缩进）。pnpm.cmd / yarn.cmd 同样识别；
 /// 用户已手写 corepack 前缀的行不会二次包装。
-fn auto_corepack_wrap(command: &str) -> String {
+pub(crate) fn auto_corepack_wrap(command: &str) -> String {
     command
         .lines()
         .map(|line| {
@@ -1274,270 +1227,21 @@ fn auto_corepack_wrap(command: &str) -> String {
         .join("\n")
 }
 
-/// corepack 是否可用（每个 job 只探测一次；node 16.10+ 自带）
+/// corepack 是否可用（node 16.10+ 自带）。探测有进程开销且结果进程内不变，
+/// 只探一次并缓存；经 env_detect::run_version_check 走 3s 超时，
+/// corepack 缺失/挂死时 UI 预览（同步调用）也不会被无限拖住。
 fn corepack_available() -> bool {
-    let mut cmd = std::process::Command::new("corepack");
-    cmd.arg("--version")
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0800_0000);
-    }
-    cmd.spawn()
-        .and_then(|c| c.wait_with_output())
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        crate::env_detect::run_version_check("corepack --version").is_some()
+    })
 }
-
-/// pack 步骤：`<目录或通配> -> <目标.zip> [--exclude <glob>]…`，路径相对 workspace 解析
-async fn pack_step(
-    command: &str,
-    workspace: &Path,
-    log: &LogHandle,
-) -> anyhow::Result<transport::ExitStatus> {
-    let (src_part, dst_part) = command.split_once("->").ok_or_else(|| {
-        anyhow::anyhow!("pack 步骤命令格式应为: <目录或通配> -> <目标.zip>，实际: {command}")
-    })?;
-    // dst 段可带 --exclude <模式>…（rsync 语义）：字面量 = 目录/文件名分量，* ? = 通配
-    let mut dst_tokens = dst_part.split("--exclude");
-    let dst_str = dst_tokens.next().unwrap_or("").trim();
-    let excludes: Vec<String> = dst_tokens
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .collect();
-    let resolve = |p: &str| {
-        let path = Path::new(p);
-        if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            workspace.join(path)
-        }
-    };
-    let src = resolve(src_part.trim());
-    let dst = resolve(dst_str);
-    if !dst.to_string_lossy().to_ascii_lowercase().ends_with(".zip") {
-        anyhow::bail!("pack 目标必须是 .zip 文件: {}", dst.display());
-    }
-
-    log.line(
-        transport::Stream::Stdout,
-        format!("[pack] {} -> {}", src.display(), dst.display()),
-    );
-    if !excludes.is_empty() {
-        log.line(
-            transport::Stream::Stdout,
-            format!("[pack] 排除: {}", excludes.join(", ")),
-        );
-    }
-    let (count, bytes) = crate::pack::pack(&src, &dst, &excludes)?;
-    let size = human_size(bytes);
-    log.line(
-        transport::Stream::Stdout,
-        format!("[pack] 完成：{count} 个文件，{size}"),
-    );
-    Ok(transport::ExitStatus::from_code(0))
-}
-
 /// trait 要求 &Target；None 时给本地占位 target
-fn target_dummy(target: Option<&Target>) -> &Target {
+pub(crate) fn target_dummy(target: Option<&Target>) -> &Target {
     static LOCAL: std::sync::OnceLock<Target> = std::sync::OnceLock::new();
     target.unwrap_or_else(|| LOCAL.get_or_init(crate::config::local_target))
 }
 
-/// 解析 upload 命令：每行一条映射 `<本地路径> -> <远端路径>`（空行与 # 注释忽略）。
-/// 微服务多 jar 场景在一个步骤里写多条映射即可。
-fn parse_upload_mappings(command: &str) -> anyhow::Result<Vec<(String, String)>> {
-    let mut out = Vec::new();
-    for line in command
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty() && !l.starts_with('#'))
-    {
-        let Some((l, r)) = line.split_once("->") else {
-            anyhow::bail!("upload 映射格式应为: <本地路径> -> <远端路径>，实际行: {line}");
-        };
-        let (l, r) = (l.trim(), r.trim());
-        // 空映射行（UI 编辑器加行的 "-> " 占位）与空白行一样跳过
-        if l.is_empty() && r.is_empty() {
-            continue;
-        }
-        out.push((l.to_string(), r.to_string()));
-    }
-    if out.is_empty() {
-        anyhow::bail!("upload 命令为空；每行一条映射：<本地路径> -> <远端路径>");
-    }
-    Ok(out)
-}
-
-async fn upload_step(
-    transport: &Arc<dyn RemoteTransport>,
-    target: Option<&Target>,
-    command: &str,
-    workspace: &Path,
-    remote_dir: &str,
-    log: &LogHandle,
-    cancel_rx: &mut broadcast::Receiver<()>,
-) -> anyhow::Result<(transport::ExitStatus, bool)> {
-    // 返回值第二项 = 是否真的传了内容（变更判断；hash 未变更跳过的映射不计）
-    if !is_remote(target) {
-        anyhow::bail!("step_type: upload 需要 SSH target，当前 target 不支持上传");
-    }
-    let target = target.expect("checked above");
-    let mappings = parse_upload_mappings(command)?;
-    let total = mappings.len();
-    let mut uploaded_any = false;
-
-    for (i, (local_part, remote_part)) in mappings.iter().enumerate() {
-        let local_path = {
-            let p = Path::new(local_part);
-            if p.is_absolute() {
-                p.to_path_buf()
-            } else {
-                workspace.join(p)
-            }
-        };
-        let remote_path = if remote_part.starts_with('/') || remote_dir.is_empty() {
-            remote_part.clone()
-        } else {
-            format!("{}/{}", remote_dir.trim_end_matches('/'), remote_part)
-        };
-        if !local_path.exists() {
-            anyhow::bail!("上传源不存在: {}", local_path.display());
-        }
-        log.line(
-            transport::Stream::Stdout,
-            format!("[upload {}/{}] {} -> {}", i + 1, total, local_path.display(), remote_path),
-        );
-
-        // 单文件：先做内容变更判断（Ansible handlers/notify 的地基）——
-        // 本地 sha256 与远端一致 → 整个传输跳过；不一致 / 远端不可查 → 正常上传
-        let mut local_hash: Option<String> = None;
-        if local_path.is_file() {
-            let bytes = std::fs::metadata(&local_path).map(|m| m.len()).unwrap_or(0);
-            log.line(
-                transport::Stream::Stdout,
-                format!("[upload {}/{}] 文件大小 {}", i + 1, total, human_size(bytes)),
-            );
-            let hash = crate::transport::putty::sha256_file(&local_path)?;
-            if let Ok(remote_hash) = crate::transport::putty::remote_sha256(target, &remote_path) {
-                if remote_hash == hash {
-                    log.line(
-                        transport::Stream::Stdout,
-                        format!(
-                            "[upload {}/{}] 内容未变更（sha256 {}），跳过传输",
-                            i + 1,
-                            total,
-                            &hash[..12]
-                        ),
-                    );
-                    continue;
-                }
-                log.line(
-                    transport::Stream::Stdout,
-                    format!(
-                        "[upload {}/{}] 远端内容不同（sha256 {} != {}），开始传输",
-                        i + 1,
-                        total,
-                        &hash[..12],
-                        &remote_hash[..remote_hash.len().min(12)]
-                    ),
-                );
-            }
-            local_hash = Some(hash);
-        }
-        transport
-            .upload(target, &local_path, &remote_path, log, cancel_rx)
-            .await?;
-        uploaded_any = true;
-
-        // 上传完整性校验（§5.9）：单文件比对本地/远端 sha256；
-        // 目录递归上传跳过（建议先用 pack 打成单文件）。校验失败 → 步骤失败 → 按重试配置重传。
-        if let Some(local_hash) = &local_hash {
-            log.line(
-                transport::Stream::Stdout,
-                format!("[verify] 校验远端 sha256: {}", remote_path),
-            );
-            let remote_hash = crate::transport::putty::remote_sha256(target, &remote_path)?;
-            if &remote_hash != local_hash {
-                anyhow::bail!(
-                    "上传校验失败：sha256 不一致（本地 {local_hash} / 远端 {remote_hash}）"
-                );
-            }
-            log.line(
-                transport::Stream::Stdout,
-                format!("[verify] sha256 一致 ✓ ({})", &local_hash[..12]),
-            );
-        } else {
-            log.line(
-                transport::Stream::Stderr,
-                "[verify] 目录上传跳过校验（建议先用 pack 打成单文件再上传）",
-            );
-        }
-    }
-    Ok((transport::ExitStatus::from_code(0), uploaded_any))
-}
-
-/// download 步骤：`<远端路径> -> <本地路径>` 每行一条（复用 upload 的映射解析，
-/// 方向相反）。本地路径相对 workspace 解析、父目录自动创建；单文件下载后 sha256 校验。
-async fn download_step(
-    transport: &Arc<dyn RemoteTransport>,
-    target: Option<&Target>,
-    command: &str,
-    workspace: &Path,
-    remote_dir: &str,
-    log: &LogHandle,
-    cancel_rx: &mut broadcast::Receiver<()>,
-) -> anyhow::Result<transport::ExitStatus> {
-    if !is_remote(target) {
-        anyhow::bail!("step_type: download 需要 SSH target，当前 target 不支持下载");
-    }
-    let target = target.expect("checked above");
-    let mappings = parse_upload_mappings(command)?;
-    let total = mappings.len();
-    for (i, (remote_part, local_part)) in mappings.iter().enumerate() {
-        let remote_path = if remote_part.starts_with('/') || remote_dir.is_empty() {
-            remote_part.clone()
-        } else {
-            format!("{}/{}", remote_dir.trim_end_matches('/'), remote_part)
-        };
-        let local_path = {
-            let p = Path::new(local_part);
-            if p.is_absolute() { p.to_path_buf() } else { workspace.join(p) }
-        };
-        if let Some(parent) = local_path.parent() {
-            if !parent.exists() {
-                std::fs::create_dir_all(parent)?;
-            }
-        }
-        log.line(
-            transport::Stream::Stdout,
-            format!("[download {}/{}] {} -> {}", i + 1, total, remote_path, local_path.display()),
-        );
-        transport
-            .download(target, &remote_path, &local_path, log, cancel_rx)
-            .await?;
-        // 下载完整性校验：单文件比对远端/本地 sha256（目录跳过）
-        if local_path.is_file() {
-            let remote_hash = crate::transport::putty::remote_sha256(target, &remote_path)?;
-            let local_hash = crate::transport::putty::sha256_file(&local_path)?;
-            if remote_hash != local_hash {
-                anyhow::bail!(
-                    "下载校验失败：sha256 不一致（远端 {remote_hash} / 本地 {local_hash}）"
-                );
-            }
-            log.line(
-                transport::Stream::Stdout,
-                format!("[verify] sha256 一致 ✓ ({})", &local_hash[..12]),
-            );
-        }
-    }
-    Ok(transport::ExitStatus::from_code(0))
-}
-
-/// 危险命令模式（§14 P1 静态检查）：预览 ⚠ + 执行前日志提醒（不拦截，操作者自己判断）
 pub fn dangerous_command_hits(command: &str) -> Vec<&'static str> {
     const PATTERNS: &[&str] = &[
         "rm -rf /",
@@ -1579,266 +1283,6 @@ fn capture_env_file(workspace: &Path) -> HashMap<String, String> {
     }
     out
 }
-
-// ---------------------------------------------------------------------------
-// 干跑预览（Ansible --check 思路）：变量全量解析 + when/creates 判定，不执行
-// 任何命令、不发起任何网络请求。顺带当变量拼错检查器用：未解析的占位符原样
-// 保留，预览里以 ⚠ 标出。
-// ---------------------------------------------------------------------------
-
-/// 单个步骤的预览结果（preview_job 产出；UI 控制台 / CLI 直接渲染）
-#[derive(Debug, Clone)]
-pub struct StepPreview {
-    pub index: usize,
-    pub name: String,
-    pub skipped: bool,
-    /// 跳过原因 / 备注（未启用 / 条件不满足 / creates 已存在 / 远端 creates 未校验）
-    pub note: Option<String>,
-    /// ⚠ 警告（条件无法解析、变量未解析、上传源缺失、目标未定义…）
-    pub warnings: Vec<String>,
-    /// 有效目标名（None = 本机）
-    pub target: Option<String>,
-    /// 变量解析后的最终命令（含 corepack 自动包装后的形态）
-    pub command: String,
-    /// 解析后的本地工作目录
-    pub working_dir: PathBuf,
-    /// upload 步骤：解析后的 (本地路径, 远端路径, 本地是否存在)
-    pub uploads: Vec<(String, String, bool)>,
-    /// pack 步骤：解析后的 (源, 目标 zip)
-    pub pack: Option<(String, String)>,
-    /// step outputs：捕获声明（键, 正则）
-    pub outputs: Vec<(String, String)>,
-    /// notify 的 handler 名
-    pub notify: Vec<String>,
-    /// wait 探测描述（模式 目标 间隔）
-    pub wait_note: Option<String>,
-}
-
-/// 干跑预览：按真实执行路径解析每个步骤（变量替换、when 条件、creates 守卫、
-/// upload/pack 命令格式），但不执行。同步无副作用，可在 UI 线程直接调用。
-pub fn preview_job(input: &RunInput) -> Vec<StepPreview> {
-    let ctx = build_var_context(input);
-    let workspace = PathBuf::from(&input.project.local_path);
-    let job_wd = resolve_job_working_dir(&input.job, &workspace);
-
-    // 与 run_job 同一判定：前端工程 corepack 钉版（预览展示包装后的最终命令）
-    let pinned_frontend = {
-        let pj = workspace.join("package.json");
-        std::fs::read_to_string(&pj)
-            .map(|t| t.contains("\"packageManager\""))
-            .unwrap_or(false)
-    };
-    let corepack_ok = pinned_frontend && corepack_available();
-
-    let mut out = Vec::new();
-    for (index, step) in input.job.steps.iter().enumerate() {
-        let step_name = step
-            .name
-            .clone()
-            .unwrap_or_else(|| step.command.lines().next().unwrap_or("").to_string());
-        let mut p = StepPreview {
-            index,
-            name: step_name,
-            skipped: false,
-            note: None,
-            warnings: Vec::new(),
-            target: None,
-            command: String::new(),
-            working_dir: resolve_step_working_dir(step, &job_wd),
-            uploads: Vec::new(),
-            pack: None,
-            outputs: step.outputs.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
-            notify: step.notify.clone(),
-            wait_note: step.wait.as_ref().map(|wp| {
-                let interval = if wp.interval_seconds == 0 {
-                    transport::WAIT_POLL_SECONDS
-                } else {
-                    wp.interval_seconds.max(1)
-                };
-                format!("{} {} 每 {interval}s", wp.mode.as_str(), wp.target)
-            }),
-        };
-
-        if !step.enabled {
-            p.skipped = true;
-            p.note = Some("未启用".to_string());
-            out.push(p);
-            continue;
-        }
-
-        // when / condition
-        if let Some(cond) = &step.condition {
-            match eval_condition(cond, &ctx) {
-                Some(false) => {
-                    p.skipped = true;
-                    p.note = Some(format!("条件不满足: {cond}"));
-                    out.push(p);
-                    continue;
-                }
-                None => p.warnings.push(format!("条件无法解析，将按真值执行: {cond}")),
-                Some(true) => {}
-            }
-        }
-
-        // 有效目标（§3.3）
-        let eff_name = step.target.clone().or_else(|| input.job.target.clone());
-        let eff_target = eff_name.as_deref().and_then(|n| {
-            let t = input.all_targets.get(n)?;
-            let mut t = t.clone();
-            if t.name.is_empty() {
-                t.name = n.to_string();
-            }
-            Some(t)
-        });
-        p.target = eff_name.clone();
-        if let Some(n) = &eff_name {
-            if eff_target.is_none() {
-                p.warnings
-                    .push(format!("目标「{n}」未定义（project.yaml 的 targets 表）"));
-            }
-        }
-        let remote = is_remote(eff_target.as_ref());
-        let remote_base = eff_target
-            .as_ref()
-            .and_then(|t| t.work_root.clone())
-            .unwrap_or_default();
-        let remote_dir = resolve_remote_step_dir(step, &remote_base);
-
-        // creates：本地实际校验；远端路径干跑不发起 SSH 往返，仅标注
-        if let Some(creates) = &step.creates {
-            let resolved = resolve(creates, &ctx);
-            if remote {
-                p.note =
-                    Some(format!("creates={resolved}（远端路径，干跑不校验，按执行处理）"));
-            } else if local_creates_exists(&workspace, &resolved) {
-                p.skipped = true;
-                p.note = Some(format!("creates 已存在: {resolved}"));
-                out.push(p);
-                continue;
-            }
-        }
-
-        // 命令解析（与 run_job 同一替换与 corepack 包装）
-        let mut command = resolve(&step.command, &ctx);
-        if pinned_frontend
-            && corepack_ok
-            && matches!(step.step_type, StepType::Exec | StepType::K8sApply)
-            && !remote
-        {
-            command = auto_corepack_wrap(&command);
-        }
-        if command.contains("${{") || command.contains("${") {
-            p.warnings
-                .push("命令仍含未解析的变量占位符（检查变量名拼写 / 变量组）".to_string());
-        }
-        // 危险命令静态检查（§14）：预览 ⚠，防手滑（执行前引擎也会再提醒一次）
-        if matches!(step.step_type, StepType::Exec | StepType::K8sApply) {
-            let hits = dangerous_command_hits(&command);
-            if !hits.is_empty() {
-                p.warnings
-                    .push(format!("⚠ 危险命令模式: {}（请确认是有意为之）", hits.join(" / ")));
-            }
-        }
-        p.command = command.clone();
-
-        match step.step_type {
-            StepType::Upload if remote => {
-                match parse_upload_mappings(&command) {
-                    Ok(mappings) => {
-                        for (local_part, remote_part) in mappings {
-                            let local_path = {
-                                let lp = Path::new(&local_part);
-                                if lp.is_absolute() {
-                                    lp.to_path_buf()
-                                } else {
-                                    workspace.join(lp)
-                                }
-                            };
-                            let exists = local_path.exists();
-                            if !exists {
-                                p.warnings
-                                    .push(format!("上传源不存在: {}", local_path.display()));
-                            }
-                            let remote_path = if remote_part.starts_with('/')
-                                || remote_dir.is_empty()
-                            {
-                                remote_part.clone()
-                            } else {
-                                format!("{}/{}", remote_dir.trim_end_matches('/'), remote_part)
-                            };
-                            p.uploads
-                                .push((local_path.to_string_lossy().to_string(), remote_path, exists));
-                        }
-                    }
-                    Err(e) => p.warnings.push(e.to_string()),
-                }
-            }
-            StepType::Upload => {
-                p.warnings
-                    .push("upload 需要 SSH 目标，当前目标不支持上传".to_string());
-            }
-            StepType::Download if remote => {
-                match parse_upload_mappings(&command) {
-                    Ok(mappings) => {
-                        for (remote_part, local_part) in mappings {
-                            let remote_path = if remote_part.starts_with('/')
-                                || remote_dir.is_empty()
-                            {
-                                remote_part.clone()
-                            } else {
-                                format!("{}/{}", remote_dir.trim_end_matches('/'), remote_part)
-                            };
-                            let local_path = {
-                                let lp = Path::new(&local_part);
-                                if lp.is_absolute() { lp.to_path_buf() } else { workspace.join(lp) }
-                            };
-                            p.uploads.push((
-                                remote_path,
-                                local_path.to_string_lossy().to_string(),
-                                true,
-                            ));
-                        }
-                    }
-                    Err(e) => p.warnings.push(e.to_string()),
-                }
-            }
-            StepType::Download => {
-                p.warnings
-                    .push("download 需要 SSH 目标，当前目标不支持下载".to_string());
-            }
-            StepType::Pack => match command.split_once("->") {
-                Some((s, d)) => {
-                    let rp = |v: &str| {
-                        let pp = Path::new(v.trim());
-                        if pp.is_absolute() {
-                            pp.to_path_buf()
-                        } else {
-                            workspace.join(pp)
-                        }
-                    };
-                    let src = rp(s);
-                    let dst = rp(d);
-                    if !dst.to_string_lossy().to_ascii_lowercase().ends_with(".zip") {
-                        p.warnings.push("pack 目标必须是 .zip 文件".to_string());
-                    }
-                    p.pack =
-                        Some((src.to_string_lossy().to_string(), dst.to_string_lossy().to_string()));
-                }
-                None => p
-                    .warnings
-                    .push("pack 命令格式应为: <目录或通配> -> <目标.zip>".to_string()),
-            },
-            _ => {}
-        }
-
-        out.push(p);
-    }
-    out
-}
-
-// ---------------------------------------------------------------------------
-// 测试
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -1890,23 +1334,6 @@ mod tests {
             enabled: true,
             ..Default::default()
         }
-    }
-
-    #[test]
-    fn upload_mapping_parser_multi_line() {
-        // 微服务多 jar：一个 upload 步骤多行映射；空行与 # 注释忽略
-        let m = parse_upload_mappings(
-            "target/user.jar -> /opt/app/user.jar\n\n# 注释行\ntarget/order.jar -> /opt/app/order.jar",
-        )
-        .unwrap();
-        assert_eq!(m.len(), 2);
-        assert_eq!(m[0], ("target/user.jar".to_string(), "/opt/app/user.jar".to_string()));
-        assert_eq!(m[1], ("target/order.jar".to_string(), "/opt/app/order.jar".to_string()));
-
-        // 缺箭头 → 明确报错
-        assert!(parse_upload_mappings("target/a.jar").is_err());
-        // 全空 → 明确报错
-        assert!(parse_upload_mappings("  \n# only comment\n").is_err());
     }
 
     fn collect(status: JobStatus, rx: &mut mpsc::Receiver<LogEvent>) -> Vec<LogEvent> {
@@ -2158,7 +1585,7 @@ mod tests {
             },
         );
 
-        let (tx, mut rx) = mpsc::channel(1024);
+        let (tx, _rx) = mpsc::channel(1024);
         let status = rt.block_on(engine.run_job(input, cancel_rx, tx));
         // 第 3 步目标未定义 → on_failure=stop → 整个 job 失败于 step 2（0 起）
         assert!(matches!(status, JobStatus::Failed { step_index: 2, .. }));
@@ -2555,21 +1982,6 @@ mod tests {
     }
 
     #[test]
-    fn local_creates_glob() {
-        // creates 通配：target/*.jar 任一匹配存在即算
-        let dir = std::env::temp_dir().join(format!("rbs_creates_glob_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("target")).unwrap();
-        assert!(!local_creates_exists(&dir, "target/*.jar"));
-        std::fs::write(dir.join("target").join("a.jar"), "x").unwrap();
-        assert!(local_creates_exists(&dir, "target/*.jar"));
-        // 字面量路径
-        assert!(local_creates_exists(&dir, "target"));
-        assert!(!local_creates_exists(&dir, "no_such_thing"));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
     fn job_level_timeout_stops_remaining() {
         // job.timeout 接线：作业级超时 → JobStatus::Timeout，剩余步骤不启动
         let rt = runtime();
@@ -2630,72 +2042,6 @@ mod tests {
             elapsed < Duration::from_secs(5),
             "取消应立即生效而非等步骤自然结束: {elapsed:?}"
         );
-    }
-
-    #[test]
-    fn preview_flags_unresolved_vars_missing_sources_and_creates() {
-        // 干跑预览：变量拼错 ⚠ / 上传源缺失 ⚠ / creates 已存在 → 跳过；不发任何网络请求
-        let dir = std::env::temp_dir().join(format!("rbs_preview_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("exists_marker.txt"), "x").unwrap();
-
-        let upload = Step {
-            name: Some("上传".into()),
-            command: "missing/nope.jar -> app.jar".to_string(),
-            step_type: StepType::Upload,
-            enabled: true,
-            target: Some("prod".into()),
-            ..Default::default()
-        };
-        let typo = exec_step("echo ${{ variables.TYPO }}");
-        let done = Step {
-            name: Some("已完成步骤".into()),
-            command: "echo done".to_string(),
-            step_type: StepType::Exec,
-            enabled: true,
-            creates: Some("exists_marker.txt".to_string()),
-            ..Default::default()
-        };
-
-        let mut input = simple_job(vec![upload, typo, done]);
-        input.project.local_path = dir.to_string_lossy().to_string();
-        input.all_targets.insert(
-            "prod".to_string(),
-            Target {
-                name: "prod".to_string(),
-                target_type: TargetType::Ssh {
-                    host: "1.2.3.4".to_string(),
-                    port: 22,
-                    user: "u".to_string(),
-                    auth: crate::models::AuthMethod::None,
-                    host_key: None,
-                },
-                work_root: Some("/srv".to_string()),
-                ..Default::default()
-            },
-        );
-
-        let previews = preview_job(&input);
-        assert_eq!(previews.len(), 3);
-        // 上传源缺失 → 警告；相对远端路径应拼上 work_root
-        assert!(
-            previews[0].warnings.iter().any(|w| w.contains("上传源不存在")),
-            "{:?}",
-            previews[0].warnings
-        );
-        assert_eq!(previews[0].uploads.len(), 1);
-        assert_eq!(previews[0].uploads[0].1, "/srv/app.jar");
-        // 变量拼写错误 → 警告，占位符原样展示
-        assert!(
-            previews[1].warnings.iter().any(|w| w.contains("未解析")),
-            "{:?}",
-            previews[1].warnings
-        );
-        assert_eq!(previews[1].command, "echo ${{ variables.TYPO }}");
-        // creates 已存在 → 跳过
-        assert!(previews[2].skipped, "{:?}", previews[2]);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

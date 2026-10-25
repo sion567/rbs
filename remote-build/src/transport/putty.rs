@@ -43,8 +43,25 @@ pub fn builtin_dir_hint() -> String {
         .unwrap_or_else(|| "<未知>".to_string())
 }
 
-/// 优先级探测：custom → builtin → PATH → Program Files
+/// 探测结果缓存：每步执行 / 每次哈希校验都会探测，逐次读盘解析 config.yaml
+/// 再扫候选目录代价不小；结果进程内缓存，save_global（自定义路径可能变化）时失效。
+static DETECTION_CACHE: std::sync::RwLock<Option<PuttyDetection>> = std::sync::RwLock::new(None);
+
+pub fn invalidate_detection_cache() {
+    *DETECTION_CACHE.write().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+/// 优先级探测：custom → builtin → PATH → Program Files（带进程内缓存）
 pub fn detect_putty_tools() -> PuttyDetection {
+    if let Some(hit) = DETECTION_CACHE.read().unwrap_or_else(|e| e.into_inner()).clone() {
+        return hit;
+    }
+    let d = detect_putty_tools_uncached();
+    *DETECTION_CACHE.write().unwrap_or_else(|e| e.into_inner()) = Some(d.clone());
+    d
+}
+
+fn detect_putty_tools_uncached() -> PuttyDetection {
     let mut candidates: Vec<(String, PathBuf)> = Vec::new();
 
     // 1. 用户自定义路径（config.yaml putty.custom_path）
@@ -260,13 +277,23 @@ impl PuttyTransport {
                                     .cred_key
                                     .clone()
                                     .unwrap_or_else(|| target.name.clone());
-                                crate::secrets::get_password(&key).ok_or_else(|| {
-                                    anyhow::anyhow!(
-                                        "目标「{}」未存储密码（凭据键: {key}）：\
-                                         请在 🎯 目标管理中配置，或改用 key / agent 认证",
-                                        target.name
-                                    )
-                                })?
+                                match crate::secrets::get_password(&key) {
+                                    Ok(Some(p)) => p,
+                                    Ok(None) => {
+                                        return Err(anyhow::anyhow!(
+                                            "目标「{}」未存储密码（凭据键: {key}）：\
+                                             请在 🎯 目标管理中配置，或改用 key / agent 认证",
+                                            target.name
+                                        ))
+                                    }
+                                    Err(e) => {
+                                        // 凭据管理器故障与「没存过密码」分开报，避免误导排查方向
+                                        return Err(e.context(format!(
+                                            "读取目标「{}」的存储密码失败（凭据键: {key}）",
+                                            target.name
+                                        )));
+                                    }
+                                }
                             }
                         };
                         args.push("-pw".to_string());
@@ -398,70 +425,78 @@ pub fn escape_posix_single_quote(s: &str) -> String {
     s.replace('\'', "'\\''")
 }
 
-/// 解析 sha256sum 输出行（`<hash>  <path>`），取小写哈希
-pub fn parse_sha256sum_output(line: &str) -> Option<String> {
-    line.split_whitespace()
-        .next()
-        .map(|h| h.to_ascii_lowercase())
-        .filter(|h| h.len() == 64 && h.chars().all(|c| c.is_ascii_hexdigit()))
-}
-
-/// 远端文件 sha256（上传校验用）：plink 执行 `sha256sum '<path>'`，10 秒超时。
-/// 认证参数复用 build_ssh_args（密码取 Credential Manager，§14）。
-pub fn remote_sha256(target: &Target, remote_path: &str) -> anyhow::Result<String> {
+/// 批量取远端文件 sha256：一条 plink 往返执行 `sha256sum p1 p2 …`（异步，30s 超时）。
+/// 返回 远端路径 → 小写哈希；不存在的文件不出现在结果里（sha256sum 对缺失文件
+/// 退出码非 0 但已找到的仍输出，按部分成功处理）。
+/// 完全失败（连不上 / 命令不存在 / 输出无法解析）返回 Err，由调用方决定
+/// fail-open（上传前预检）还是判步骤失败（上传后校验）。
+///
+/// 取代旧版逐文件同步实现：多 jar 上传场景从「每文件 2 次冷启动连接」
+/// 降为「预检 + 校验各 1 次往返」，也不再阻塞 tokio worker 线程。
+pub async fn remote_sha256_batch(
+    target: &Target,
+    remote_paths: &[String],
+) -> anyhow::Result<HashMap<String, String>> {
+    if remote_paths.is_empty() {
+        return Ok(HashMap::new());
+    }
     let d = detect_putty_tools();
     if !d.found {
         anyhow::bail!("未找到 plink（PuTTY）");
     }
     let (dest, mut args) = PuttyTransport::build_ssh_args(target)?;
     args.push(dest);
-    args.push(format!("sha256sum '{}'", escape_posix_single_quote(remote_path)));
-
-    use std::io::Read;
-    use std::process::{Command, Stdio};
-    use std::time::{Duration, Instant};
+    let joined = remote_paths
+        .iter()
+        .map(|p| format!("'{}'", escape_posix_single_quote(p)))
+        .collect::<Vec<_>>()
+        .join(" ");
+    args.push(format!("sha256sum {joined}"));
 
     let mut cmd = Command::new(&d.plink);
-    cmd.args(&args).stdout(Stdio::piped()).stderr(Stdio::piped());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0800_0000);
+    cmd.args(&args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    let child = cmd.spawn().context("启动 plink 失败")?;
+    let out = tokio::time::timeout(std::time::Duration::from_secs(30), child.wait_with_output())
+        .await
+        .map_err(|_| anyhow::anyhow!("远端 sha256sum 超时（30s）"))??;
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let map = parse_sha256sum_batch(&stdout);
+    if map.is_empty() && !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        anyhow::bail!(
+            "远端 sha256sum 失败: {}",
+            stderr.lines().next().unwrap_or("(无输出)").trim()
+        );
     }
-    let mut child = cmd.spawn().context("启动 plink 失败")?;
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(st)) => break Some(st),
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    anyhow::bail!("远端 sha256sum 超时（10s）");
-                }
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            Err(e) => anyhow::bail!("执行 plink 失败: {e}"),
-        }
-    };
-    let mut out = String::new();
-    if let Some(mut o) = child.stdout.take() {
-        let _ = o.read_to_string(&mut out);
+    Ok(map)
+}
+
+/// 解析 `sha256sum` 多文件输出：每行 `<hash>  <path>`（GNU/busybox 均两个空格分隔，
+/// 二进制模式为 ` *`），路径可含空格；非哈希行（错误提示等）忽略。
+pub fn parse_sha256sum_batch(output: &str) -> HashMap<String, String> {
+    output.lines().filter_map(parse_sha256sum_line).collect()
+}
+
+fn parse_sha256sum_line(line: &str) -> Option<(String, String)> {
+    // 哈希固定 64 个十六进制字符且顶行首
+    if line.len() < 67 {
+        return None;
     }
-    if let Some(st) = status {
-        if !st.success() {
-            let mut err = String::new();
-            if let Some(mut x) = child.stderr.take() {
-                let _ = x.read_to_string(&mut err);
-            }
-            anyhow::bail!(
-                "远端 sha256sum 失败: {}",
-                err.lines().next().unwrap_or("(无输出)").trim()
-            );
-        }
+    let (hash, rest) = line.split_at(64);
+    if !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
     }
-    out.lines()
-        .find_map(parse_sha256sum_output)
-        .ok_or_else(|| anyhow::anyhow!("远端 sha256sum 输出无法解析: {out}"))
+    let rest = rest.strip_prefix(" *").or_else(|| rest.strip_prefix("  ")).unwrap_or(rest);
+    let path = rest.trim();
+    if path.is_empty() {
+        return None;
+    }
+    // 返回 (路径, 哈希)：直接 collect 进 HashMap 时路径为键（调用方按路径查）
+    Some((path.to_string(), hash.to_ascii_lowercase()))
 }
 // ---------------------------------------------------------------------------
 // 连接测试 + 服务器体检
@@ -959,21 +994,21 @@ mod tests {
     }
 
     #[test]
-    fn sha256sum_output_parsing() {
-        // 上传校验：解析远端 sha256sum 输出（`<hash>  <path>`）
-        let hash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
-        assert_eq!(
-            parse_sha256sum_output(&format!("{hash}  /opt/app/server.zip")).as_deref(),
-            Some(hash)
+    fn sha256sum_batch_parsing() {
+        let h1 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let h2 = "a".repeat(64);
+        // 多文件输出：逐行解析，路径可含空格；错误行忽略
+        let out = format!(
+            "{h1}  /opt/app/user.jar\n\
+             sh: /opt/missing.jar: No such file or directory\n\
+             {h2}  /opt/My Projects/app.jar\n"
         );
-        // 大写哈希归一化为小写
-        assert_eq!(
-            parse_sha256sum_output(&hash.to_uppercase()).as_deref(),
-            Some(hash)
-        );
-        // 非哈希内容（命令不存在等）→ None
-        assert!(parse_sha256sum_output("sh: sha256sum: command not found").is_none());
-        assert!(parse_sha256sum_output("").is_none());
+        let map = parse_sha256sum_batch(&out);
+        assert_eq!(map.len(), 2, "{map:?}");
+        assert_eq!(map.get("/opt/app/user.jar").map(String::as_str), Some(h1));
+        assert_eq!(map.get("/opt/My Projects/app.jar").map(String::as_str), Some(h2.as_str()));
+        // 全错误输出 → 空 map（调用方按失败处理）
+        assert!(parse_sha256sum_batch("sh: sha256sum: command not found").is_empty());
     }
 
     #[test]
@@ -984,6 +1019,7 @@ mod tests {
         if !bundled.exists() {
             return;
         }
+        invalidate_detection_cache(); // 排除其他测试留下的缓存
         let d = detect_putty_tools();
         assert!(d.found, "捆绑了 PuTTY 时必须能探测到");
         // config.yaml 配了 putty.custom_path 时自定义目录按设计优先（source=custom）；
@@ -991,6 +1027,10 @@ mod tests {
         if d.source != "custom" {
             assert_eq!(d.source, "builtin");
         }
+        // 缓存生效：第二次调用返回同一结果
+        let d2 = detect_putty_tools();
+        assert_eq!(d.source, d2.source);
+        assert_eq!(d.plink, d2.plink);
     }
 
     // -- 服务器体检（probe_server 输出解析）---------------------------------

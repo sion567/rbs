@@ -144,6 +144,8 @@ pub struct MainState {
     pub confirm_gate: ConfirmGate,
     /// 👀 监听模式（watchexec/WinSCP keep-up-to-date 思路）：工作目录文件变化自动重跑
     pub watch: Option<WatchState>,
+    /// 后台目录扫描结果通道（扫描在独立线程，UI 线程只收结果不递归走盘）
+    pub watch_scan: Option<std_mpsc::Receiver<Option<std::time::SystemTime>>>,
     /// 下一次 launch_run 的触发来源是否为监听自动重跑（历史入库 trigger=watch）
     pub run_trigger_watch: bool,
     /// 运行历史列表缓存（设置页懒加载，None = 需要重读；sqlite 关闭时恒为空）
@@ -221,6 +223,7 @@ impl MainState {
             pull_done: None,
             confirm_gate: Default::default(),
             watch: None,
+            watch_scan: None,
             run_trigger_watch: false,
             history_rows: None,
             run_step_durations: Vec::new(),
@@ -506,6 +509,7 @@ impl MainState {
             );
             self.status_msg = Some("👀 监听已停止".to_string());
         }
+        self.watch_scan = None; // 丢弃在途的扫描结果
         if self.run_active() {
             if let Some(run) = &self.run {
                 let _ = run.cancel_tx.send(());
@@ -513,12 +517,40 @@ impl MainState {
         }
     }
 
-    /// 空闲时轮询工作目录 mtime（3 秒节流），变化则自动重跑
+    /// 空闲时轮询工作目录 mtime（3 秒节流），变化则自动重跑。
+    /// 递归扫描放后台线程（大项目几万文件，UI 线程同步扫会掉帧），
+    /// UI 每帧只做 try_recv 收结果。
     fn poll_watch(&mut self) {
         let Some(w) = self.watch.clone() else { return };
         // 确认门开着 = 等用户输入，不抢跑；运行中 / 更新代码中不轮询
         if self.run_active() || self.pull_done.is_some() || self.confirm_gate.open {
             return;
+        }
+        // 收后台扫描结果（Some(mtime) = 有最新修改时刻；None = 目录不可读）
+        if let Some(rx) = &self.watch_scan {
+            match rx.try_recv() {
+                Ok(mtime) => {
+                    self.watch_scan = None;
+                    if let Some(mtime) = mtime {
+                        if mtime > w.since {
+                            if let Some(w) = self.watch.as_mut() {
+                                w.since = std::time::SystemTime::now();
+                            }
+                            self.console.push_line(
+                                "👀 检测到文件变化，自动重跑…".to_string(),
+                                crate::ui::console::Role::Info,
+                            );
+                            // 监听重跑 = 已确认过的会话，跳过确认门直达启动
+                            self.auto_rerun(&w);
+                        }
+                    }
+                }
+                Err(std_mpsc::TryRecvError::Empty) => {} // 扫描还在跑
+                Err(std_mpsc::TryRecvError::Disconnected) => self.watch_scan = None,
+            }
+        }
+        if self.watch_scan.is_some() {
+            return; // 上一轮扫描未完，不叠加
         }
         if w.last_poll.elapsed() < Duration::from_secs(3) {
             return;
@@ -534,20 +566,13 @@ impl MainState {
             self.stop_watch();
             return;
         }
-        match newest_mtime(std::path::Path::new(&w.dir), 0) {
-            Some(mtime) if mtime > w.since => {
-                if let Some(w) = self.watch.as_mut() {
-                    w.since = std::time::SystemTime::now();
-                }
-                self.console.push_line(
-                    "👀 检测到文件变化，自动重跑…".to_string(),
-                    crate::ui::console::Role::Info,
-                );
-                // 监听重跑 = 已确认过的会话，跳过确认门直达启动
-                self.auto_rerun(&w);
-            }
-            _ => {}
-        }
+        // 扫描丢后台线程，结果回传
+        let (tx, rx) = std_mpsc::channel();
+        let dir = std::path::PathBuf::from(&w.dir);
+        std::thread::spawn(move || {
+            let _ = tx.send(newest_mtime(&dir, 0));
+        });
+        self.watch_scan = Some(rx);
     }
 
     /// 监听触发的重跑：定位监听目标并启动（绕过确认门；目标被选中以保持 UI 一致）
@@ -885,6 +910,12 @@ impl MainState {
                 if !p.command.is_empty() {
                     self.console
                         .push_line(format!("    $ {}", p.command), Role::Stdout);
+                }
+                if let Some((tname, tcmd)) = &p.tool {
+                    self.console.push_line(
+                        format!("    🔧 工具 {tname} → {tcmd}（其目录前置 PATH，裸名命令用这个版本）"),
+                        Role::Stdout,
+                    );
                 }
                 for (l, r, exists) in &p.uploads {
                     self.console.push_line(

@@ -287,7 +287,7 @@ pub fn show(ctx: &egui::Context, main: &mut MainState) {
                     tool_editor(ui, main);
                 }
                 SettingsTab::Putty => putty_section(ui, &mut main.global),
-                SettingsTab::Global => global_section(ctx, ui, &mut main.global),
+                SettingsTab::Global => global_section(ctx, ui, main),
                 SettingsTab::History => history_section(ui, main),
             }
         });
@@ -755,8 +755,9 @@ fn putty_section(ui: &mut egui::Ui, global: &mut crate::models::GlobalConfig) {
 fn global_section(
     ctx: &egui::Context,
     ui: &mut egui::Ui,
-    global: &mut crate::models::GlobalConfig,
+    main: &mut MainState,
 ) {
+    let global = &mut main.global;
     ui.heading("全局配置（config.yaml）");
     egui::Grid::new("settings_global")
         .num_columns(2)
@@ -827,6 +828,30 @@ fn global_section(
         "提示：PuTTY 自定义目录在「🔌 PuTTY」页设置（putty.custom_path）；\
          tools.yaml 的 putty 条目由探测自动生成，仅供展示。控制台配色跟随主题（深浅两套色板各自调校）。",
     );
+
+    ui.add_space(8.0);
+    ui.separator();
+    ui.heading("示范工程");
+    ui.horizontal(|ui| {
+        if ui
+            .button("重新生成 example（四本示范合集）")
+            .on_hover_text(
+                "覆盖 projects/example 下的 project.yaml 与 git/build/linux/deploy 四本合集 yaml。\n\
+                 只影响示范工程，你自己的项目不动",
+            )
+            .clicked()
+        {
+            match crate::config::create_example_project() {
+                Ok(()) => {
+                    main.status_msg =
+                        Some("示范工程已重新生成（Git / 构建 / Linux / 发布 四本合集）".to_string());
+                    main.reload();
+                }
+                Err(e) => main.status_msg = Some(format!("重新生成失败: {e}")),
+            }
+        }
+        ui.weak("Git / 构建 / Linux 远端 / 发布 四本合集，点「👁 预览」当活文档看");
+    });
 }
 
 // ---------------------------------------------------------------------------

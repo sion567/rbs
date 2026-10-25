@@ -129,12 +129,7 @@ pub(super) async fn wait_with_cancel(
         _ = cancel.recv() => {
             tree.terminate();
             let _ = child.kill().await;
-            anyhow::bail!("__cancelled__")
+            Err(anyhow::Error::new(super::Cancelled))
         }
     }
-}
-
-/// 判断错误是否为取消（引擎据此返回 StepResult::Cancelled）
-pub fn is_cancelled(err: &anyhow::Error) -> bool {
-    err.to_string() == "__cancelled__"
 }

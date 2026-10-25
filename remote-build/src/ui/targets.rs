@@ -37,6 +37,11 @@ pub struct TargetEditorState {
     /// 连接测试（后台线程）
     pub test_rx: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
     pub test_result: Option<(bool, String)>,
+    /// local 目标的本机信息（后台采集一次，面板展示）
+    pub local_info: Option<crate::env_detect::LocalSystemInfo>,
+    pub local_info_rx: Option<std::sync::mpsc::Receiver<crate::env_detect::LocalSystemInfo>>,
+    /// 「重新探测系统工具」后台任务（结果合并回 tools.yaml）
+    pub redetect_rx: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
     pub unsaved: bool,
 }
 
@@ -80,6 +85,31 @@ pub fn show(ctx: &egui::Context, main: &mut MainState) {
             Err(std::sync::mpsc::TryRecvError::Empty) => {}
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 main.target_editor.test_rx = None;
+            }
+        }
+    }
+    // 回收本机信息采集结果
+    if let Some(rx) = &main.target_editor.local_info_rx {
+        if let Ok(info) = rx.try_recv() {
+            main.target_editor.local_info = Some(info);
+            main.target_editor.local_info_rx = None;
+        }
+    }
+    // 回收「重新探测系统工具」结果：tools.yaml 已被后台更新，刷新内存副本
+    if let Some(rx) = &main.target_editor.redetect_rx {
+        match rx.try_recv() {
+            Ok(Ok(msg)) => {
+                main.status_msg = Some(msg);
+                main.target_editor.redetect_rx = None;
+                main.tools = crate::config::load_tools().map(|t| t.tools).unwrap_or_default();
+            }
+            Ok(Err(e)) => {
+                main.status_msg = Some(format!("⚠ {e}"));
+                main.target_editor.redetect_rx = None;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                main.target_editor.redetect_rx = None;
             }
         }
     }
@@ -133,7 +163,10 @@ pub fn show(ctx: &egui::Context, main: &mut MainState) {
         });
     main.target_editor.open = open;
 
-    if main.target_editor.test_rx.is_some() {
+    if main.target_editor.test_rx.is_some()
+        || main.target_editor.local_info_rx.is_some()
+        || main.target_editor.redetect_rx.is_some()
+    {
         ctx.request_repaint_after(std::time::Duration::from_millis(150));
     }
 }
@@ -279,6 +312,16 @@ fn edit_form(ui: &mut egui::Ui, main: &mut MainState) {
     };
     if !scope_map_ref(main).map(|m| m.contains_key(&selected)).unwrap_or(false) {
         main.target_editor.selected = None;
+        return;
+    }
+
+    // local 目标 = 本机展示位（系统信息 + 工具链清单），不是配置表单
+    let is_local = scope_map_ref(main)
+        .and_then(|m| m.get(&selected))
+        .map(|t| matches!(t.target_type, TargetType::Local))
+        .unwrap_or(false);
+    if is_local {
+        local_machine_panel(ui, main);
         return;
     }
 
@@ -507,10 +550,10 @@ fn edit_form(ui: &mut egui::Ui, main: &mut MainState) {
             target.name = new.clone();
             map.insert(new.clone(), target);
         }
-        // 重命名后同步凭据键
+        // 重命名后同步凭据键（读取失败只跳过迁移，不阻断改名）
         let old_key = cred_key_for(main, &selected);
         let new_key = cred_key_for(main, &new);
-        if let Some(pwd) = crate::secrets::get_password(&old_key) {
+        if let Ok(Some(pwd)) = crate::secrets::get_password(&old_key) {
             let _ = crate::secrets::set_password(&new_key, &pwd);
             crate::secrets::delete_password(&old_key);
         }
@@ -554,6 +597,127 @@ fn auth_from_index(i: usize) -> AuthMethod {
         2 => AuthMethod::Agent,
         _ => AuthMethod::None,
     }
+}
+
+/// local 目标的展示面板：本机系统信息 + 工具链清单 + 重新探测。
+/// 与远端目标的「连接测试 + 服务器体检」对称——local 看本机，SSH 看远端。
+fn local_machine_panel(ui: &mut egui::Ui, main: &mut MainState) {
+    ui.heading("🖥 本机（local 目标）");
+    ui.weak(
+        "命令在本机执行，无需配置。这里展示发版机当前状态与工具链；\n\
+         工具的新增/编辑在 ⚙ 设置，本面板只读 + 可重新探测。",
+    );
+    ui.add_space(6.0);
+
+    // 本机信息：首次打开后台采集一次（含 ver 子进程，不在 UI 线程跑）
+    if main.target_editor.local_info.is_none() && main.target_editor.local_info_rx.is_none() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        main.target_editor.local_info_rx = Some(rx);
+        std::thread::spawn(move || {
+            let _ = tx.send(crate::env_detect::local_system_info());
+        });
+    }
+    if let Some(info) = &main.target_editor.local_info {
+        egui::Grid::new("local_info_grid")
+            .num_columns(2)
+            .spacing([16.0, 4.0])
+            .show(ui, |ui| {
+                ui.label("主机名:");
+                ui.monospace(&info.hostname);
+                ui.end_row();
+                ui.label("系统:");
+                ui.monospace(format!("{} ({})", info.os, info.arch));
+                ui.end_row();
+                ui.label("CPU:");
+                ui.monospace(format!("{} 逻辑核", info.cpu_cores));
+                ui.end_row();
+                ui.label("内存:");
+                ui.monospace(format!(
+                    "{:.1} GB 总量 / {:.1} GB 可用",
+                    info.mem_total_mb as f64 / 1024.0,
+                    info.mem_avail_mb as f64 / 1024.0
+                ));
+                ui.end_row();
+            });
+    } else {
+        ui.spinner();
+        ui.weak(" 正在采集本机信息…");
+    }
+
+    ui.add_space(8.0);
+    ui.separator();
+    ui.heading("🧰 工具链（tools.yaml）");
+    ui.weak(
+        "步骤里选择了工具时：该工具的 env 注入该步骤，其所在目录前置到 PATH，\n\
+         命令里的裸名（java / mvn / node…）就会解析到这个工具的版本——选哪个用哪个。",
+    );
+    ui.add_space(4.0);
+
+    let names: Vec<String> = {
+        let mut v: Vec<String> = main.tools.keys().cloned().collect();
+        v.sort();
+        v
+    };
+    egui::ScrollArea::vertical()
+        .id_salt("local_tools")
+        .max_height(200.0)
+        .show(ui, |ui| {
+            egui::Grid::new("local_tools_grid")
+                .num_columns(4)
+                .spacing([12.0, 4.0])
+                .show(ui, |ui| {
+                    ui.strong("工具");
+                    ui.strong("版本");
+                    ui.strong("来源");
+                    ui.strong("命令 / 路径");
+                    ui.end_row();
+                    for n in &names {
+                        let Some(t) = main.tools.get(n) else { continue };
+                        ui.label(n);
+                        ui.label(t.version.as_deref().unwrap_or("—"));
+                        ui.weak(t.detected_from.as_deref().unwrap_or("手动"));
+                        // 路径可选中复制：配步骤引用工具时方便对照
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(&t.command).monospace())
+                                .selectable(true)
+                                .wrap(),
+                        );
+                        ui.end_row();
+                    }
+                });
+            if names.is_empty() {
+                ui.weak("（tools.yaml 为空——点下方「⟳ 重新探测系统工具」生成）");
+            }
+        });
+
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        let probing = main.target_editor.redetect_rx.is_some();
+        if ui
+            .add_enabled(!probing, egui::Button::new("⟳ 重新探测系统工具"))
+            .on_hover_text(
+                "后台重新探测 java / maven / gradle / node / git / docker / kubectl / npm / putty\n\
+                 （每个版本命令最多 3 秒）。结果合并进 tools.yaml：同名条目更新版本与路径，\n\
+                 手动添加的工具与 env 不受影响",
+            )
+            .clicked()
+        {
+            let (tx, rx) = std::sync::mpsc::channel();
+            main.target_editor.redetect_rx = Some(rx);
+            std::thread::spawn(move || {
+                let report = crate::env_detect::detect_all();
+                let res = crate::config::merge_detection(&report)
+                    .map(|n| format!("探测完成：已更新 {n} 个工具 → tools.yaml ✅"))
+                    .map_err(|e| format!("写入 tools.yaml 失败: {e}"));
+                let _ = tx.send(res);
+            });
+            main.status_msg = Some("正在重新探测系统工具…".to_string());
+        }
+        if probing {
+            ui.spinner();
+            ui.weak(" 探测中（每个工具最多 3 秒）…");
+        }
+    });
 }
 
 fn text_row(ui: &mut egui::Ui, value: &mut String, width: f32) -> bool {
@@ -632,7 +796,8 @@ fn load_buffers(main: &mut MainState, name: &str) {
     }
     main.target_editor.work_root = t.work_root.clone().unwrap_or_default();
     main.target_editor.password_buf.clear();
-    main.target_editor.password_saved = crate::secrets::get_password(&key).is_some();
+    main.target_editor.password_saved =
+        crate::secrets::get_password(&key).map(|p| p.is_some()).unwrap_or(false);
 }
 
 /// 后台线程做 SSH 连接测试 + 服务器体检（复用 putty::probe_server，8 秒超时）；

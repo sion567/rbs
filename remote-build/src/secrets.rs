@@ -6,11 +6,16 @@ use anyhow::{Context, Result};
 
 const SERVICE: &str = "remote-build";
 
-pub fn get_password(target_name: &str) -> Option<String> {
-    keyring::Entry::new(SERVICE, target_name)
-        .ok()?
-        .get_password()
-        .ok()
+/// 读取密码：Ok(None) = 未存储过；Err = 凭据管理器故障（服务异常等）。
+/// 两者分开，调用方才不会把「系统问题」误报成「没配密码」。
+pub fn get_password(target_name: &str) -> Result<Option<String>> {
+    let entry = keyring::Entry::new(SERVICE, target_name)
+        .with_context(|| format!("打开凭据失败: {target_name}"))?;
+    match entry.get_password() {
+        Ok(p) => Ok(Some(p)),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(e) => Err(anyhow::anyhow!("读取凭据「{target_name}」失败: {e}")),
+    }
 }
 
 pub fn set_password(target_name: &str, password: &str) -> Result<()> {

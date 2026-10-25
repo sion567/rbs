@@ -21,6 +21,22 @@ pub enum Stream {
     Stderr,
 }
 
+/// 取消信号错误：引擎据此把步骤结果归为 Cancelled 而非 Failed。
+/// 类型化判定（downcast）取代此前的魔法字符串比较——改提示文案不会再破坏取消路径。
+#[derive(Debug)]
+pub struct Cancelled;
+
+impl std::fmt::Display for Cancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "已取消")
+    }
+}
+impl std::error::Error for Cancelled {}
+
+pub fn is_cancelled(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<Cancelled>().is_some()
+}
+
 /// LogSink 的 mpsc 实现：把每行输出包装成 LogEvent 推给引擎/UI。
 /// UI 侧在 RunHandle 里持有 receiver 逐帧消费。
 /// 可选附带 stdout 捕获缓冲（step outputs：正则从全文捕获运行时变量）。
@@ -30,11 +46,13 @@ pub struct LogHandle {
     pub step_index: usize,
     /// stdout 全文缓冲（None = 不捕获）
     capture: Option<std::sync::Arc<std::sync::Mutex<String>>>,
+    /// 通道满时被丢弃的行数（步骤收尾 report_dropped 上报一次，可诊断输出洪峰）
+    dropped: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl LogHandle {
     pub fn new(tx: mpsc::Sender<LogEvent>, step_index: usize) -> Self {
-        Self { tx, step_index, capture: None }
+        Self { tx, step_index, capture: None, dropped: Default::default() }
     }
 
     /// 附带 stdout 捕获缓冲的构造（step.outputs 非空时由引擎创建）
@@ -43,7 +61,7 @@ impl LogHandle {
         step_index: usize,
         capture: std::sync::Arc<std::sync::Mutex<String>>,
     ) -> Self {
-        Self { tx, step_index, capture: Some(capture) }
+        Self { tx, step_index, capture: Some(capture), dropped: Default::default() }
     }
 
     pub fn line(&self, stream: Stream, text: impl Into<String>) {
@@ -68,7 +86,25 @@ impl LogHandle {
             },
         };
         // 通道满时丢弃最不关键的输出行，绝不阻塞执行
-        let _ = self.tx.try_send(ev);
+        if self.tx.try_send(ev).is_err() {
+            self.dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// 上报并清零累计丢行数（步骤收尾调用）。上报行本身也可能撞上满通道——
+    /// 那样计数滚回，下轮再报，不会丢统计。
+    pub fn report_dropped(&self) {
+        let n = self.dropped.swap(0, std::sync::atomic::Ordering::Relaxed);
+        if n == 0 {
+            return;
+        }
+        let ev = LogEvent::Stderr {
+            step_index: self.step_index,
+            line: format!("⚠ 输出过快，{n} 行日志被丢弃（完整输出见构建工具自身日志）"),
+        };
+        if self.tx.try_send(ev).is_err() {
+            self.dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 }
 

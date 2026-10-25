@@ -254,3 +254,59 @@ fn probe(exe: &str, args: &[&str]) -> Option<String> {
         .find(|l| !l.is_empty())
         .map(str::to_string)
 }
+
+// ---------------------------------------------------------------------------
+// 本机信息（local 目标展示用，与远端目标的 probe_server 体检对称）
+// ---------------------------------------------------------------------------
+
+/// 发版机本机概要：主机名 / 系统 / CPU / 内存。采集含子进程（ver），请在后台线程调用。
+#[derive(Debug, Clone, Default)]
+pub struct LocalSystemInfo {
+    pub hostname: String,
+    /// 如 "Microsoft Windows [Version 10.0.26300.1]" 的版本段
+    pub os: String,
+    pub arch: String,
+    pub cpu_cores: u32,
+    pub mem_total_mb: u64,
+    pub mem_avail_mb: u64,
+}
+
+/// 采集本机信息（Windows：winapi + `cmd /C ver`；其他平台尽力而为）
+pub fn local_system_info() -> LocalSystemInfo {
+    let mut info = LocalSystemInfo {
+        hostname: std::env::var("COMPUTERNAME").unwrap_or_default(),
+        arch: std::env::consts::ARCH.to_string(),
+        ..Default::default()
+    };
+    // OS 版本：GetVersionEx 无清单会谎报（固定 6.2），`ver` 命令最省事
+    if let Some(line) = probe("cmd", &["/C", "ver"]) {
+        // "Microsoft Windows [Version 10.0.26300.1]" → 取方括号段
+        info.os = line
+            .split(['[', ']'])
+            .find(|s| s.contains("Version "))
+            .map(|s| s.trim_start_matches("Version ").to_string())
+            .unwrap_or(line);
+    }
+    #[cfg(windows)]
+    unsafe {
+        use std::mem;
+        use winapi::um::sysinfoapi::{GlobalMemoryStatusEx, GetSystemInfo, MEMORYSTATUSEX, SYSTEM_INFO};
+        let mut si: SYSTEM_INFO = mem::zeroed();
+        GetSystemInfo(&mut si);
+        info.cpu_cores = si.dwNumberOfProcessors;
+
+        let mut ms: MEMORYSTATUSEX = mem::zeroed();
+        ms.dwLength = mem::size_of::<MEMORYSTATUSEX>() as u32;
+        if GlobalMemoryStatusEx(&mut ms) != 0 {
+            info.mem_total_mb = ms.ullTotalPhys / (1024 * 1024);
+            info.mem_avail_mb = ms.ullAvailPhys / (1024 * 1024);
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        info.cpu_cores = std::thread::available_parallelism()
+            .map(|n| n.get() as u32)
+            .unwrap_or(0);
+    }
+    info
+}

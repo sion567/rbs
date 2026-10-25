@@ -20,19 +20,23 @@ egui = { version = "0.37", features = ["monochrome_emoji_fonts"] }  # 0.37 起 e
 egui-wgpu = "0.37"               # 与 eframe 内部同版本；用于锁定渲染后端（见 main.rs）
 serde = { version = "1.0", features = ["derive"] }
 yaml_serde = "0.10"                      # serde_yaml 的正统后继（YAML 官方组织维护）；serde_yml 已废弃勿用
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = [
+    "rt-multi-thread", # GUI 侧自建多线程 runtime（main.rs）
+    "macros",          # select! 宏
+    "process",         # 子进程（cmd /C、plink/pscp）
+    "io-util",         # 管道逐行读取
+    "net",             # wait 步骤 tcp/http 探测
+    "time",            # 超时 / 轮询间隔
+    "sync",            # mpsc（日志事件）+ broadcast（取消信号）
+] }
 async-trait = "0.1"
-thiserror = "1.0"
 anyhow = "1.0"
 dirs = "5.0"
 log = "0.4"                         # 仅用于 StderrLogger（main.rs）：暴露 egui-winit/arboard/wgpu 的静默错误
-whoami = "1.4"
 chrono = { version = "0.4", features = ["serde"] }
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 sha2 = "0.10"                    # 工具校验和
 keyring = "2.0"                  # Windows Credential Manager（P1 密码存储）
-winapi = { version = "0.3", features = ["shellapi", "winuser", "wincon", "winnls", "stringapiset", "jobapi2", "winnt", "handleapi"] }  # 快捷方式/通知（P2）；OEM 代码页解码；Job Object 进程树终止
+winapi = { version = "0.3", features = ["shellapi", "winuser", "wincon", "winnls", "stringapiset", "jobapi2", "winnt", "handleapi", "sysinfoapi"] }  # 快捷方式/通知（P2）；OEM 代码页解码；Job Object 进程树终止；本机信息（CPU/内存）
 rfd = "0.13"                     # 原生文件/文件夹选择对话框（项目目录浏览）
 zip = { version = "2", default-features = false, features = ["deflate"] }  # pack 步骤内置打包
 glob = "0.3"                     # pack 源通配匹配（如 target/*.jar）+ creates 通配 + pack 排除
@@ -45,3 +49,12 @@ sqlite = ["dep:sqlx"]
 
 [profile.dev]
 opt-level = 1
+
+# 依赖全量优化（自己代码保持 opt-level=1 的快速增量编译）：
+# egui/wgpu 纯解释执行的调试版依赖是 UI 卡顿大户，这一行收益极大
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

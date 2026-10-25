@@ -501,6 +501,7 @@ pub fn show(main: &mut MainState, ui: &mut egui::Ui) {
     }
     if create_job_requested {
         main.new_job.open = true;
+        main.new_job.preset_group = None; // 编辑器入口默认不分组（分组入口会带预选）
     }
     if delete_job_confirmed {
         delete_current_job(main);
@@ -519,6 +520,8 @@ pub struct NewJobState {
     pub name: String,
     /// 创建时复制当前选中流程的步骤（否则用起始模板）
     pub clone_from: bool,
+    /// 预选分组（从分组右键「＋ 添加任务」打开时带入；窗口内可改/清除）
+    pub preset_group: Option<String>,
     pub message: Option<(bool, String)>,
 }
 
@@ -556,6 +559,34 @@ pub fn show_new_job_window(ctx: &egui::Context, main: &mut MainState) {
                 }
             });
             ui.weak("自由命名不走枚举；文件名自动净化（dev:h5 → dev_h5.yaml），树上仍显示原名");
+            // 分组：从分组右键打开时预选，这里可改
+            {
+                let groups = &main.projects[pi].project.groups;
+                if !groups.is_empty() || main.new_job.preset_group.is_some() {
+                    ui.horizontal(|ui| {
+                        ui.label("分组:");
+                        let selected =
+                            main.new_job.preset_group.clone().unwrap_or_else(|| "（不分组）".to_string());
+                        egui::ComboBox::from_id_salt("new_job_group")
+                            .selected_text(selected)
+                            .width(180.0)
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut main.new_job.preset_group,
+                                    None,
+                                    "（不分组）",
+                                );
+                                for g in groups {
+                                    ui.selectable_value(
+                                        &mut main.new_job.preset_group,
+                                        Some(g.clone()),
+                                        g,
+                                    );
+                                }
+                            });
+                    });
+                }
+            }
             ui.add_space(4.0);
             ui.checkbox(
                 &mut main.new_job.clone_from,
@@ -628,6 +659,7 @@ fn create_job(main: &mut MainState) {
         on_failure: FailureAction::Stop,
         steps,
         working_dir: None,
+        group: main.new_job.preset_group.clone(),
     };
     if let Err(e) = crate::storage::files::save_yaml(&path, &job) {
         main.new_job.message = Some((false, format!("写入失败: {e}")));
@@ -645,6 +677,7 @@ fn create_job(main: &mut MainState) {
 
     main.new_job.message = None;
     main.new_job.name.clear();
+    main.new_job.preset_group = None;
     main.new_job.open = false;
     main.reload();
     main.select_project_by_name(&project_name);
@@ -843,7 +876,7 @@ fn edit_step(
 
             ui.separator();
             ui.label("工具:");
-            egui::ComboBox::from_id_salt(format!("tool_{si}"))
+            let tool_resp = egui::ComboBox::from_id_salt(format!("tool_{si}"))
                 .selected_text(if step.tool.is_empty() {
                     "（无）".to_string()
                 } else {
@@ -867,6 +900,13 @@ fn edit_step(
                         }
                     }
                 });
+            tool_resp.response.on_hover_text(
+                "选择工具的作用：\n\
+                 1. 该工具的环境变量注入本步骤；\n\
+                 2. 工具所在目录前置到 PATH——命令里写裸名（java / mvn / node…）时，\n\
+                    用的就是这个工具的版本（多个 java 并存时靠它选版本）。\n\
+                 命令本身不变；具体解析路径见「👁 预览」或 🎯 目标管理 → 本机工具链",
+            );
             // 来源徽标 + 悬停显示解析到的实际 command
             if !step.tool.is_empty() {
                 match tool_menu.merged.get(&step.tool) {

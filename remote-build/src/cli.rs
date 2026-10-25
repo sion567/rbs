@@ -343,6 +343,9 @@ fn preview(args: &[String]) {
             if !p.command.is_empty() {
                 println!("    $ {}", p.command);
             }
+            if let Some((tname, tcmd)) = &p.tool {
+                println!("    🔧 工具 {tname} → {tcmd}（其目录前置 PATH，裸名命令用这个版本）");
+            }
             for (l, r, exists) in &p.uploads {
                 println!("    ↑ {l} -> {r}{}", if *exists { "" } else { "（本地缺失 ⚠）" });
             }

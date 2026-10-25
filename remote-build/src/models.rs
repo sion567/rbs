@@ -80,6 +80,11 @@ pub struct Project {
     /// 运行前与 tools.yaml 探测到的 version 对比，偏差零步失败；预览显示偏差。
     #[serde(default)]
     pub tools_require: HashMap<String, String>,
+    /// 流程分组（项目树展示用）：分组只是名字列表，流程通过自身的
+    /// `group` 字段归属；引用了列表外分组名的流程会动态显示为该组。
+    /// 空分组因此可以持久存在（先建组、后往里加任务）。
+    #[serde(default)]
+    pub groups: Vec<String>,
     /// 可选：加载额外 .env 文件
     pub env_file: Option<String>,
 }
@@ -128,6 +133,10 @@ pub struct Job {
     pub steps: Vec<Step>,
     /// 项目级默认工作目录（相对 local_path）
     pub working_dir: Option<String>,
+    /// 所属分组（project.yaml groups 列表里的名字；None = 不分组，旧配置默认如此）。
+    /// 纯项目树展示用，不影响执行。
+    #[serde(default)]
+    pub group: Option<String>,
 }
 
 /// job 前置检查条目：check 在发版本机本地执行（经变量替换），退出码 0 = 通过
