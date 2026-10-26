@@ -1,14 +1,61 @@
 #!/usr/bin/env bash
+# 必须用 bash 运行（麒麟桌面版等 Debian 系的 sh 是 dash，缺关联数组语法）
+if [ -z "${BASH_VERSION:-}" ]; then
+  echo "错误：请用 bash 运行本脚本：bash release.sh（不要用 sh release.sh）" >&2
+  exit 1
+fi
+# 关联数组、mapfile 需要 bash 4+（麒麟 V10 / CentOS / Ubuntu 主流版本都满足）
+if [ "${BASH_VERSINFO[0]}" -lt 4 ]; then
+  echo "错误：bash 版本过低（当前 $BASH_VERSION，需要 4.0 及以上）" >&2
+  exit 1
+fi
+# 依赖自检：缺了就在开头人话报错，而不是跑到一半莫名失败（flock/timeout 可选，不查）
+for _cmd in sha256sum df awk sort tee; do
+  command -v "$_cmd" >/dev/null 2>&1 || { echo "错误：系统缺少命令 $_cmd，请先安装（一般属于 coreutils/gawk 基础包）" >&2; exit 1; }
+done
 # ============================================================================
-# release.sh —— rbs 正式版发布脚本（在服务器上、source/ 与 targets/ 同级目录运行）
+# release.sh —— rbs 正式版发布脚本（在服务器上、sources/ 与 targets/ 同级目录运行）
 #
 # 目录约定：
-#   source/    你上传的待发布包（平铺）。
-#              也支持 source/<目标名>/xxx 子目录形式：强制发布到该目标，
-#              用于"该目标第一次新增包、目录里还没有同名旧文件"的场景。
+#   sources/    你上传的待发布包。三种用法：
+#              ① 平铺 sources/xxx.jar：发给所有"目录里已有同名旧包"的目标，
+#                 适合全局唯一的包名（如后端 jar，一次发给 N 台）。
+#              ② 子目录 sources/<目标名>/xxx：只发给该目标。给目标首次上包、
+#                 或多个目标用同一个包名（手机端/web 端都叫 dist.tar.gz）
+#                 时必须用这种。
+#              ③ 【推荐】清单 sources/manifest.txt，明确写每个包发到哪，
+#                 详见下方「发布清单」一节。
+#              同一个包名同时出现在平铺和子目录、且两者会发到同一个
+#              目标时，脚本报错拒绝（无法判断该用哪个文件）。
 #   targets/   每个子目录是一个发布目标，放着当前版本的包 + 发布脚本 sh。
-#              发布脚本默认叫 deploy.sh；没有 deploy.sh 时，若目录里恰好
-#              只有一个 *.sh 也会自动认出来。
+#              新目标的目录（含发布 sh）要先手工建好，脚本不会替你创建。
+#              发布脚本按以下顺序确定：
+#              ① targets/<目标名>/.deploy-script（一行写脚本名，目录里
+#                 有多个 .sh 时靠它指定）
+#              ② 环境变量 DEPLOY_SH=xxx.sh（所有目标统一改名）
+#              ③ restart.sh（默认名，用 sh restart.sh 方式执行）
+#              ④ 目录里唯一的一个 *.sh（自动识别，叫什么名字都行）
+#
+# 发布清单 sources/manifest.txt（推荐）：
+#   格式：每行一条「文件路径 目标名 [目标名2 ...]」
+#         - 路径相对 sources/（子目录里的包写 web/dist.tar.gz 这种相对路径）
+#         - 目标名必须是 targets/ 下真实存在的目录，一行可写多个
+#         - 空格 / Tab 分隔均可；# 开头为注释行；空行忽略；CRLF 也能读
+#   示例（sources/manifest.txt 内容）：
+#         # 后端 jar，首发也直接平铺放
+#         xx-system-server.jar     xx-system
+#         # 手机端、web 端同名包，各发各的
+#         web/dist.tar.gz          web
+#         mobile/dist.tar.gz       mobile
+#         # 同一个包一次发多台
+#         agent.jar                app1 app2
+#   规则：
+#   - 清单存在时它就是完整分发计划：指到哪发到哪，不再要求目标里有
+#     同名旧包（首发平铺也能用）、同名包也不会串。
+#   - sources/ 里的每个包（平铺 + 一级子目录）都必须列进清单，漏列
+#     报错拒发（防漏发）。
+#   - 这些情况直接报错：目标名拼错、路径写错、重复列同一个文件、
+#     清单为空。删掉清单即回退到上面的目录约定规则。
 #
 # 每个目标的发布流程（每一步都有校验）：
 #   1. 备份   旧包 xxx -> xxxYYYYMMDD（当天日期，直接接在文件名末尾）
@@ -46,9 +93,10 @@ set -uo pipefail
 
 cd "$(dirname "$0")" || { echo "无法进入脚本所在目录" >&2; exit 1; }
 
-SOURCE_DIR="${SOURCE_DIR:-source}"
+SOURCE_DIR="${SOURCE_DIR:-sources}"
+MANIFEST_NAME="${MANIFEST_NAME:-manifest.txt}"   # sources/ 下可选的发布清单
 TARGETS_DIR="${TARGETS_DIR:-targets}"
-DEPLOY_SH="${DEPLOY_SH:-deploy.sh}"
+DEPLOY_SH="${DEPLOY_SH:-restart.sh}"
 SH_TIMEOUT="${SH_TIMEOUT:-600}"
 MIN_FREE_MB="${MIN_FREE_MB:-200}"
 LOG_DIR="${LOG_DIR:-logs}"
@@ -69,12 +117,20 @@ die()  { err "$*"; exit 1; }
 usage() {
   cat <<'EOF'
 用法：bash release.sh [选项]
-  （默认）          发布：source/ 里的包 -> targets/ 各目标 -> 执行发布 sh
+  （默认）          发布：sources/ 里的包 -> targets/ 各目标 -> 执行发布 sh
   --dry-run         演练：只打印将要做什么，不改动任何文件、不执行 sh
   --targets A B     只处理 targets/ 下指定的目标
   --keep-going      某个目标失败后继续处理其余目标（默认立即终止）
   --rollback        回滚模式：用备份恢复旧包并重跑发布 sh
   --date YYYYMMDD   配合 --rollback 指定用哪天的备份（默认当天）
+【推荐】发布清单 sources/manifest.txt：每行「文件路径 目标名...」（# 注释，路径相对 sources/）
+  例：xx-system-server.jar  xx-system      首发（无同名旧包）也直接发
+      web/dist.tar.gz       web            手机端/web 端同名包，各发各的
+      agent.jar             app1 app2      一个包一次发多台
+  清单存在时即完整分发计划：sources/ 里所有包必须都列出，漏列报错；删掉清单回退目录约定
+无清单时的目录约定：平铺=发给有同名旧包的目标；子目录 sources/<目标名>/=只发该目标
+首次发布：targets/<目标名>/（含发布 sh）要先手工建好
+发布脚本：.deploy-script 文件指定 > DEPLOY_SH 环境变量 > restart.sh > 目录里唯一的 *.sh（执行方式：sh 脚本名 包名...）
 环境变量：SOURCE_DIR / TARGETS_DIR / DEPLOY_SH / SH_TIMEOUT / MIN_FREE_MB / LOG_DIR
 完整约定见脚本头部注释。
 EOF
@@ -186,9 +242,22 @@ restore_backup() { # $1=tdir $2=pkg
   return 0
 }
 
-# 找发布 sh：优先 $DEPLOY_SH，否则目录里唯一的 *.sh；找不到输出空
+# 找发布脚本，优先级：
+#   ① targets/<t>/.deploy-script（一行写脚本名；目录里有多个 .sh 时靠它指定）
+#   ② 环境变量 DEPLOY_SH（全局统一改名）
+#   ③ restart.sh（默认名，用 sh restart.sh 方式执行）
+#   ④ 目录里唯一的 *.sh（自动识别，叫什么都行）
 resolve_sh() { # $1=tdir
-  local tdir="$1" cand=()
+  local tdir="$1" cand=() name
+  if [[ -f "$tdir/.deploy-script" ]]; then
+    IFS= read -r name < "$tdir/.deploy-script" || true
+    name="${name%$'\r'}"
+    name="${name#"${name%%[![:space:]]*}"}"
+    name="${name%"${name##*[![:space:]]}"}"
+    [[ -n "$name" ]] || die "$tdir/.deploy-script 是空的，应写一行脚本名"
+    [[ -f "$tdir/$name" ]] || die "$tdir/.deploy-script 指向的 '$name' 不存在（写相对该目标目录的文件名）"
+    echo "$name"; return 0
+  fi
   if [[ -f "$tdir/$DEPLOY_SH" ]]; then echo "$DEPLOY_SH"; return 0; fi
   cand=( "$tdir"/*.sh )
   if [[ ${#cand[@]} -eq 1 ]]; then basename "${cand[0]}"; return 0; fi
@@ -200,9 +269,9 @@ run_deploy_sh() { # $1=tdir $2=sh_rel 其余=包名...
   (
     cd "$tdir" || exit 97
     if [[ "$SH_TIMEOUT" != "0" ]] && command -v timeout >/dev/null 2>&1; then
-      exec timeout -k 10 "$SH_TIMEOUT" bash "./$sh_rel" "$@"
+      exec timeout -k 10 "$SH_TIMEOUT" sh "./$sh_rel" "$@"
     else
-      exec bash "./$sh_rel" "$@"
+      exec sh "./$sh_rel" "$@"
     fi
   )
 }
@@ -229,33 +298,96 @@ print_summary() { # $@=结果行
 # ---------------- source -> targets 映射（仅发布模式） ----------------
 declare -A PLAN   # "目标|包名" -> source 文件路径
 
-build_plan() {
-  local sub t f pkg key found
+MANIFEST="$SOURCE_DIR/$MANIFEST_NAME"
 
-  # ① 子目录形式 source/<目标>/<包>：强制发到该目标（用于新包）
+# 清单模式：sources/manifest.txt 存在时，它就是完整分发计划。
+# 每行「文件路径 目标名 [目标名2 ...]」（路径相对 sources/，# 为注释）。
+# 指到哪发到哪，不要求目标里有同名旧包（首发也能平铺）；
+# sources/ 里所有包都必须列出，防止漏发。
+build_plan_from_manifest() {
+  local line path rest t rel d
+  local -A seen=() files=()
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%$'\r'}"                      # 容忍 Windows 编辑出来的 CRLF
+    [[ "$line" =~ ^[[:space:]]*$ ]] && continue
+    [[ "$line" == \#* ]] && continue
+    read -r path rest <<< "$line"
+    [[ -n "$path" && -n "$rest" ]] || die "$MANIFEST 格式错误，每行应为：文件路径 目标名 [目标名2 ...] —— 问题行：$line"
+    path="${path#./}"
+    [[ -f "$SOURCE_DIR/$path" ]] || die "$MANIFEST 里的文件不存在：sources/$path"
+    [[ -z "${seen[$path]:-}" ]] || die "$MANIFEST 里重复列了同一个文件：sources/$path"
+    seen["$path"]=1
+    for t in $rest; do
+      [[ " ${TARGETS_ALL[*]} " == *" $t "* ]] || die "$MANIFEST 里的目标不存在：'$t'（targets/ 下没有这个目录，是不是拼错了？）"
+      PLAN["$t|$(basename "$path")"]="$SOURCE_DIR/$path"
+    done
+  done < "$MANIFEST"
+
+  [[ ${#seen[@]} -gt 0 ]] || die "$MANIFEST 是空的。要么把清单写好，要么删掉它改用目录约定"
+
+  # 枚举 sources/ 里实际存在的包（平铺 + 一级子目录，manifest.txt 本身除外）
+  for f in "$SOURCE_DIR"/*; do
+    [[ -f "$f" ]] || continue
+    [[ "$(basename "$f")" == "$MANIFEST_NAME" ]] && continue
+    files["$(basename "$f")"]=1
+  done
   for sub in "$SOURCE_DIR"/*/; do
-    t="$(basename "$sub")"
-    [[ -d "$TARGETS_DIR/$t" ]] || die "$SOURCE_DIR/$t/ 不是合法的 source 子目录：targets/ 下没有同名目标"
+    d="${sub#"$SOURCE_DIR"/}"                 # 如 xx-system/
     for f in "$sub"*; do
       [[ -f "$f" ]] || continue
+      [[ "$(basename "$f")" == "$MANIFEST_NAME" ]] && continue
+      files["$d$(basename "$f")"]=1
+    done
+  done
+  for rel in "${!files[@]}"; do
+    [[ -n "${seen[$rel]:-}" ]] || die "sources/$rel 没有出现在 $MANIFEST 里（清单模式下必须逐个列明，防止漏发）"
+  done
+}
+
+# 目录约定模式（无清单）：子目录按目标名、平铺按同名旧包猜
+build_plan_by_name() {
+  local sub t f pkg key found
+
+  # ① 子目录形式 sources/<目标>/<包>：强制发到该目标。
+  #    用于：给目标首次上包 / 多个目标用同名包（手机端、web 端都叫 dist.tar.gz）
+  for sub in "$SOURCE_DIR"/*/; do
+    t="$(basename "$sub")"
+    [[ -d "$TARGETS_DIR/$t" ]] || die "$SOURCE_DIR/$t/ 对不上目标：targets/ 下没有 '$t' 这个目标（首发新目标请先在服务器上建好 targets/$t/ 并放入发布 sh，脚本不会自动创建）"
+    for f in "$sub"*; do
+      [[ -f "$f" ]] || continue
+      [[ "$(basename "$f")" == "$MANIFEST_NAME" ]] && continue
       PLAN["$t|$(basename "$f")"]="$f"
     done
   done
 
-  # ② 平铺形式 source/<包>：发给所有"已存在同名旧包"的目标
+  # ② 平铺形式 sources/<包>：发给所有"已存在同名旧包"的目标。
+  #    若平铺包会发到某个已被子目录认领的目标（同名包），意图冲突，报错拒绝
   for f in "$SOURCE_DIR"/*; do
     [[ -f "$f" ]] || continue
-    pkg="$(basename "$f")"; found=0
+    pkg="$(basename "$f")"
+    [[ "$pkg" == "$MANIFEST_NAME" ]] && continue
+    found=0
     for t in "${TARGETS_ALL[@]}"; do
-      if [[ -f "$TARGETS_DIR/$t/$pkg" ]]; then
-        PLAN["$t|$pkg"]="$f"
-        found=1
+      [[ -f "$TARGETS_DIR/$t/$pkg" ]] || continue
+      if [[ -n "${PLAN[$t|$pkg]:-}" ]]; then
+        die "包名 '$pkg' 冲突：$SOURCE_DIR/$pkg（平铺）与 $SOURCE_DIR/$t/$pkg（子目录）都会发到目标 '$t'，无法判断用哪个文件，请二选一（同名包发给不同目标请一律用子目录形式，或改用 $MANIFEST 明确指定）"
       fi
+      PLAN["$t|$pkg"]="$f"
+      found=1
     done
-    [[ $found -eq 1 ]] || die "$SOURCE_DIR/$pkg 找不到对应目标（没有任何目标目录里有同名旧包）。若是给某目标新增的包，请放到 $SOURCE_DIR/<目标名>/ 子目录里"
+    [[ $found -eq 1 ]] || die "$SOURCE_DIR/$pkg 找不到对应目标（没有任何目标目录里有同名旧包）。给目标新增包请放到 $SOURCE_DIR/<目标名>/ 子目录里，或建一个 $MANIFEST 写明发到哪"
   done
 
   [[ ${#PLAN[@]} -gt 0 ]] || die "$SOURCE_DIR/ 里没有任何可发布的文件"
+}
+
+build_plan() {
+  if [[ -f "$MANIFEST" ]]; then
+    build_plan_from_manifest
+  else
+    build_plan_by_name
+  fi
 
   # 源文件非空、可读（防上传一半的包）
   local key f
@@ -354,12 +486,22 @@ do_deploy() {
       FAILED=1
       if [[ $KEEP_GOING -eq 1 ]]; then continue; else break; fi
     fi
-    [[ $DRY_RUN -eq 1 ]] && { results+=("[DRY ] $t"); continue; }
+    if [[ $DRY_RUN -eq 1 ]]; then
+      sh_rel="$(resolve_sh "$tdir" || true)"
+      if [[ -n "$sh_rel" ]]; then
+        info "[演练] 将执行 $t/$sh_rel ${pkgs[*]}"
+      else
+        err "[演练] 目标 $t：无法确定发布脚本"
+      fi
+      results+=("[DRY ] $t"); continue
+    fi
 
     # ---- 第 3 步：执行发布 sh ----
     sh_rel="$(resolve_sh "$tdir" || true)"
     if [[ -z "$sh_rel" ]]; then
-      err "目标 $t：找不到发布脚本（没有 $DEPLOY_SH，且目录里 *.sh 不唯一/不存在），不执行"
+      local shlist="" sf
+      for sf in "$tdir"/*.sh; do shlist+="$(basename "$sf") "; done
+      err "目标 $t：无法确定发布脚本（目录里的 .sh 不唯一：${shlist:-（无）}）。在 targets/$t/.deploy-script 里写一行脚本名，或运行时用 DEPLOY_SH=脚本名 指定"
       results+=("[FAIL] $t：找不到发布 sh（包已发布，请补脚本后单独执行）")
       FAILED=1
       if [[ $KEEP_GOING -eq 1 ]]; then continue; else break; fi
@@ -404,7 +546,7 @@ do_deploy() {
   if [[ $DRY_RUN -eq 1 ]]; then
     info "（演练结束，未改动任何文件）"
   elif [[ $FAILED -eq 0 ]]; then
-    ok "全部目标发布成功。source/ 里的包没有删除，确认稳定后可自行清理；旧备份按需保留。"
+    ok "全部目标发布成功。sources/ 里的包没有删除，确认稳定后可自行清理；旧备份按需保留。"
   else
     err "有目标失败或被回滚，详见上方日志。"
   fi

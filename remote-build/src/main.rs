@@ -44,7 +44,9 @@ fn main() -> eframe::Result<()> {
     let mut wgpu_setup = egui_wgpu::WgpuSetupCreateNew::without_display_handle();
     wgpu_setup.instance_descriptor.backends = egui_wgpu::wgpu::Backends::DX12;
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([1280.0, 800.0]),
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1280.0, 800.0])
+            .with_icon(app_icon()),
         wgpu_options: egui_wgpu::WgpuConfiguration {
             wgpu_setup: egui_wgpu::WgpuSetup::CreateNew(wgpu_setup),
             ..Default::default()
@@ -57,6 +59,69 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(move |cc| Ok(Box::new(app::RemoteBuildApp::new(cc, runtime.clone())))),
     )
+}
+
+/// 64×64 应用图标：蓝底圆角方块 + 白色字母 R，运行时生成，免二进制资源文件。
+/// 窗口标题栏 / Windows 任务栏共用这一个图标。
+fn app_icon() -> egui::IconData {
+    const S: usize = 64;
+    let mut rgba = vec![0u8; S * S * 4];
+
+    // 5×7 点阵字母 R（1 = 填充），8 倍放大居中
+    const GLYPH_R: [[u8; 5]; 7] = [
+        [0, 1, 1, 1, 0],
+        [1, 0, 0, 0, 1],
+        [1, 0, 0, 0, 1],
+        [1, 1, 1, 1, 0],
+        [1, 0, 1, 0, 0],
+        [1, 0, 0, 1, 0],
+        [1, 0, 0, 0, 1],
+    ];
+    let cell = 8usize;
+    let (w, h) = (5 * cell, 7 * cell);
+    let (x0, y0) = ((S - w) / 2, (S - h) / 2);
+
+    for y in 0..S {
+        for x in 0..S {
+            // 圆角方块的带符号距离（内部为负），留 1px 抗锯齿过渡
+            let (px, py) = (
+                x as f32 + 0.5 - S as f32 / 2.0,
+                y as f32 + 0.5 - S as f32 / 2.0,
+            );
+            let (half, r) = (30.0f32, 12.0f32);
+            let qx = px.abs() - (half - r);
+            let qy = py.abs() - (half - r);
+            let d = qx.max(0.0).hypot(qy.max(0.0)) + qx.max(qy).min(0.0) - r;
+            let cover = (0.5 - d).clamp(0.0, 1.0);
+            if cover <= 0.0 {
+                continue;
+            }
+            // 顶部亮蓝 → 底部深蓝的纵向渐变
+            let t = y as f32 / (S - 1) as f32;
+            let lerp = |a: f32, b: f32| (a + (b - a) * t).round() as u8;
+            let (mut cr, mut cg, mut cb) = (
+                lerp(74.0, 29.0),
+                lerp(144.0, 78.0),
+                lerp(245.0, 216.0),
+            );
+            let in_r = (x0..x0 + w).contains(&x)
+                && (y0..y0 + h).contains(&y)
+                && GLYPH_R[(y - y0) / cell][(x - x0) / cell] == 1;
+            if in_r {
+                (cr, cg, cb) = (255, 255, 255);
+            }
+            let i = (y * S + x) * 4;
+            rgba[i] = cr;
+            rgba[i + 1] = cg;
+            rgba[i + 2] = cb;
+            rgba[i + 3] = (cover * 255.0) as u8;
+        }
+    }
+    egui::IconData {
+        width: S as u32,
+        height: S as u32,
+        rgba,
+    }
 }
 
 /// CLI 子命令在 GBK 代码页的终端里输出 UTF-8 会乱码，切换为 UTF-8（仅当前进程）

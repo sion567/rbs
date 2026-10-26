@@ -1,13 +1,16 @@
 //! 左侧项目/作业树（设计文档 §9.1）。
 //!
-//! 右键菜单：项目 = 添加分组 / 改名 / 删除；分组 = 添加任务 / 删除（组成员一并删，
-//! 有确认提示）；流程 = 运行 / 更新代码 / 移动到分组 / 改名 / 删除。
+//! 右键菜单：项目 = 打开项目目录 / 添加分组 / 改名 / 删除；分组 = 添加任务 /
+//! 删除（组成员一并删，有确认提示）；流程 = 运行 / 更新代码 / 移动到分组 /
+//! 改名 / 删除。
 //! 分组与流程支持拖拽排序（顺序写入 project.yaml 的 groups / jobs 列表）。
 //! 删除走确认弹窗（避免误删），改名走输入弹窗；两者都带遮罩。
 
 use crate::app::MainState;
 use eframe::egui;
 use egui::Color32;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 
 /// 右键菜单待确认的删除目标（下标为 main.projects 的索引；分组用名字定位）
 #[derive(Debug, Clone, PartialEq)]
@@ -213,8 +216,25 @@ pub fn show(main: &mut MainState, ui: &mut egui::Ui) {
                 }
             }
 
-            // 项目头右键菜单：添加分组 / 改名 / 删除
+            // 项目头右键菜单：打开目录 / 添加分组 / 改名 / 删除
             body.header_response.context_menu(|ui| {
+                let dir = main.projects[pi].dir.display().to_string();
+                if ui.button("📂 打开项目目录").clicked() {
+                    if let Err(e) = open_in_explorer(std::path::Path::new(&dir)) {
+                        main.status_msg = Some(e);
+                    }
+                    ui.close();
+                }
+                // 本地目录模式：源码在别处，给个直达入口（与项目目录相同时不重复显示）
+                let local = main.projects[pi].project.local_path.trim().to_string();
+                if !local.is_empty() && local != dir
+                    && ui.button("📂 打开源码目录").clicked()
+                {
+                    if let Err(e) = open_in_explorer(std::path::Path::new(&local)) {
+                        main.status_msg = Some(e);
+                    }
+                    ui.close();
+                }
                 if ui.button("📂 添加分组").clicked() {
                     add_group(main, pi);
                     ui.close();
@@ -356,12 +376,16 @@ fn confirm_delete_window(ctx: &egui::Context, main: &mut MainState) {
                     let Some(entry) = main.projects.get(*pi) else { return; };
                     ui.colored_label(
                         Color32::from_rgb(230, 120, 90),
-                        format!("删除项目「{}」？", entry.project.name),
+                        format!("删除项目「{}」的配置？", entry.project.name),
                     );
-                    ui.weak(format!("将删除整个目录：{}", entry.dir.display()));
+                    ui.weak(format!("项目目录：{}", entry.dir.display()));
                     ui.weak(
-                        "Git 模式克隆的项目代码也在其中；本地目录模式只删配置，源码目录不受影响。",
+                        "只删除其中的配置文件（project.yaml、各流程 yaml）；目录本身与其余文件（代码、构建产物）全部保留。",
                     );
+                    let local = entry.project.local_path.trim();
+                    if !local.is_empty() && local != entry.dir.display().to_string() {
+                        ui.weak(format!("源码目录（不受影响）：{local}"));
+                    }
                 }
                 TreeDeleteTarget::Job(pi, ji) => {
                     let Some(je) = main.projects.get(*pi).and_then(|p| p.jobs.get(*ji)) else {
@@ -857,21 +881,76 @@ fn move_job_to_group(main: &mut MainState, pi: usize, ji: usize, group: Option<S
     ));
 }
 
+/// 用系统文件管理器打开目录（Windows explorer / macOS open / Linux xdg-open）。
+/// explorer 成功时退出码也非 0，只看能否启动、不校验退出码。
+fn open_in_explorer(path: &std::path::Path) -> Result<(), String> {
+    if !path.exists() {
+        return Err(format!("⚠ 目录不存在: {}", path.display()));
+    }
+    #[cfg(windows)]
+    {
+        std::process::Command::new("explorer")
+            .arg(path)
+            .creation_flags(0x0800_0000) // 不闪控制台窗口
+            .spawn()
+            .map_err(|e| format!("⚠ 打开目录失败: {e}"))?;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(path)
+            .spawn()
+            .map_err(|e| format!("⚠ 打开目录失败: {e}"))?;
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(path)
+            .spawn()
+            .map_err(|e| format!("⚠ 打开目录失败: {e}"))?;
+    }
+    Ok(())
+}
+
+/// 删除项目：只删配置（project.yaml + 各流程 yaml + 残留 .yaml.tmp），
+/// 目录本身与其余文件（克隆的代码、源码、构建产物）一律保留；
+/// 删完后目录若已为空（纯配置项目）则顺手移除空目录。
 fn delete_project(main: &mut MainState, pi: usize) {
     if busy_guard(main) {
         return;
     }
-    let Some((dir, name)) = main.projects.get(pi).map(|e| (e.dir.clone(), e.project.name.clone()))
-    else {
-        return;
-    };
-    match std::fs::remove_dir_all(&dir) {
-        Ok(()) => {
-            main.reload();
-            main.status_msg = Some(format!("项目「{name}」已删除 🗑"));
+    let Some(entry) = main.projects.get(pi) else { return };
+    let (dir, name) = (entry.dir.clone(), entry.project.name.clone());
+    let mut files: Vec<std::path::PathBuf> = vec![dir.join("project.yaml")];
+    files.extend(entry.jobs.iter().map(|je| je.path.clone()));
+    // save_yaml 原子写中途崩溃会留下 *.yaml.tmp，一并清理
+    if let Ok(rd) = std::fs::read_dir(&dir) {
+        for p in rd.flatten().map(|e| e.path()) {
+            if p.file_name().map(|n| n.to_string_lossy().ends_with(".yaml.tmp")) == Some(true) {
+                files.push(p);
+            }
         }
-        Err(e) => main.status_msg = Some(format!("删除失败: {e}")),
     }
+    let mut failed = Vec::new();
+    for f in &files {
+        if f.exists() {
+            if let Err(e) = std::fs::remove_file(f) {
+                failed.push(format!("{}: {e}", f.display()));
+            }
+        }
+    }
+    if !failed.is_empty() {
+        main.status_msg = Some(format!("删除失败: {}", failed.join("；")));
+        return;
+    }
+    let empty = std::fs::read_dir(&dir)
+        .map(|mut it| it.next().is_none())
+        .unwrap_or(false);
+    if empty {
+        let _ = std::fs::remove_dir(&dir);
+    }
+    main.reload();
+    main.status_msg = Some(format!("项目「{name}」配置已删除 🗑（目录及其余文件保留）"));
 }
 
 fn delete_job(main: &mut MainState, pi: usize, ji: usize) {
