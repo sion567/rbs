@@ -7,42 +7,42 @@
 //! 开关：config.yaml `save_history`（默认开）；保留期复用 `log_retention_days`
 //!（按 runs.started_at 清理，step_runs 经外键级联）。
 //! 入库点：GUI / CLI 的事件转发任务——所有 LogEvent 都过那里，天然是录制点。
+//!
+//! 存储：rusqlite（同步 API）+ bundled SQLite（源码编进 exe，用户机器零依赖）。
+//! 对外保持 async 签名（调用侧是 tokio 任务），内部 spawn_blocking 落库——
+//! 单条写入微秒级，不打扰事件循环；连接不共享（每次 open 独立 + WAL +
+//! busy_timeout），录制的 Connection 走 Arc<Mutex> 供阻塞线程安全取用。
 
 use crate::models::{JobStatus, LogEvent};
 use chrono::Utc;
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
-use std::str::FromStr as _;
+use rusqlite::Connection;
+use std::sync::{Arc, Mutex};
 
 /// history.db 路径（~/.remote-build/data/history.db）
 pub fn db_path() -> std::path::PathBuf {
     crate::config::app_root().join("data").join("history.db")
 }
 
-/// 打开（不存在则创建）连接池 + 建表。每次运行调用一次（SQLite 本地文件，开销毫秒级）。
-pub async fn open() -> anyhow::Result<SqlitePool> {
+/// 打开（不存在则创建）连接 + WAL/外键/忙等 + 建表。同步函数，
+/// 调用方负责放进 spawn_blocking；连接用完显式 close（WAL 句柄不滞留）。
+fn open() -> anyhow::Result<Connection> {
     let path = db_path();
-    let dir = path.parent().expect("data dir");
-    std::fs::create_dir_all(dir)?;
-    let url = format!("sqlite://{}", path.display());
-    let opts = SqliteConnectOptions::from_str(&url)?
-        .create_if_missing(true)
-        .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
-        .foreign_keys(true);
-    let pool = SqlitePoolOptions::new().max_connections(2).connect_with(opts).await?;
-    migrate(&pool).await?;
-    Ok(pool)
+    std::fs::create_dir_all(path.parent().expect("data dir"))?;
+    let conn = Connection::open(&path)?;
+    // busy_timeout：GUI 查询与运行录制偶发并发，等锁而不是报 locked
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;")?;
+    migrate(&conn)?;
+    Ok(conn)
 }
 
 /// 轻量迁移：PRAGMA user_version 记录 schema 版本，逐版本向前滚。
 /// v0（空库）→ v1：初始两张表。此后加字段/加表都在这里追加 `if ver < N` 分支，
 /// 不要改旧分支——老库按版本逐级升级，新库一次到位。
-async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
-    let ver: i64 = sqlx::query_scalar("PRAGMA user_version")
-        .fetch_one(pool)
-        .await
-        .unwrap_or(0);
+fn migrate(conn: &Connection) -> anyhow::Result<()> {
+    let ver: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap_or(0);
     if ver < 1 {
-        sqlx::query(
+        conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS runs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 run_id TEXT NOT NULL UNIQUE,
@@ -56,12 +56,8 @@ async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
                 duration_ms INTEGER,
                 log_path TEXT,
                 config_snapshot TEXT NOT NULL
-            )",
-        )
-        .execute(pool)
-        .await?;
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS step_runs (
+            );
+            CREATE TABLE IF NOT EXISTS step_runs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 run_id INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
                 step_index INTEGER NOT NULL,
@@ -72,11 +68,9 @@ async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
                 started_at TEXT NOT NULL,
                 finished_at TEXT,
                 UNIQUE(run_id, step_index)
-            )",
-        )
-        .execute(pool)
-        .await?;
-        sqlx::query("PRAGMA user_version = 1").execute(pool).await?;
+            );
+            PRAGMA user_version = 1;",
+        )?;
     }
     Ok(())
 }
@@ -108,10 +102,17 @@ pub struct RunMeta {
     pub log_path: Option<String>,
 }
 
+/// on_event 提取出的落库动作（owned：可跨线程进 spawn_blocking）
+enum Write {
+    StepStart { step_index: i64, name: String, status: &'static str },
+    StepEnd { step_index: i64, exit_code: i64, duration_ms: i64 },
+    JobEnd { status: &'static str, duration_ms: i64 },
+}
+
 /// 运行录制器：插 runs 行（running）→ 事件流更新 step_runs / runs → JobEnd 收尾。
 /// 每个方法独立容错（库满/锁失败不阻塞运行本身，只 eprintln）。
 pub struct RunRecorder {
-    pool: SqlitePool,
+    conn: Arc<Mutex<Connection>>,
     row_id: i64,
     /// 主流程步骤数：只录主流程的 step 事件（handlers / preflight 的 index 超界跳过）
     steps_len: usize,
@@ -121,47 +122,76 @@ pub struct RunRecorder {
 impl RunRecorder {
     /// 插入 running 行；失败返回 None（调用方无录制器照常运行）
     pub async fn start(meta: &RunMeta, snapshot_yaml: &str, steps_len: usize) -> Option<Self> {
-        let pool = match open().await {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("[history] 打开库失败（历史不记录）: {e:#}");
-                return None;
-            }
-        };
-        let row_id = sqlx::query_scalar::<_, i64>(
-            "INSERT INTO runs
-                (run_id, project_name, job_name, target, trigger_type, status, started_at,
-                 log_path, config_snapshot)
-             VALUES (?1, ?2, ?3, ?4, ?5, 'running', ?6, ?7, ?8)
-             RETURNING id",
-        )
-        .bind(&meta.run_id)
-        .bind(&meta.project)
-        .bind(&meta.job)
-        .bind(&meta.target)
-        .bind(meta.trigger)
-        .bind(now())
-        .bind(&meta.log_path)
-        .bind(snapshot_yaml)
-        .fetch_one(&pool)
+        let run_id = meta.run_id.clone();
+        let project = meta.project.clone();
+        let job = meta.job.clone();
+        let target = meta.target.clone();
+        let trigger = meta.trigger;
+        let log_path = meta.log_path.clone();
+        let snapshot = snapshot_yaml.to_string();
+        let opened = tokio::task::spawn_blocking(move || {
+            let conn = open()?;
+            let id: i64 = conn.query_row(
+                "INSERT INTO runs
+                    (run_id, project_name, job_name, target, trigger_type, status, started_at,
+                     log_path, config_snapshot)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'running', ?6, ?7, ?8)
+                 RETURNING id",
+                rusqlite::params![run_id, project, job, target, trigger, now(), log_path, snapshot],
+                |r| r.get(0),
+            )?;
+            Ok::<(Connection, i64), anyhow::Error>((conn, id))
+        })
         .await;
-        match row_id {
-            Ok(id) => Some(Self { pool, row_id: id, steps_len, started: std::time::Instant::now() }),
+        match opened {
+            Ok(Ok((conn, id))) => {
+                Some(Self { conn: Arc::new(Mutex::new(conn)), row_id: id, steps_len, started: std::time::Instant::now() })
+            }
+            Ok(Err(e)) => {
+                eprintln!("[history] 打开库/记录运行失败（历史不记录）: {e:#}");
+                None
+            }
             Err(e) => {
-                eprintln!("[history] 记录运行失败（历史不记录）: {e:#}");
+                eprintln!("[history] 录制任务失败（历史不记录）: {e}");
                 None
             }
         }
     }
 
     pub async fn on_event(&self, ev: &LogEvent) {
-        let res: anyhow::Result<()> = async {
-            match ev {
-                LogEvent::StepStart { step_index, name, skipped, .. }
-                    if *step_index < self.steps_len =>
-                {
-                    let status = if *skipped { "skipped" } else { "running" };
-                    sqlx::query(
+        // steps_len 过滤在提取时做：handlers / preflight 的 index 超界不入库
+        let write = match ev {
+            LogEvent::StepStart { step_index, name, skipped, .. }
+                if *step_index < self.steps_len =>
+            {
+                Write::StepStart {
+                    step_index: *step_index as i64,
+                    name: name.clone(),
+                    status: if *skipped { "skipped" } else { "running" },
+                }
+            }
+            LogEvent::StepEnd { step_index, exit_code, duration_ms, .. }
+                if *step_index < self.steps_len =>
+            {
+                Write::StepEnd {
+                    step_index: *step_index as i64,
+                    exit_code: *exit_code as i64,
+                    duration_ms: *duration_ms as i64,
+                }
+            }
+            LogEvent::JobEnd { status, .. } => Write::JobEnd {
+                status: status_key(status),
+                duration_ms: self.started.elapsed().as_millis() as i64,
+            },
+            _ => return,
+        };
+        let conn = Arc::clone(&self.conn);
+        let row_id = self.row_id;
+        let res = tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().map_err(|_| anyhow::anyhow!("连接锁中毒"))?;
+            match write {
+                Write::StepStart { step_index, name, status } => {
+                    conn.execute(
                         "INSERT INTO step_runs
                             (run_id, step_index, step_name, status, started_at)
                          VALUES (?1, ?2, ?3, ?4, ?5)
@@ -169,132 +199,116 @@ impl RunRecorder {
                             step_name = excluded.step_name,
                             status = excluded.status,
                             started_at = excluded.started_at",
-                    )
-                    .bind(self.row_id)
-                    .bind(*step_index as i64)
-                    .bind(name)
-                    .bind(status)
-                    .bind(now())
-                    .execute(&self.pool)
-                    .await?;
+                        rusqlite::params![row_id, step_index, name, status, now()],
+                    )?;
                 }
-                LogEvent::StepEnd { step_index, exit_code, duration_ms, .. }
-                    if *step_index < self.steps_len =>
-                {
-                    let status = if *exit_code == 0 { "success" } else { "failed" };
-                    sqlx::query(
+                Write::StepEnd { step_index, exit_code, duration_ms } => {
+                    conn.execute(
                         "UPDATE step_runs
                          SET status = ?3, exit_code = ?4, duration_ms = ?5, finished_at = ?6
                          WHERE run_id = ?1 AND step_index = ?2",
-                    )
-                    .bind(self.row_id)
-                    .bind(*step_index as i64)
-                    .bind(status)
-                    .bind(*exit_code as i64)
-                    .bind(*duration_ms as i64)
-                    .bind(now())
-                    .execute(&self.pool)
-                    .await?;
+                        rusqlite::params![
+                            row_id,
+                            step_index,
+                            if exit_code == 0 { "success" } else { "failed" },
+                            exit_code,
+                            duration_ms,
+                            now()
+                        ],
+                    )?;
                 }
-                LogEvent::JobEnd { status, .. } => {
-                    let duration = self.started.elapsed().as_millis() as i64;
-                    sqlx::query(
+                Write::JobEnd { status, duration_ms } => {
+                    conn.execute(
                         "UPDATE runs
                          SET status = ?2, finished_at = ?3, duration_ms = ?4
                          WHERE id = ?1",
-                    )
-                    .bind(self.row_id)
-                    .bind(status_key(status))
-                    .bind(now())
-                    .bind(duration)
-                    .execute(&self.pool)
-                    .await?;
+                        rusqlite::params![row_id, status, now(), duration_ms],
+                    )?;
                 }
-                _ => {}
             }
-            Ok(())
-        }
+            Ok::<(), anyhow::Error>(())
+        })
         .await;
-        if let Err(e) = res {
-            eprintln!("[history] 更新历史失败: {e:#}");
+        match res {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => eprintln!("[history] 更新历史失败: {e:#}"),
+            Err(e) => eprintln!("[history] 录制任务失败: {e}"),
         }
     }
 
-    /// 收尾（JobEnd 后由事件循环自然走到；显式关池避免 WAL 文件句柄滞留）
+    /// 收尾（JobEnd 后由事件循环自然走到；显式关连接避免 WAL 文件句柄滞留）
     pub async fn close(self) {
-        self.pool.close().await;
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Ok(mutex) = Arc::try_unwrap(self.conn) {
+                if let Ok(conn) = mutex.into_inner() {
+                    let _ = conn.close();
+                }
+            }
+        })
+        .await;
     }
 }
 
 /// 最近运行列表（设置页「运行历史」展示用）
 pub async fn recent_runs(limit: u32) -> anyhow::Result<Vec<crate::storage::HistoryRow>> {
-    let pool = open().await?;
-    let rows = sqlx::query_as::<_, RawRow>(
-        "SELECT run_id, project_name, job_name, target, trigger_type, status,
-                started_at, duration_ms, log_path
-         FROM runs ORDER BY id DESC LIMIT ?1",
-    )
-    .bind(limit)
-    .fetch_all(&pool)
-    .await?;
-    pool.close().await;
-    Ok(rows
-        .into_iter()
-        .map(|r| crate::storage::HistoryRow {
-            run_id: r.run_id,
-            project: r.project_name,
-            job: r.job_name,
-            target: r.target,
-            trigger: r.trigger_type,
-            status: r.status,
-            started_at: r.started_at,
-            duration_ms: r.duration_ms,
-            log_path: r.log_path,
-        })
-        .collect())
-}
-
-/// sqlx 直接映射的原始行（对外的 HistoryRow 不依赖 sqlx 派生）
-#[derive(sqlx::FromRow)]
-struct RawRow {
-    run_id: String,
-    project_name: String,
-    job_name: String,
-    target: Option<String>,
-    trigger_type: String,
-    status: String,
-    started_at: String,
-    duration_ms: Option<i64>,
-    log_path: Option<String>,
+    tokio::task::spawn_blocking(move || {
+        let conn = open()?;
+        // stmt 借用 conn：查询在块内完成（stmt drop）后再 close
+        let rows = {
+            let mut stmt = conn.prepare(
+                "SELECT run_id, project_name, job_name, target, trigger_type, status,
+                        started_at, duration_ms, log_path
+                 FROM runs ORDER BY id DESC LIMIT ?1",
+            )?;
+            let mapped = stmt.query_map(rusqlite::params![limit], |r| {
+                Ok(crate::storage::HistoryRow {
+                    run_id: r.get(0)?,
+                    project: r.get(1)?,
+                    job: r.get(2)?,
+                    target: r.get(3)?,
+                    trigger: r.get(4)?,
+                    status: r.get(5)?,
+                    started_at: r.get(6)?,
+                    duration_ms: r.get(7)?,
+                    log_path: r.get(8)?,
+                })
+            })?;
+            mapped.collect::<Result<Vec<_>, _>>()?
+        };
+        let _ = conn.close();
+        Ok(rows)
+    })
+    .await?
 }
 
 /// 保留期清理（启动时调用）：删 started_at 早于 N 天前的 runs（step_runs 级联）；
 /// 顺带把超过 24h 仍 running 的行标记 cancelled（进程被杀 / 断电留下的残行）
 pub async fn prune_old(days: u32) -> anyhow::Result<u64> {
-    let pool = open().await?;
-    let cutoff = (Utc::now() - chrono::Duration::days(days as i64)).to_rfc3339();
-    let res = sqlx::query("DELETE FROM runs WHERE started_at < ?1")
-        .bind(&cutoff)
-        .execute(&pool)
-        .await?;
-    let stale_cutoff = (Utc::now() - chrono::Duration::hours(24)).to_rfc3339();
-    sqlx::query(
-        "UPDATE runs SET status = 'cancelled', finished_at = ?1
-         WHERE status = 'running' AND started_at < ?1",
-    )
-    .bind(&stale_cutoff)
-    .execute(&pool)
-    .await?;
-    pool.close().await;
-    Ok(res.rows_affected())
+    tokio::task::spawn_blocking(move || {
+        let conn = open()?;
+        let cutoff = (Utc::now() - chrono::Duration::days(days as i64)).to_rfc3339();
+        let n = conn.execute("DELETE FROM runs WHERE started_at < ?1", [&cutoff])? as u64;
+        let stale_cutoff = (Utc::now() - chrono::Duration::hours(24)).to_rfc3339();
+        conn.execute(
+            "UPDATE runs SET status = 'cancelled', finished_at = ?1
+             WHERE status = 'running' AND started_at < ?1",
+            [&stale_cutoff],
+        )?;
+        let _ = conn.close();
+        Ok(n)
+    })
+    .await?
 }
 
 /// 清空全部历史
 pub async fn clear_all() -> anyhow::Result<()> {
-    let pool = open().await?;
-    sqlx::query("DELETE FROM runs").execute(&pool).await?;
-    pool.close().await;
-    Ok(())
+    tokio::task::spawn_blocking(move || {
+        let conn = open()?;
+        conn.execute("DELETE FROM runs", [])?;
+        let _ = conn.close();
+        Ok(())
+    })
+    .await?
 }
 
 #[cfg(test)]

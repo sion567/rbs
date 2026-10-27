@@ -111,6 +111,7 @@ pub async fn run_group_serial(spec: GroupSpec, sink: &dyn GroupSink) -> GroupOut
 
         let run_id = format!("{}-{:02}", spec.group_id, i + 1);
         let snapshot = yaml_serde::to_string(&gj.job).unwrap_or_default();
+        #[cfg(feature = "sqlite")]
         let meta = crate::storage::sqlite::RunMeta {
             run_id: run_id.clone(),
             project: spec.project.name.clone(),

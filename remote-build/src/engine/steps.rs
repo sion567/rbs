@@ -106,8 +106,9 @@ pub(crate) async fn pack_step(
     };
     let src = resolve(src_part.trim());
     let dst = resolve(dst_str);
-    if !dst.to_string_lossy().to_ascii_lowercase().ends_with(".zip") {
-        anyhow::bail!("pack 目标必须是 .zip 文件: {}", dst.display());
+    // 格式由扩展名决定（.zip / .tar.gz / .tgz），pack() 内部按同一判定分派写入器
+    if crate::pack::dst_format(&dst).is_none() {
+        anyhow::bail!("pack 目标必须是 .zip / .tar.gz / .tgz 文件: {}", dst.display());
     }
 
     log.line(

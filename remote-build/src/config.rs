@@ -335,18 +335,23 @@ pub fn create_example_project() -> Result<()> {
     };
     crate::storage::files::save_yaml(&dir.join("project.yaml"), &project)?;
 
-    // ── ① Git 合集：变量 / 默认值 / creates / 条件 / 未启用 / outputs / 重试 ──
+    // ── ① Git 合集：变量 / 默认值 / ${VAR} / creates / 条件 / 未启用 / outputs / .env / 重试 ──
     let git_job = Job {
         name: "① Git 合集".to_string(),
         project: "example".to_string(),
         description: Some(
-            "演示：变量拼 URL、|| 默认值、creates 重跑秒过、when 条件、未启用步骤、\n\
-             outputs 捕获 → ${{ env.* }} 传递、步骤超时与重试"
+            "演示：变量拼 URL、|| 默认值、${VAR} 系统变量兜底、creates 重跑秒过、\n\
+             when 条件、未启用步骤、outputs 捕获 → ${{ env.* }} 传递、\n\
+             workspace/.env 产出约定、now 时间戳、步骤超时与重试"
                 .to_string(),
         ),
         target: Some("local".to_string()),
         environment: Some("staging".to_string()),
         steps: vec![
+            demo_step(
+                "发版机环境速览（${VAR} 写法：变量表查不到时兜底系统环境变量）",
+                "echo 当前用户 = ${USERNAME}",
+            ),
             Step {
                 creates: Some("demo/.git".to_string()),
                 ..demo_step(
@@ -371,8 +376,8 @@ pub fn create_example_project() -> Result<()> {
                 working_dir: Some("demo".to_string()),
                 continue_on_error: true,
                 ..demo_step(
-                    "提交改动（continue_on_error：失败只黄灯不拦后续）",
-                    "git add -A && git commit -m demo",
+                    "提交改动（continue_on_error：失败只黄灯不拦后续；${{ now.iso }} 人读时间戳）",
+                    "git add -A && git commit -m \"demo @ ${{ now.iso }}\"",
                 )
             },
             Step {
@@ -382,6 +387,18 @@ pub fn create_example_project() -> Result<()> {
                 ..demo_step("生成版本号（outputs：正则捕获 stdout）", "cmd /C echo TAG=v1.0.1")
             },
             demo_step("引用上一步捕获的变量", "echo 本次版本 = ${{ env.TAG }}"),
+            demo_step(
+                "产出变量写法二：workspace/.env 约定（KEY=VALUE 行，步骤成功后引擎自动捕获）",
+                "cmd /C echo CHANNEL=nightly 1> .env",
+            ),
+            demo_step(
+                "读取 .env 产出（与 outputs 同一命名空间，均用 ${{ env.* }} 引用）",
+                "echo 渠道 = ${{ env.CHANNEL }}",
+            ),
+            demo_step(
+                "清理演示用 .env（残留会并入本项目后续所有运行的变量表）",
+                "cmd /C if exist .env del .env",
+            ),
             Step {
                 timeout: Some(60),
                 retry: Some(RetryConfig { max_attempts: 3, backoff_seconds: 5 }),
@@ -396,13 +413,15 @@ pub fn create_example_project() -> Result<()> {
         ..Default::default()
     };
 
-    // ── ② 构建合集：前置检查 / 大超时 / creates / 步骤 env / pack / handlers ──
+    // ── ② 构建合集：前置检查 / 工具绑定 / 大超时 / creates / 步骤 env / pack / handlers / 整体重试 ──
     let build_job = Job {
         name: "② 构建合集".to_string(),
         project: "example".to_string(),
         description: Some(
-            "演示：前置检查、大步骤超时、creates 守卫、条件路线选择、步骤 env、\n\
-             pack 打包（--exclude）、notify → handlers（变更才收尾）"
+            "演示：前置检查、工具绑定（tool 字段）、大步骤超时、creates 守卫、\n\
+             条件路线选择、步骤 env（值也走变量替换）、outputs 捕获、\n\
+             pack 打包（--exclude）、notify → handlers（变更才收尾）、\n\
+             on_failure: retry 作业级整体重跑（配合 creates 只补失败部分）"
                 .to_string(),
         ),
         target: Some("local".to_string()),
@@ -411,7 +430,18 @@ pub fn create_example_project() -> Result<()> {
             check: "java -version".to_string(),
             message: "本机未找到 java（工具版本门禁见 project.yaml 的 tools_require）".to_string(),
         }],
+        // 作业级重试（§13.2）：失败从头重跑整个流程；上面 creates 守卫保证
+        // 已完成的步骤（依赖已装、产物已在）重跑秒过，实际只补失败的部分
+        on_failure: FailureAction::Retry,
+        retry: Some(RetryConfig { max_attempts: 2, backoff_seconds: 30 }),
         steps: vec![
+            Step {
+                tool: "java".to_string(),
+                ..demo_step(
+                    "工具绑定（tool: java → 注入 tools.yaml 里该工具的 env；命令里的裸名优先解析到工具路径）",
+                    "java -version",
+                )
+            },
             Step {
                 timeout: Some(1800),
                 creates: Some("target/*.jar".to_string()),
@@ -441,10 +471,16 @@ pub fn create_example_project() -> Result<()> {
                 ..demo_step("前端构建", "pnpm build")
             },
             Step {
-                env: [("BUILD_MODE".to_string(), "release".to_string())]
-                    .into_iter()
-                    .collect(),
-                ..demo_step("步骤环境变量（步骤 env 注入）", "echo 构建模式 = %BUILD_MODE%")
+                env: [
+                    ("BUILD_MODE".to_string(), "release".to_string()),
+                    ("BUILD_TAG".to_string(), "demo-${{ now.date }}".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+                ..demo_step(
+                    "步骤环境变量（步骤 env 注入；值同样走 ${{ ... }} 变量替换）",
+                    "echo 构建模式 = %BUILD_MODE%，标签 = %BUILD_TAG%",
+                )
             },
             Step {
                 outputs: [("JAR".to_string(), r"JAR=(\S+\.jar)".to_string())]
@@ -472,20 +508,28 @@ pub fn create_example_project() -> Result<()> {
         ..Default::default()
     };
 
-    // ── ③ Linux 远端合集：远端命令 / 上传下载 / wait 三模式 / 危险命令提醒 ──
+    // ── ③ Linux 远端合集：远端命令 / 上传下载 / wait 三模式 / 步骤级目标 / 长任务配方 / 危险命令 ──
     let linux_job = Job {
         name: "③ Linux 远端合集".to_string(),
         project: "example".to_string(),
         description: Some(
-            "演示：远端命令、targets.* 变量、upload（未变更自动跳过）、pack 后上传、\n\
-             wait 三种探测（tcp / http / command）、download、危险命令 ⚠ 提醒。\n\
-             demo-server 是占位目标（192.0.2.10）：先在 🎯 目标管理 里改成真实机器"
+            "演示：远端命令、targets.* 变量、步骤级 target 切回本地（混合流程）、\n\
+             引擎侧 now 与服务器 $(date) 两种时间戳、upload（未变更自动跳过）、\n\
+             pack 双格式（目标扩展名决定：.zip / .tar.gz，tar 保留可执行权限；\n\
+             源以 /. 结尾 = tar -C 语义，条目无目录根）、\n\
+             wait 三种探测（tcp / http / command）、长任务 fire-and-poll\n\
+             （nohup 起飞 + fail_exit_code 轮询，见 docs/长任务配方.md）、download、危险命令 ⚠ 提醒。\n\
+             demo-server 是占位目标（192.0.2.10）：先在 🎯 目标管理里改成真实机器"
                 .to_string(),
         ),
         target: Some("demo-server".to_string()),
         environment: Some("staging".to_string()),
         steps: vec![
             demo_step("远端系统信息", "uname -sr && nproc && free -h"),
+            demo_step(
+                "目标字段速览（targets.* 直接引用目标配置的 host / port / user）",
+                "echo ssh -p ${{ targets.demo-server.port }} ${{ targets.demo-server.user }}@${{ targets.demo-server.host }}",
+            ),
             demo_step(
                 "磁盘与发布目录准备（targets.* 变量取目标字段）",
                 "df -h / && mkdir -p ${{ targets.demo-server.work_root }}/release",
@@ -494,6 +538,17 @@ pub fn create_example_project() -> Result<()> {
                 "命令里用变量（staging 环境）",
                 "echo 发布到 ${{ variables.NAMESPACE }} 的 ${{ variables.APP_NAME }}",
             ),
+            demo_step(
+                "两种时间戳（${{ now }} 引擎侧、整次运行同值；$(date) 远端 shell 现算）",
+                "echo run=${{ now }} server=$(date '+%F %T')",
+            ),
+            Step {
+                target: Some("local".to_string()),
+                ..demo_step(
+                    "本步切回发版机本地（步骤级 target 覆盖流程目标——混合流程的关键）",
+                    "cmd /C if exist upload (dir /B upload) else echo upload 目录尚未生成（后面的本地 pack 步骤会创建）",
+                )
+            },
             Step {
                 step_type: StepType::Upload,
                 ..demo_step(
@@ -518,6 +573,43 @@ pub fn create_example_project() -> Result<()> {
             demo_step(
                 "远端解压",
                 "cd ${{ targets.demo-server.work_root }}/release && unzip -o src-*.zip -d src",
+            ),
+            // 同一目录再走一遍 tar.gz：格式由 pack 目标扩展名决定，
+            // tar 保留可执行权限（Windows 打 zip 到 Linux 解压会丢 +x）
+            Step {
+                step_type: StepType::Pack,
+                ..demo_step(
+                    "打包为 tar.gz（目标扩展名决定格式；tar 保留可执行权限）",
+                    "src -> upload/src.tar.gz --exclude node_modules",
+                )
+            },
+            Step {
+                step_type: StepType::Upload,
+                ..demo_step(
+                    "上传 tar.gz（格式语义同 zip：包里是 src/… 目录根）",
+                    "upload/src.tar.gz -> release/src-${{ now.date }}.tar.gz",
+                )
+            },
+            demo_step(
+                "远端解压 tar.gz（解出的 .sh / 二进制自带 +x，可直接执行）",
+                "cd ${{ targets.demo-server.work_root }}/release && mkdir -p src-tgz && tar -xzf src-*.tar.gz -C src-tgz",
+            ),
+            // 源以 /. 结尾 = tar -C dir . 语义：条目不带目录根，
+            // 远端 tar -xzf -C 直接铺文件，不多套一层目录（zip / tar.gz 同一语义）
+            Step {
+                step_type: StepType::Pack,
+                ..demo_step(
+                    "打包目录内容（源以 /. 结尾 = tar -C 语义：条目无目录根）",
+                    "src/. -> upload/app.tar.gz --exclude node_modules",
+                )
+            },
+            Step {
+                step_type: StepType::Upload,
+                ..demo_step("上传（包顶层即文件，无 dist/ 嵌套）", "upload/app.tar.gz -> release/app-${{ now.date }}.tar.gz")
+            },
+            demo_step(
+                "远端解包（-C 直接铺进目录：/opt/app 即文件本体）",
+                "cd ${{ targets.demo-server.work_root }}/release && mkdir -p app && tar -xzf app-*.tar.gz -C app",
             ),
             Step {
                 step_type: StepType::Wait,
@@ -556,19 +648,38 @@ pub fn create_example_project() -> Result<()> {
                     "logs/app.log -> downloaded/app.log",
                 )
             },
+            // 长任务配方（fire-and-poll，详见 docs/长任务配方.md）：
+            // 远端脚本自维护 status 三态文件，SSH 只当遥控器，断了不连带
+            demo_step(
+                "起飞远端长任务（nohup 后台：SSH 断开 / 步骤超时杀 plink 都不连带任务）",
+                "nohup /opt/demo/scripts/backup.sh > /dev/null 2>&1 & echo started",
+            ),
+            Step {
+                step_type: StepType::Wait,
+                timeout: Some(7200),
+                wait: Some(WaitProbe {
+                    mode: WaitMode::Command,
+                    // 探测码约定：0=就绪 1=还在跑 2=任务已死（fail_exit_code 立即失败）
+                    target: r#"s=$(cat /opt/demo/backup/status 2>/dev/null || echo running); [ "$s" = success ] && exit 0; [ "$s" = failed ] && exit 2; exit 1"#.to_string(),
+                    interval_seconds: 30,
+                    fail_exit_code: Some(2),
+                }),
+                ..demo_step("轮询长任务状态（fail_exit_code: 2 → failed 立即失败，不烧完超时）", "")
+            },
             demo_step("危险命令演示（执行前与预览都会 ⚠ 提醒）", "rm -rf /tmp/demo-cache"),
         ],
         group: Some("远端发布".to_string()),
         ..Default::default()
     };
 
-    // ── ④ 发布合集：确认门 / 前置检查 / 备份 / 重试 / notify / 等待健康 ──
+    // ── ④ 发布合集：确认门 / 前置检查 / 备份 / 重试 / notify / 等待健康 / 台账 ──
     let deploy_job = Job {
         name: "④ 发布合集".to_string(),
         project: "example".to_string(),
         description: Some(
             "演示：人工确认门（运行前输入「发布」）、前置检查、作业级超时、\n\
-             now 时间戳备份、continue_on_error 容错、上传真变更才触发 handler 清理"
+             now 时间戳备份、!= 条件（非生产才跑的步骤）、continue_on_error 容错、\n\
+             上传真变更才触发 handler 清理、run.id 发布台账（与控制台日志同名可追溯）"
                 .to_string(),
         ),
         target: Some("demo-server".to_string()),
@@ -587,9 +698,16 @@ pub fn create_example_project() -> Result<()> {
         ],
         steps: vec![
             demo_step(
-                "备份当前版本（${{ now.full }} 做时间戳后缀）",
-                "cp -a /opt/demo/app.jar /opt/demo/backup/app-${{ now.full }}.jar",
+                "备份当前版本（${{ now }} 做时间戳后缀：紧凑无空格，适合文件名）",
+                "cp -a /opt/demo/app.jar /opt/demo/backup/app-${{ now }}.jar",
             ),
+            Step {
+                condition: Some("${{ variables.NAMESPACE }} != demo-prod".to_string()),
+                ..demo_step(
+                    "调试信息采集（!= 条件：本流程选了 prod 变量组 → 本步跳过不执行）",
+                    "curl -s http://127.0.0.1:8080/debug/stats -o /tmp/last-debug.json",
+                )
+            },
             Step {
                 continue_on_error: true,
                 ..demo_step(
@@ -622,6 +740,10 @@ pub fn create_example_project() -> Result<()> {
                 ..demo_step("等待健康检查通过（总限 2 分钟）", "")
             },
             demo_step("验证运行版本", "curl -s http://127.0.0.1:8080/version"),
+            demo_step(
+                "记录发布台账（run.id 与控制台日志同名，整次运行可追溯）",
+                "echo ${{ now.iso }} run=${{ run.id }} >> ${{ targets.demo-server.work_root }}/release.log",
+            ),
         ],
         handlers: vec![demo_step(
             "清理旧备份（只保留最近 5 份；仅上传真的传了新内容才执行）",

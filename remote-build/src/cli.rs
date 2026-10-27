@@ -3,6 +3,7 @@
 //! - `remote-build set-password <目标名> <密码>`  写入 Windows Credential Manager
 //! - `remote-build test-conn <目标名>`            SSH 连接测试
 //! - `remote-build run <项目名> <流程名>`         无头执行一条流程（控制台实时输出）
+//! - `remote-build regen-example`                 重新生成示范工程 example（当参考文档用）
 //!
 //! 便于脚本化与 CI 使用；GUI 功能与 CLI 共用同一套引擎/配置。
 
@@ -35,6 +36,10 @@ pub fn dispatch(args: &[String]) -> Option<()> {
             preview(args.get(1..).unwrap_or_default());
             Some(())
         }
+        Some("regen-example") => {
+            regen_example();
+            Some(())
+        }
         Some("help" | "--help" | "-h") => {
             print_help();
             Some(())
@@ -52,8 +57,23 @@ fn print_help() {
          remote-build run <项目名> <流程名> [--yes]    无头执行一条流程（--yes 跳过确认门）\n  \
          remote-build run-group <项目名> <组名> [--yes] [--from <流程名>]\n  \
          [...]                                         组运行：组内流程串行·失败即停（--from 从指定流程续跑）\n  \
-         remote-build preview <项目名> <流程名>        干跑预览（展示解析后的命令，不执行）"
+         remote-build preview <项目名> <流程名>        干跑预览（展示解析后的命令，不执行）\n  \
+         remote-build regen-example                   重新生成示范工程 example（覆盖四本合集 yaml）"
     );
+}
+
+/// 重新生成示范工程：与 ⚙ 设置里的按钮同一入口，升级 / 改造示例后刷新参考
+fn regen_example() {
+    match config::create_example_project() {
+        Ok(()) => println!(
+            "✅ 已重新生成示范工程: {}（git / build / linux / deploy 四本合集）",
+            config::projects_dir().join("example").display()
+        ),
+        Err(e) => {
+            eprintln!("❌ {e:#}");
+            std::process::exit(1);
+        }
+    }
 }
 
 fn set_password(args: &[String]) {
@@ -184,6 +204,7 @@ fn run(args: &[String]) {
         entry.project.name,
         chrono::Local::now().format("%Y%m%d-%H%M%S%3f")
     );
+    #[cfg(feature = "sqlite")]
     let history_meta = crate::storage::sqlite::RunMeta {
         run_id: run_id.clone(),
         project: entry.project.name.clone(),

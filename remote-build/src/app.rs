@@ -1333,6 +1333,7 @@ impl MainState {
         });
 
         // 转发任务：tokio mpsc → std mpsc（UI）+ 追加日志文件 + 运行历史入库（save_history 开）
+        #[cfg(feature = "sqlite")]
         let history_meta = crate::storage::sqlite::RunMeta {
             run_id: run_id.clone(),
             project: project.name.clone(),

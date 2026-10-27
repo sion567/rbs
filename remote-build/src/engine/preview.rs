@@ -46,6 +46,15 @@ pub struct StepPreview {
 /// 干跑预览：按真实执行路径解析每个步骤（变量替换、when 条件、creates 守卫、
 /// upload/pack 命令格式），但不执行。同步无副作用，可在 UI 线程直接调用。
 pub fn preview_job(input: &RunInput) -> Vec<StepPreview> {
+    // 预览没有真实运行号：给个占位值让 ${{ run.id }} 正常解析，
+    // 否则会被误报「未解析的变量占位符」（真实运行取与日志同名的 id）
+    let owned_input;
+    let input = if input.run_id.is_empty() {
+        owned_input = RunInput { run_id: "preview".to_string(), ..input.clone() };
+        &owned_input
+    } else {
+        input
+    };
     let ctx = build_var_context(input);
     let workspace = PathBuf::from(&input.project.local_path);
     let job_wd = resolve_job_working_dir(&input.job, &workspace, &ctx);
@@ -179,8 +188,19 @@ pub fn preview_job(input: &RunInput) -> Vec<StepPreview> {
             command = auto_corepack_wrap(&command);
         }
         if command.contains("${{") || command.contains("${") {
-            p.warnings
-                .push("命令仍含未解析的变量占位符（检查变量名拼写 / 变量组）".to_string());
+            // 残留的 ${{ ... }} 全是 env.* 形态 → 引用运行时产出（前序步骤
+            // outputs / workspace/.env 约定捕获），预览期本就无法解析：
+            // 如实说明而非误报「检查变量名拼写」
+            let unresolved = unresolved_exprs(&command);
+            if !unresolved.is_empty() && unresolved.iter().all(|e| e.starts_with("env.")) {
+                p.warnings.push(
+                    "引用 ${{ env.* }} 运行时产出（前序步骤 outputs / .env 捕获，执行时才解析）"
+                        .to_string(),
+                );
+            } else {
+                p.warnings
+                    .push("命令仍含未解析的变量占位符（检查变量名拼写 / 变量组）".to_string());
+            }
         }
         // 危险命令静态检查（§14）：预览 ⚠，防手滑（执行前引擎也会再提醒一次）
         if matches!(step.step_type, StepType::Exec | StepType::K8sApply) {
@@ -259,6 +279,8 @@ pub fn preview_job(input: &RunInput) -> Vec<StepPreview> {
             }
             StepType::Pack => match command.split_once("->") {
                 Some((s, d)) => {
+                    // dst 段可带 --exclude <模式>…：与 steps::pack_step 同一解析，先剥掉再判 .zip
+                    let dst_str = d.split("--exclude").next().unwrap_or("").trim();
                     let rp = |v: &str| {
                         let pp = std::path::Path::new(v.trim());
                         if pp.is_absolute() {
@@ -268,9 +290,9 @@ pub fn preview_job(input: &RunInput) -> Vec<StepPreview> {
                         }
                     };
                     let src = rp(s);
-                    let dst = rp(d);
-                    if !dst.to_string_lossy().to_ascii_lowercase().ends_with(".zip") {
-                        p.warnings.push("pack 目标必须是 .zip 文件".to_string());
+                    let dst = rp(dst_str);
+                    if crate::pack::dst_format(&dst).is_none() {
+                        p.warnings.push("pack 目标必须是 .zip / .tar.gz / .tgz 文件".to_string());
                     }
                     p.pack =
                         Some((src.to_string_lossy().to_string(), dst.to_string_lossy().to_string()));
@@ -283,6 +305,24 @@ pub fn preview_job(input: &RunInput) -> Vec<StepPreview> {
         }
 
         out.push(p);
+    }
+    out
+}
+
+/// 提取文本中残留（未被解析）的 `${{ 表达式 }}` 内部表达式，trim 后返回；
+/// 用于区分「运行时产出引用」与「变量名拼错」两类未解析占位符
+fn unresolved_exprs(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(i) = rest.find("${{") {
+        let after = &rest[i + 3..];
+        match after.find("}}") {
+            Some(j) => {
+                out.push(after[..j].trim().to_string());
+                rest = &after[j + 2..];
+            }
+            None => break,
+        }
     }
     out
 }

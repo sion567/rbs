@@ -1,22 +1,60 @@
-//! zip 打包（step_type: pack，设计文档 §5.8 v0.4 实施补充）。
+//! 打包（step_type: pack，设计文档 §5.8 v0.4 实施补充）。
 //!
-//! 上传大量小文件前先打成一个 zip，pscp 单文件传输显著更快。
-//! 引擎内置 Rust 实现（deflate），不依赖系统 zip / 7z。
+//! 上传大量小文件前先打成一个压缩包，pscp 单文件传输显著更快。
+//! 引擎内置 Rust 实现，不依赖系统 zip / tar。
+//!
+//! **格式由目标扩展名决定**：`.tar.gz` / `.tgz` → tar+gzip（Linux 惯用，
+//! 保留可执行权限）；`.zip` → zip（deflate）。其他扩展名拒绝。
+//!
+//! **源以 `/.` 结尾 = `tar -C dir .` 语义**：打目录内容，条目不带目录名根
+//! （`dist/. -> app.tar.gz` 解包 `-C /opt/app` 直接铺文件）；普通目录源
+//! 带目录名根（`dist -> app.tar.gz` 条目为 `dist/...`）。zip / tar.gz 同一语义。
 //!
 //! 源支持三种形态：
-//! - 目录：递归打包，条目带目录名根（如 `target/` → 条目 `target/classes/...`，同 zip -r 习惯）
+//! - 目录：递归打包，条目带目录名根（如 `target/` → 条目 `target/classes/...`，
+//!   同 `zip -r` / `tar -czf x.tgz target` 习惯）
 //! - 单文件：条目为文件名
 //! - 通配（如 `target/*.jar`）：仅匹配文件，条目为文件名
 
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
-/// 打包入口：返回 (文件数, zip 字节数)。
+/// 打包格式（由目标扩展名判定）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArchiveFormat {
+    Zip,
+    TarGz,
+}
+
+/// 按目标扩展名判定打包格式；不支持的扩展名返回 None（执行 / 预览据此报错）
+pub fn dst_format(dst: &Path) -> Option<ArchiveFormat> {
+    let lower = dst.to_string_lossy().to_ascii_lowercase();
+    if lower.ends_with(".tar.gz") || lower.ends_with(".tgz") {
+        Some(ArchiveFormat::TarGz)
+    } else if lower.ends_with(".zip") {
+        Some(ArchiveFormat::Zip)
+    } else {
+        None
+    }
+}
+
+/// 打包入口：返回 (文件数, 压缩包字节数)。
 /// 目标父目录自动创建；文件清单先收集完再写包，避免目标在源目录内时自吞。
 /// `excludes`（rsync --exclude 语义）：字面量 = 路径任一目录/文件名分量匹配即排除
 /// （如 `node_modules`）；含 `*` `?` = 对相对路径与文件名做通配匹配（如 `*.map`）。
 pub fn pack(src: &Path, dst: &Path, excludes: &[String]) -> Result<(usize, u64)> {
-    // 归一化 `.` 分量（workspace.join(".") 之类），避免 zip 条目出现 `dir/./file`
+    // 源以 `/.` 结尾 = tar -C dir . 语义：条目不带目录名根。
+    // 必须按字符串剥尾点：Path::components 会把尾部 CurDir 归一化掉，
+    // parent() 会错剥掉真实目录名（src/. 的 parent 是上级目录而非 src）
+    let stripped = {
+        let s = src.to_string_lossy();
+        s.strip_suffix("/.")
+            .or_else(|| s.strip_suffix("\\."))
+            .map(str::to_string)
+    };
+    let no_root = stripped.is_some();
+    let src = stripped.map(PathBuf::from).unwrap_or_else(|| src.to_path_buf());
+    // 归一化 `.` 分量（workspace.join(".") 之类），避免条目出现 `dir/./file`
     let src = {
         let normalized: PathBuf = src
             .components()
@@ -36,14 +74,22 @@ pub fn pack(src: &Path, dst: &Path, excludes: &[String]) -> Result<(usize, u64)>
         }
     }
 
+    match dst_format(dst) {
+        Some(ArchiveFormat::Zip) => write_zip(dst, &src, &files, no_root),
+        Some(ArchiveFormat::TarGz) => write_tar_gz(dst, &src, &files, no_root),
+        None => anyhow::bail!("pack 目标必须是 .zip / .tar.gz / .tgz 文件: {}", dst.display()),
+    }
+}
+
+fn write_zip(dst: &Path, src: &Path, files: &[PathBuf], no_root: bool) -> Result<(usize, u64)> {
     let file = std::fs::File::create(dst)
         .with_context(|| format!("创建 zip 失败: {}", dst.display()))?;
     let mut zip = zip::ZipWriter::new(file);
     let options = zip::write::SimpleFileOptions::default()
         .compression_method(zip::CompressionMethod::Deflated);
 
-    for path in &files {
-        let entry_name = entry_name_for(&src, path)?;
+    for path in files {
+        let entry_name = entry_name_for(src, path, no_root)?;
         zip.start_file(entry_name.as_str(), options)
             .with_context(|| format!("写入条目失败: {entry_name}"))?;
         let mut f = std::fs::File::open(path)
@@ -60,11 +106,58 @@ pub fn pack(src: &Path, dst: &Path, excludes: &[String]) -> Result<(usize, u64)>
     Ok((files.len(), bytes))
 }
 
-/// 条目名：目录源 → 相对源父目录（带目录名根）；文件/通配 → 文件名。
-/// zip 条目统一用 `/` 分隔。
-fn entry_name_for(src: &Path, path: &Path) -> Result<String> {
+fn write_tar_gz(dst: &Path, src: &Path, files: &[PathBuf], no_root: bool) -> Result<(usize, u64)> {
+    let file = std::fs::File::create(dst)
+        .with_context(|| format!("创建 tar.gz 失败: {}", dst.display()))?;
+    let enc = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+    let mut tar = tar::Builder::new(enc);
+
+    for path in files {
+        let entry_name = entry_name_for(src, path, no_root)?;
+        let mut f = std::fs::File::open(path)
+            .with_context(|| format!("读取失败: {}", path.display()))?;
+        let meta = f.metadata().with_context(|| format!("读取元数据失败: {}", path.display()))?;
+        let mut header = tar::Header::new_gnu();
+        header.set_size(meta.len());
+        header.set_mode(unix_mode(path));
+        // mtime 取文件修改时间（秒级）；取不到就 0（tar 允许）
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        header.set_mtime(mtime);
+        tar.append_data(&mut header, &entry_name, &mut f)
+            .with_context(|| format!("写入条目失败: {entry_name}"))?;
+    }
+
+    let enc = tar.into_inner().context("收尾 tar 失败")?;
+    enc.finish().context("收尾 gzip 失败")?;
+    let bytes = dst.metadata().map(|m| m.len()).unwrap_or_default();
+    Ok((files.len(), bytes))
+}
+
+/// Windows 文件系统没有 Unix 权限位，按扩展名约定映射，避免解包出来全是 0644：
+/// 无扩展名（多为编译产物二进制）与脚本扩展名 → 0755，其余 → 0644
+fn unix_mode(path: &Path) -> u32 {
+    const EXEC_EXTS: &[&str] = &["sh", "bash", "run", "py", "pl", "rb"];
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase());
+    match ext {
+        None => 0o755,
+        Some(e) if EXEC_EXTS.contains(&e.as_str()) => 0o755,
+        Some(_) => 0o644,
+    }
+}
+
+/// 条目名：目录源 → 相对源父目录（带目录名根；no_root = 相对源自身，即内容直接铺顶层）；
+/// 文件/通配 → 文件名。条目统一用 `/` 分隔。
+fn entry_name_for(src: &Path, path: &Path, no_root: bool) -> Result<String> {
     let rel: PathBuf = if src.is_dir() {
-        let base = src.parent().unwrap_or(src);
+        let base = if no_root { src } else { src.parent().unwrap_or(src) };
         path.strip_prefix(base)?.to_path_buf()
     } else {
         path.file_name().map(PathBuf::from).unwrap_or_default()
@@ -274,6 +367,109 @@ mod tests {
         let n = names(&dst);
         assert!(!n.iter().any(|e| e.contains("node_modules")), "{n:?}");
         assert!(!n.iter().any(|e| e.ends_with(".map")), "{n:?}");
+
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    // ── tar.gz（扩展名决定格式）──
+
+    #[test]
+    fn dst_format_by_extension() {
+        assert_eq!(dst_format(Path::new("a.tar.gz")), Some(ArchiveFormat::TarGz));
+        assert_eq!(dst_format(Path::new("A.TGZ")), Some(ArchiveFormat::TarGz));
+        assert_eq!(dst_format(Path::new("a.zip")), Some(ArchiveFormat::Zip));
+        // 裸 .gz / 其他扩展名不支持（.gz 不是 tar.gz）
+        assert_eq!(dst_format(Path::new("a.gz")), None);
+        assert_eq!(dst_format(Path::new("a.rar")), None);
+    }
+
+    #[test]
+    fn packs_tar_gz_with_root_prefix_and_modes() {
+        let ws = make_ws("targz");
+        std::fs::write(ws.join("src/run.sh"), "#!/bin/sh\necho hi").unwrap();
+
+        let dst = ws.join("out/app.tar.gz");
+        let (count, bytes) = pack(&ws.join("src"), &dst, &[]).unwrap();
+        assert_eq!(count, 3);
+        assert!(bytes > 0);
+
+        // 解包核对：目录源带目录名根（dist -> dist.tar.gz 里面是 dist/...）
+        let f = std::fs::File::open(&dst).unwrap();
+        let gz = flate2::read::GzDecoder::new(f);
+        let mut ar = tar::Archive::new(gz);
+        let mut modes = std::collections::HashMap::new();
+        for entry in ar.entries().unwrap() {
+            let e = entry.unwrap();
+            let name = e.path().unwrap().to_string_lossy().replace('\\', "/");
+            modes.insert(name, e.header().mode().unwrap());
+        }
+        assert_eq!(modes.get("src/a.txt"), Some(&0o644), "{modes:?}");
+        assert_eq!(modes.get("src/run.sh"), Some(&0o755), "{modes:?}");
+        assert!(modes.contains_key("src/sub/b.txt"), "{modes:?}");
+
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn packs_tar_gz_glob_as_basenames_and_tgz_alias() {
+        let ws = make_ws("tgz");
+        let dst = ws.join("out/jars.tgz"); // .tgz 别名同样走 tar.gz
+        let (count, _) = pack(&ws.join("target/*.jar"), &dst, &[]).unwrap();
+        assert_eq!(count, 2);
+        let f = std::fs::File::open(&dst).unwrap();
+        let mut ar = tar::Archive::new(flate2::read::GzDecoder::new(f));
+        let names: Vec<String> = ar
+            .entries()
+            .unwrap()
+            .map(|e| e.unwrap().path().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert!(names.contains(&"x.jar".to_string()), "{names:?}");
+        assert!(names.contains(&"y.jar".to_string()), "{names:?}");
+
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn unsupported_extension_rejected() {
+        let ws = make_ws("badext");
+        assert!(pack(&ws.join("src"), &ws.join("out/x.rar"), &[]).is_err());
+        assert!(pack(&ws.join("src"), &ws.join("out/x.gz"), &[]).is_err());
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    /// 源以 `/.` 结尾 = tar -C dir . 语义：条目不带目录名根，zip / tar.gz 同一语义
+    #[test]
+    fn slash_dot_source_packs_contents_at_root() {
+        let ws = make_ws("rootless");
+        let root_entries = |dst: &Path| {
+            if dst.extension().and_then(|e| e.to_str()) == Some("zip") {
+                names(dst)
+            } else {
+                let f = std::fs::File::open(dst).unwrap();
+                let mut ar = tar::Archive::new(flate2::read::GzDecoder::new(f));
+                ar.entries()
+                    .unwrap()
+                    .map(|e| e.unwrap().path().unwrap().to_string_lossy().to_string())
+                    .collect::<Vec<_>>()
+            }
+        };
+
+        for (dst, tag) in [
+            (ws.join("out/rl.zip"), "zip"),
+            (ws.join("out/rl.tar.gz"), "targz"),
+        ] {
+            pack(&ws.join("src/."), &dst, &[]).unwrap();
+            let n = root_entries(&dst);
+            // 顶层即文件，无 src/ 根；子目录相对内容保留
+            assert!(n.contains(&"a.txt".to_string()), "{tag}: {n:?}");
+            assert!(n.contains(&"sub/b.txt".to_string()), "{tag}: {n:?}");
+            assert!(!n.iter().any(|e| e.starts_with("src/")), "{tag}: {n:?}");
+        }
+
+        // 对照：普通目录源仍带目录名根（现有语义不变）
+        let dst = ws.join("out/rooted.zip");
+        pack(&ws.join("src"), &dst, &[]).unwrap();
+        assert!(names(&dst).contains(&"src/a.txt".to_string()));
 
         let _ = std::fs::remove_dir_all(&ws);
     }
