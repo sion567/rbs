@@ -33,3 +33,23 @@ pub(crate) fn modal_backdrop(ctx: &egui::Context, id: &str) {
                 .rect_filled(screen, 0.0, egui::Color32::from_black_alpha(110));
         });
 }
+
+/// 输入框标准宽度三档（短 / 中 / 长）：全应用统一，别逐处手写像素。
+/// 短 = 端口/超时这类紧凑数值；中 = 账号 / 分支 / 项目名；
+/// 长 = 路径 / URL / 失败说明这类长文本
+pub mod input {
+    pub const SHORT: f32 = 110.0;
+    pub const MED: f32 = 260.0;
+    pub const LONG: f32 = 440.0;
+}
+
+/// 弹窗首次出现时屏幕居中（之后仍可拖动）：pivot 让 default_pos 按窗口中心
+/// 对齐屏幕中心，default_pos 只在首次出现生效
+pub(crate) fn centered_window<'a>(
+    win: egui::Window<'a>,
+    ctx: &egui::Context,
+) -> egui::Window<'a> {
+    let center = ctx.input(|i| i.content_rect().center());
+    win.pivot(egui::Align2::CENTER_CENTER)
+        .default_pos(center)
+}

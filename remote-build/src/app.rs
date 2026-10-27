@@ -848,6 +848,19 @@ impl MainState {
                 }
                 LogEvent::JobEnd { status, .. } => {
                     run.finished = Some(status.clone());
+                    // 监听模式下本次运行已收尾（含 ⏹ Stop / 超时）：把基线拨到现在。
+                    // 运行自己往监听目录写的产物（克隆 / .env / 构建输出）mtime 全晚于
+                    // 旧基线，不重置的话运行一结束下次轮询立刻再次触发重跑
+                    if let Some(w) = self.watch.as_mut() {
+                        let is_watch_run = self
+                            .run_job
+                            .as_ref()
+                            .map(|(p, j)| p == &w.project && j == &w.job)
+                            .unwrap_or(false);
+                        if is_watch_run {
+                            w.since = std::time::SystemTime::now();
+                        }
+                    }
                     // 状态栏同步落终态：否则单流程结束后右上角一直残留「运行中: xxx」
                     // （组运行随后由 GroupJobBegin/GroupJobEnd 覆盖，监听模式见下方分支）
                     self.status_msg =
@@ -1571,7 +1584,7 @@ fn show_confirm_gate_window(ctx: &egui::Context, main: &mut MainState) {
     crate::ui::modal_backdrop(ctx, "mask_confirm_gate");
     let mut pass = false;
     let mut cancel = false;
-    egui::Window::new("🔒 人工确认")
+    crate::ui::centered_window(egui::Window::new("🔒 人工确认"), ctx)
         .collapsible(false)
         .order(egui::Order::Tooltip)
         .default_width(420.0)

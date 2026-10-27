@@ -357,7 +357,9 @@ pub fn show(main: &mut MainState, ui: &mut egui::Ui) {
                 .small_button("＋前置检查")
                 .on_hover_text(
                     "执行前在发版机本地逐条运行，任一退出码非 0 → 整个流程零秒失败并展示说明。\n\
-                     例：java -version（失败说明「JDK 未安装」）；支持 ${{ variables.X }} 替换",
+                     例：java -version（失败说明「JDK 未安装」）；支持 ${{ variables.X }} 替换\n\
+                     ⚠ 只放无副作用的检查命令：成功时输出不显示、固定 30s 超时。\n\
+                     拉代码 / 构建这类动作请加为普通步骤（输出实时打印、可配超时重试）",
                 )
                 .clicked()
             {
@@ -365,7 +367,7 @@ pub fn show(main: &mut MainState, ui: &mut egui::Ui) {
             }
             if !job.preconditions.is_empty() {
                 ui.weak(format!(
-                    "前置检查 {} 条：任一失败整个流程不执行",
+                    "前置检查 {} 条（只做检查不做动作）：任一失败整个流程不执行",
                     job.preconditions.len()
                 ));
             }
@@ -378,13 +380,13 @@ pub fn show(main: &mut MainState, ui: &mut egui::Ui) {
                 ui.monospace(format!("{}", i + 1));
                 ui.add(
                     egui::TextEdit::singleline(&mut pre.check)
-                        .desired_width(300.0)
+                        .desired_width(crate::ui::input::LONG)
                         .hint_text("本地命令，如 java -version"),
                 );
                 ui.add(
                     egui::TextEdit::singleline(&mut pre.message)
-                        .desired_width(200.0)
-                        .hint_text("失败时的人话说明"),
+                        .desired_width(crate::ui::input::LONG)
+                        .hint_text("失败时的人话说明（为什么失败 / 该怎么办）"),
                 );
             });
         }
@@ -530,7 +532,7 @@ pub fn show_new_job_window(ctx: &egui::Context, main: &mut MainState) {
     if open {
         crate::ui::modal_backdrop(ctx, "mask_new_job");
     }
-    egui::Window::new("＋ 新建流程")
+    crate::ui::centered_window(egui::Window::new("＋ 新建流程"), ctx)
         .open(&mut open)
         .order(egui::Order::Foreground)
         .default_width(520.0)
@@ -699,7 +701,7 @@ pub fn show_var_help_window(ctx: &egui::Context, main: &mut MainState) {
     if open {
         crate::ui::modal_backdrop(ctx, "mask_var_help");
     }
-    egui::Window::new("？ 变量语法速查")
+    crate::ui::centered_window(egui::Window::new("？ 变量语法速查"), ctx)
         .open(&mut open)
         .order(egui::Order::Foreground)
         .default_width(720.0)
@@ -787,7 +789,7 @@ pub fn show_var_help_window(ctx: &egui::Context, main: &mut MainState) {
             ui.add_space(4.0);
             ui.strong("四、流程级开关（build.yaml）");
             ui.monospace("confirm: prod            # 确认门：运行前弹窗输入 prod 才放行");
-            ui.monospace("preconditions:           # 前置检查：发版机本地断言，失败零秒退出");
+            ui.monospace("preconditions:           # 前置检查：发版机本地断言，失败零秒退出（只放检查，别放拉代码/构建等动作）");
             ui.monospace("  - check: java -version");
             ui.monospace("    message: JDK 未安装");
             ui.monospace("timeout: 600             # 作业级总超时（秒）；步骤级用 step.timeout");
@@ -1205,7 +1207,8 @@ fn edit_step(
                 );
                 let mut buf = step.notify.join(",");
                 let resp = ui.add(
-                    egui::TextEdit::singleline(&mut buf).desired_width(110.0),
+                    egui::TextEdit::singleline(&mut buf)
+                        .desired_width(crate::ui::input::SHORT),
                 );
                 if resp.changed() {
                     step.notify = buf.split(',').map(|s| s.trim().to_string()).collect();

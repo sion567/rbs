@@ -84,6 +84,15 @@ remote-build preview <项目名> <流程名>           # 干跑预览：解析�
 
 ## 示例工程（~/.remote-build/projects/）
 
+目录布局（代码与配置两层分离，§10.1）：
+
+```
+~/.remote-build/
+├── projects/<项目名>/        # 配置：project.yaml + jobs/<流程名>.yaml（新布局）
+│   └── jobs/                 #   根目录的旧版 *.yaml 流程仍兼容发现
+└── workspace/<项目名>/       # git 克隆的代码（默认目标；本地目录模式代码原位不动）
+```
+
 `yudao-cloud`（Maven 微服务，需 JDK25）/ `yudao-admin-uniapp`（pnpm，corepack 钉版本）/
 `yudao-admin-vben`（turbo + pnpm）三个真实工程，各配 dev-build（本地）与
 prod-deploy（编译 → pack 打 zip → 多行映射 upload 到 prod 目标 → 远端发布脚本）。

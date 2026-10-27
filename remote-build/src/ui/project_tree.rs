@@ -302,16 +302,21 @@ fn job_row(main: &mut MainState, ui: &mut egui::Ui, pi: usize, ji: usize, layer:
             main.start_run(0, None);
             ui.close();
         }
-        if ui
-            .add_enabled(
-                !main.run_active() && main.pull_done.is_none(),
-                egui::Button::new("⟳ 更新代码"),
-            )
-            .on_hover_text(
-                "对项目代码目录执行 git pull --ff-only\n\
-                 （远端分叉 / 本地冲突会报错，不覆盖本地修改）",
-            )
-            .clicked()
+        // 本地目录不是 git 仓库（无 .git）= 单机项目，没有可更新的远端，不显示本项
+        let is_git_repo = std::path::Path::new(&main.projects[pi].project.local_path)
+            .join(".git")
+            .exists();
+        if is_git_repo
+            && ui
+                .add_enabled(
+                    !main.run_active() && main.pull_done.is_none(),
+                    egui::Button::new("⟳ 更新代码"),
+                )
+                .on_hover_text(
+                    "对项目代码目录执行 git pull --ff-only\n\
+                     （远端分叉 / 本地冲突会报错，不覆盖本地修改）",
+                )
+                .clicked()
         {
             main.pull_project_code(pi);
             ui.close();
@@ -364,7 +369,7 @@ fn confirm_delete_window(ctx: &egui::Context, main: &mut MainState) {
     crate::ui::modal_backdrop(ctx, "mask_tree_delete");
 
     let mut open = true;
-    egui::Window::new("⚠ 确认删除")
+    crate::ui::centered_window(egui::Window::new("⚠ 确认删除"), ctx)
         .open(&mut open)
         .order(egui::Order::Foreground)
         .collapsible(false)
@@ -464,7 +469,7 @@ fn rename_window(ctx: &egui::Context, main: &mut MainState) {
 
     let mut open = true;
     let mut do_rename = false;
-    egui::Window::new("✏ 改名")
+    crate::ui::centered_window(egui::Window::new("✏ 改名"), ctx)
         .open(&mut open)
         .order(egui::Order::Foreground)
         .collapsible(false)

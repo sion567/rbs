@@ -60,14 +60,21 @@ const MAX_LINES: usize = 5000;
 pub struct ConsoleLine {
     pub text: String,
     pub role: Role,
+    /// 步骤头行（Role::StepStart）所属的步骤下标：只看错误模式下，
+    /// 只显示失败步骤的骨架头（其余步骤头随整步隐藏）
+    pub step: Option<usize>,
 }
 
 pub struct ConsoleState {
     pub lines: Vec<ConsoleLine>,
     /// 自动滚动到最新输出（勾选时新日志始终可见；关闭后可上翻检查历史，新行不会拉走视图）
     pub auto_scroll: bool,
-    /// 只看错误（gh run view --log-failed 同款）：隐藏 stdout/提示噪音行，保留步骤头尾与错误
+    /// 只看错误（gh run view --log-failed 同款）：隐藏 stdout/提示/成功行，
+    /// 只留失败步骤的骨架（Step 头 + stderr + ❌）与 ⚠ 错误、取消收尾。
+    /// 全程无错误的运行在此模式下不显示任何行——本身就是"没有错误"的信号
     pub errors_only: bool,
+    /// 退出码非 0 的步骤集合：只看错误模式下保留这些步骤的骨架头
+    failed_steps: std::collections::HashSet<usize>,
     // ── 虚拟化渲染缓存 ──────────────────────────────────────────────
     /// 每行在 measured_width 下量得的高度（Fonts::layout 逐行排版太贵，
     /// 5000 行全量重排每帧会卡顿；缓存后每帧只排版可视区几十行）
@@ -83,6 +90,7 @@ impl Default for ConsoleState {
             lines: Vec::new(),
             auto_scroll: true,
             errors_only: false,
+            failed_steps: Default::default(),
             heights: Vec::new(),
             measured_width: 0.0,
             heights_dirty: true,
@@ -94,10 +102,10 @@ impl ConsoleState {
     pub fn push_event(&mut self, ev: &LogEvent) {
         match ev {
             LogEvent::StepStart { step_index, name, .. } => {
-                self.push(
-                    format!("── Step {} ── {name}", step_index + 1),
-                    Role::StepStart,
-                );
+                let text = format!("── Step {} ── {name}", step_index + 1);
+                self.lines
+                    .push(ConsoleLine { text, role: Role::StepStart, step: Some(*step_index) });
+                self.trim_to_limit();
             }
             LogEvent::Stdout { line, .. } => {
                 self.push(line.clone(), Role::Stdout);
@@ -106,6 +114,10 @@ impl ConsoleState {
                 self.push(line.clone(), Role::Stderr);
             }
             LogEvent::StepEnd { step_index, exit_code, duration_ms } => {
+                if *exit_code != 0 {
+                    // 只看错误模式保留失败步骤的骨架头
+                    self.failed_steps.insert(*step_index);
+                }
                 let (text, role) = if *exit_code == 0 {
                     (
                         format!("✅ Step {} 完成 ({duration_ms}ms)", step_index + 1),
@@ -160,7 +172,15 @@ impl ConsoleState {
     }
 
     fn push(&mut self, text: String, role: Role) {
-        self.lines.push(ConsoleLine { text, role });
+        self.push_line_obj(ConsoleLine { text, role, step: None });
+    }
+
+    fn push_line_obj(&mut self, line: ConsoleLine) {
+        self.lines.push(line);
+        self.trim_to_limit();
+    }
+
+    fn trim_to_limit(&mut self) {
         if self.lines.len() > MAX_LINES {
             let drop = self.lines.len() - MAX_LINES;
             self.lines.drain(0..drop);
@@ -234,7 +254,10 @@ pub fn show(console: &mut ConsoleState, ui: &mut egui::Ui, running: bool, dark: 
                 ui.checkbox(&mut console.auto_scroll, "自动滚动");
                 if ui
                     .checkbox(&mut console.errors_only, "只看错误")
-                    .on_hover_text("隐藏 stdout / 系统提示行，只保留步骤头尾、stderr 与错误（gh --log-failed 同款）")
+                    .on_hover_text(
+                        "只留失败步骤的骨架（Step 头 + stderr + ❌）与 ⚠ 错误、取消收尾；\n\
+                         成功步骤整体隐藏——全程无错误时此视图为空，即「没有错误」",
+                    )
                     .changed()
                 {
                     console.auto_scroll = true;
@@ -316,13 +339,22 @@ pub fn show(console: &mut ConsoleState, ui: &mut egui::Ui, running: bool, dark: 
                         }
                     }
 
-                    // 只看错误的可见行索引（O(n) 过滤扫描，无控件开销）
+                    // 只看错误的可见行索引（O(n) 过滤扫描，无控件开销）：
+                    // 藏 stdout/提示/成功行与成功步骤的骨架头；
+                    // 留失败步骤骨架（头 + stderr + ❌）、⚠ 错误、取消收尾
                     let visible_idx: Vec<usize> = if console.errors_only {
                         console
                             .lines
                             .iter()
                             .enumerate()
-                            .filter(|(_, l)| !matches!(l.role, Role::Stdout | Role::Info))
+                            .filter(|(_, l)| match &l.role {
+                                Role::Stdout | Role::Info | Role::Ok => false,
+                                Role::StepStart => l
+                                    .step
+                                    .map(|i| console.failed_steps.contains(&i))
+                                    .unwrap_or(true),
+                                _ => true,
+                            })
                             .map(|(i, _)| i)
                             .collect()
                     } else {

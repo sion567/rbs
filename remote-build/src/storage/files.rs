@@ -75,18 +75,21 @@ pub fn discover_with_errors(root: &Path) -> (Vec<ProjectEntry>, Vec<String>) {
             }
         };
 
+        // 流程文件：jobs/ 子目录（现布局）优先，根目录 *.yaml 兼容旧布局
+        //（项目配置与代码分离后，旧项目根目录的流程 yaml 继续可用，编辑仍原位保存）。
+        // 同名时以 jobs/ 为准（迁移后双份并存不产生重复流程）
         let mut jobs = Vec::new();
-        if let Ok(files) = std::fs::read_dir(&dir) {
-            let mut names: Vec<PathBuf> = files
-                .flatten()
-                .map(|e| e.path())
-                .filter(|p| {
-                    p.extension().map(|e| e == "yaml").unwrap_or(false)
-                        && p.file_name().map(|n| n != "project.yaml").unwrap_or(false)
-                })
-                .collect();
+        let mut seen: std::collections::HashSet<String> = Default::default();
+        let mut scan = |files: Vec<PathBuf>, jobs: &mut Vec<JobEntry>, seen: &mut std::collections::HashSet<String>| {
+            let mut names = files;
             names.sort();
             for f in names {
+                let Some(name) = f.file_name().map(|n| n.to_string_lossy().to_string()) else {
+                    continue;
+                };
+                if !seen.insert(name) {
+                    continue;
+                }
                 match load_yaml::<Job>(&f) {
                     Ok(job) => jobs.push(JobEntry { path: f, job }),
                     Err(e) => errors.push(format!(
@@ -95,8 +98,91 @@ pub fn discover_with_errors(root: &Path) -> (Vec<ProjectEntry>, Vec<String>) {
                     )),
                 }
             }
-        }
+        };
+        let jobs_dir_files = std::fs::read_dir(dir.join("jobs"))
+            .map(|it| {
+                it.flatten()
+                    .map(|e| e.path())
+                    .filter(|p| p.extension().map(|e| e == "yaml").unwrap_or(false))
+                    .collect()
+            })
+            .unwrap_or_default();
+        scan(jobs_dir_files, &mut jobs, &mut seen);
+        let legacy_files = std::fs::read_dir(&dir)
+            .map(|it| {
+                it.flatten()
+                    .map(|e| e.path())
+                    .filter(|p| {
+                        p.is_file()
+                            && p.extension().map(|e| e == "yaml").unwrap_or(false)
+                            && p.file_name().map(|n| n != "project.yaml").unwrap_or(false)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        scan(legacy_files, &mut jobs, &mut seen);
         out.push(ProjectEntry { dir, project, jobs });
     }
     (out, errors)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::{FailureAction, Job, Step, StepType};
+
+    fn job_named(name: &str, marker: &str) -> Job {
+        Job {
+            name: name.to_string(),
+            project: "demo".to_string(),
+            description: Some(marker.to_string()),
+            steps: vec![Step {
+                name: Some(marker.to_string()),
+                command: "echo x".to_string(),
+                step_type: StepType::Exec,
+                enabled: true,
+                ..Default::default()
+            }],
+            on_failure: FailureAction::Stop,
+            ..Default::default()
+        }
+    }
+
+    /// 双布局发现：jobs/ 子目录（现布局）与根目录 *.yaml（旧布局）都能被发现；
+    /// 同名时以 jobs/ 为准，不产生重复流程；非 yaml / project.yaml 不算流程
+    #[test]
+    fn discovers_jobs_subdir_and_legacy_root() {
+        let root = std::env::temp_dir().join(format!("rbs_files_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("demo"); // discover 扫描 root 下的项目子目录
+        std::fs::create_dir_all(dir.join("jobs")).unwrap();
+
+        crate::storage::files::save_yaml(&dir.join("project.yaml"), &crate::models::Project {
+            name: "demo".to_string(),
+            local_path: dir.to_string_lossy().to_string(),
+            jobs: vec!["build".to_string(), "legacy".to_string()],
+            ..Default::default()
+        })
+        .unwrap();
+        // 现布局：jobs/build.yaml
+        crate::storage::files::save_yaml(&dir.join("jobs").join("build.yaml"), &job_named("build", "new-layout")).unwrap();
+        // 旧布局：根目录 legacy.yaml；与 jobs/ 同名的旧文件应被忽略
+        crate::storage::files::save_yaml(&dir.join("legacy.yaml"), &job_named("legacy", "old-layout")).unwrap();
+        crate::storage::files::save_yaml(&dir.join("build.yaml"), &job_named("build", "stale-root")).unwrap();
+        // 干扰项：yml 扩展名 / 非流程 yaml 名（project.yaml 已排除）
+        std::fs::write(dir.join("readme.yml"), "name: x").unwrap();
+
+        let found = discover_projects(&root);
+        assert_eq!(found.len(), 1);
+        let entry = &found[0];
+        assert_eq!(entry.jobs.len(), 2, "{:?}", entry.jobs.iter().map(|j| j.job.name.clone()).collect::<Vec<_>>());
+
+        let build = entry.jobs.iter().find(|j| j.job.name == "build").unwrap();
+        assert_eq!(build.job.description.as_deref(), Some("new-layout"), "同名以 jobs/ 为准");
+        assert!(build.path.ends_with("jobs/build.yaml"));
+        let legacy = entry.jobs.iter().find(|j| j.job.name == "legacy").unwrap();
+        assert!(legacy.path.ends_with("legacy.yaml"), "旧布局根目录流程仍可发现");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

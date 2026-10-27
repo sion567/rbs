@@ -28,6 +28,8 @@ pub struct NewProjectState {
     pub git_url: String,
     pub git_user: String,
     pub git_password: String,
+    /// 密码明文显示开关（👁 切换）
+    pub show_password: bool,
     pub git_branch: String,
     pub git_target: String,
 
@@ -62,6 +64,14 @@ pub fn show(ctx: &egui::Context, main: &mut MainState) {
                 main.new_project.result_rx = None;
                 main.new_project.progress = None;
                 main.new_project.message = None;
+                // 克隆成功 → 生成项目配置（与端到端测试走同一 complete_clone 路径）。
+                // 此前缺这一步：discover 只认有 project.yaml 的目录，
+                // 克隆完成的项目一直不会出现在项目树里
+                let target = main.new_project.git_target.trim().to_string();
+                if let Err(e) = complete_clone(&name, &target) {
+                    main.status_msg =
+                        Some(format!("项目「{name}」克隆成功，但配置生成失败 ❌ {e:#}"));
+                }
                 main.reload();
                 main.select_project_by_name(&name);
                 main.status_msg = Some(format!("项目「{name}」创建成功 ✅"));
@@ -90,7 +100,7 @@ pub fn show(ctx: &egui::Context, main: &mut MainState) {
         crate::ui::modal_backdrop(ctx, "mask_new_project");
     }
 
-    egui::Window::new("＋ 新建项目")
+    crate::ui::centered_window(egui::Window::new("＋ 新建项目"), ctx)
         .open(&mut open)
         .order(egui::Order::Foreground)
         .default_width(600.0)
@@ -101,7 +111,7 @@ pub fn show(ctx: &egui::Context, main: &mut MainState) {
                 ui.selectable_value(&mut main.new_project.kind, SourceKind::Local, "本地目录");
                 ui.separator();
                 ui.weak(match main.new_project.kind {
-                    SourceKind::Git => "克隆远端仓库（默认下载到 ~/.remote-build/projects/）",
+                    SourceKind::Git => "克隆远端仓库（默认下载到 ~/.remote-build/workspace/）",
                     SourceKind::Local => "使用已有本地代码目录",
                 });
             });
@@ -118,9 +128,9 @@ pub fn show(ctx: &egui::Context, main: &mut MainState) {
                 ui.label("项目名称:");
                 ui.add(
                     egui::TextEdit::singleline(&mut main.new_project.project_name)
-                        .desired_width(220.0),
+                        .desired_width(crate::ui::input::MED),
                 );
-                ui.weak("（将创建在 ~/.remote-build/projects/ 下）");
+                ui.weak("（配置将创建在 ~/.remote-build/projects/<项目名>/ 下）");
             });
 
             ui.add_space(10.0);
@@ -187,7 +197,7 @@ fn git_form(ui: &mut egui::Ui, main: &mut MainState) {
             ui.label("仓库地址:");
             let resp = ui.add(
                 egui::TextEdit::singleline(&mut main.new_project.git_url)
-                    .desired_width(360.0)
+                    .desired_width(crate::ui::input::LONG)
                     .hint_text("https://github.com/org/repo.git 或 git@host:path/repo.git"),
             );
             if resp.changed() {
@@ -198,7 +208,7 @@ fn git_form(ui: &mut egui::Ui, main: &mut MainState) {
             ui.label("分支:");
             ui.add(
                 egui::TextEdit::singleline(&mut main.new_project.git_branch)
-                    .desired_width(240.0)
+                    .desired_width(crate::ui::input::MED)
                     .hint_text("留空 = 默认分支"),
             );
             ui.end_row();
@@ -206,25 +216,35 @@ fn git_form(ui: &mut egui::Ui, main: &mut MainState) {
             ui.label("账号:");
             ui.add(
                 egui::TextEdit::singleline(&mut main.new_project.git_user)
-                    .desired_width(240.0)
+                    .desired_width(crate::ui::input::MED)
                     .hint_text("https 私有仓库必填（ssh 忽略）"),
             );
             ui.end_row();
 
             ui.label("密码:");
-            ui.add(
-                egui::TextEdit::singleline(&mut main.new_project.git_password)
-                    .password(true)
-                    .desired_width(240.0)
-                    .hint_text("https 填密码或 Personal Access Token"),
-            );
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut main.new_project.git_password)
+                        .password(!main.new_project.show_password)
+                        .desired_width(crate::ui::input::MED)
+                        .hint_text("https 填密码或 Personal Access Token"),
+                );
+                let (icon, tip) = if main.new_project.show_password {
+                    ("🙈", "隐藏密码")
+                } else {
+                    ("👁", "显示密码")
+                };
+                if ui.small_button(icon).on_hover_text(tip).clicked() {
+                    main.new_project.show_password = !main.new_project.show_password;
+                }
+            });
             ui.end_row();
 
             ui.label("目标目录:");
             ui.horizontal(|ui| {
                 ui.add(
                     egui::TextEdit::singleline(&mut main.new_project.git_target)
-                        .desired_width(300.0),
+                        .desired_width(crate::ui::input::LONG),
                 );
                 if ui.small_button("📂").clicked() {
                     if let Some(dir) = rfd::FileDialog::new()
@@ -249,7 +269,7 @@ fn local_form(ui: &mut egui::Ui, main: &mut MainState) {
             ui.horizontal(|ui| {
                 ui.add(
                     egui::TextEdit::singleline(&mut main.new_project.local_dir)
-                        .desired_width(300.0)
+                        .desired_width(crate::ui::input::LONG)
                         .hint_text("D:\\workspace\\my-project"),
                 );
                 if ui.button("📂 浏览…").clicked() {
@@ -268,8 +288,8 @@ fn local_form(ui: &mut egui::Ui, main: &mut MainState) {
             ui.end_row();
         });
     ui.weak(
-        "代码目录保持原位不动；项目的构建配置（project.yaml / build.yaml）\
-         会生成到 ~/.remote-build/projects/<项目名>/。",
+        "代码与配置分离：克隆代码 → ~/.remote-build/workspace/<项目名>/，\n\
+         构建配置（project.yaml + jobs/ 流程）→ ~/.remote-build/projects/<项目名>/。",
     );
 }
 
@@ -286,7 +306,7 @@ fn auto_fill_from_url(main: &mut MainState) {
     main.new_project.project_name = derived.clone();
     if main.new_project.git_target.is_empty() {
         main.new_project.git_target =
-            crate::config::default_project_dir(&derived).to_string_lossy().to_string();
+            crate::config::default_clone_target(&derived).to_string_lossy().to_string();
     }
 }
 
@@ -383,6 +403,17 @@ fn start_clone(main: &mut MainState, name: String) -> bool {
         let _ = tx.send(res.map(|_| name));
     });
     true
+}
+
+/// 克隆成功后的收尾：生成项目配置（project.yaml + build.yaml；git 项目自动带
+/// git 前置与版本/拉取起步步骤）。UI 完成分支与端到端测试共用此函数——
+/// 此前克隆路径从未生成配置，克隆出的项目进不了项目树（discover 只认
+/// 有 project.yaml 的目录），第一版起就存在且完全静默。
+pub(crate) fn complete_clone(
+    name: &str,
+    target: &str,
+) -> Result<std::path::PathBuf, anyhow::Error> {
+    crate::config::create_project_entry(name, Path::new(target))
 }
 
 /// 后台线程执行 git clone，进度写入 progress（已脱敏），返回 Ok(())/Err(错误详情)。
@@ -663,6 +694,71 @@ mod tests {
         assert!(res.is_err());
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 端到端锁链：向导克隆路径（run_clone → complete_clone）产出的项目必须能被
+    /// discover 发现，且起步配置带 git 前置 + 版本/拉取两条步骤。
+    /// 此前的真 bug：完成分支没生成 project.yaml，克隆项目永远进不了项目树。
+    #[test]
+    fn clone_wizard_produces_discoverable_project() {
+        if std::process::Command::new("git").arg("--version").output().is_err() {
+            return;
+        }
+        let tmp = std::env::temp_dir().join(format!("rbs_wiz_e2e_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::env::set_var("REMOTE_BUILD_HOME", &tmp);
+
+        // 源仓库（本地路径当远端用）
+        let src = tmp.join("src-repo");
+        std::fs::create_dir_all(&src).unwrap();
+        let git = |args: &[&str], cwd: &Path| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?} 失败: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-b", "main"], &src);
+        std::fs::write(src.join("a.txt"), "a").unwrap();
+        git(&["add", "."], &src);
+        git(&["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-m", "init"], &src);
+
+        // 向导的完整路径：克隆 → 完成分支调用的同一个 complete_clone
+        let target = tmp.join("workspace").join("demo");
+        let res = run_clone(
+            "git",
+            src.to_str().unwrap(),
+            target.to_str().unwrap(),
+            "main",
+            Arc::new(Mutex::new(String::new())),
+            "",
+        );
+        assert!(res.is_ok(), "{res:?}");
+        complete_clone("demo", target.to_str().unwrap()).expect("克隆后配置必须生成");
+
+        // 项目可被发现，起步配置 = 1 条 git 前置 + 版本/拉取两条步骤
+        let found = crate::storage::files::discover_projects(&crate::config::projects_dir());
+        let entry = found
+            .iter()
+            .find(|p| p.project.name == "demo")
+            .expect("克隆项目应能被发现");
+        let build = entry
+            .jobs
+            .iter()
+            .find(|j| j.job.name == "build")
+            .expect("应有 build 起步流程");
+        assert_eq!(build.job.preconditions.len(), 1);
+        assert_eq!(build.job.preconditions[0].check, "git --version");
+        assert_eq!(build.job.steps.len(), 2);
+
+        std::env::remove_var("REMOTE_BUILD_HOME");
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

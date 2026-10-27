@@ -29,10 +29,19 @@ pub fn tools_path() -> PathBuf { app_root().join("tools.yaml") }
 pub fn projects_dir() -> PathBuf { app_root().join("projects") }
 pub fn logs_dir() -> PathBuf { app_root().join("logs") }
 
+/// 代码工作区根：~/.remote-build/workspace（git 克隆的默认落点）。
+/// 与 projects/（配置目录）彻底分离——仓库自带的 project.yaml / *.yaml
+/// 不会与配置同名冲突，也不会被流程发现逻辑误当流程解析
+pub fn workspace_dir() -> PathBuf { app_root().join("workspace") }
+
+/// git 克隆的默认目标目录：workspace/<项目名>
+pub fn default_clone_target(name: &str) -> PathBuf { workspace_dir().join(name) }
+
 /// 创建目录骨架（§7.1 首次启动第一步）
 pub fn ensure_layout() -> std::io::Result<()> {
     std::fs::create_dir_all(projects_dir())?;
     std::fs::create_dir_all(logs_dir())?;
+    std::fs::create_dir_all(workspace_dir())?;
     Ok(())
 }
 
@@ -194,6 +203,26 @@ pub fn create_project_entry(name: &str, local_path: &Path) -> Result<PathBuf> {
     };
     crate::storage::files::save_yaml(&dir.join("project.yaml"), &project)?;
 
+    // git 仓库目录（克隆完成 / 本地选择的现成仓库）→ 起步流程自带
+    // 「查看版本 + 拉取最新」两条，每次运行天然用最新代码；纯本地目录 → 单条示例
+    let is_git = local_path.join(".git").exists();
+    let steps = if is_git {
+        git_starter_steps()
+    } else {
+        starter_steps()
+    };
+    // git 项目默认带一条 git 可用性前置：环境缺 git 时零秒失败并给一句人话，
+    // 而不是跑到拉取步骤才报一条难懂的命令错误（前置检查的本职用法）
+    let preconditions = if is_git {
+        vec![Precondition {
+            check: "git --version".to_string(),
+            message: "本机未找到 git：查看版本/拉取代码需要它（可在 ⚙ 设置重新探测工具）"
+                .to_string(),
+        }]
+    } else {
+        Vec::new()
+    };
+
     let job = Job {
         name: "build".to_string(),
         project: name.to_string(),
@@ -202,22 +231,18 @@ pub fn create_project_entry(name: &str, local_path: &Path) -> Result<PathBuf> {
         environment: None,
         timeout: Some(60),
         confirm: None,
-        preconditions: Vec::new(),
+        preconditions,
         handlers: Vec::new(),
         retry: None,
         on_failure: FailureAction::Stop,
-        steps: starter_steps(),
+        steps,
         working_dir: None,
         group: None,
     };
-    crate::storage::files::save_yaml(&dir.join("build.yaml"), &job)?;
+    crate::storage::files::save_yaml(&job_file_path(&dir, "build"), &job)?;
     Ok(dir)
 }
 
-/// 默认新建项目目录：~/.remote-build/projects/<name>（Git clone 目标 / 本地模式的配置目录）
-pub fn default_project_dir(name: &str) -> PathBuf {
-    projects_dir().join(name)
-}
 
 /// Windows 文件名非法字符替换为下划线。
 /// 流程名（如 dev:h5）进 YAML 的 name 字段保留原名，仅文件名净化。
@@ -227,11 +252,16 @@ pub fn sanitize_filename(s: &str) -> String {
         .collect()
 }
 
-/// 流程（job）文件路径：projects/<项目>/<流程名>.yaml，文件名经净化
+/// 流程（job）文件路径：projects/<项目>/jobs/<流程名>.yaml（文件名经净化）。
+/// 流程统一放 jobs/ 子目录——项目目录根留给 project.yaml，
+/// 兼容旧布局（根目录 *.yaml 仍可被发现，见 files::discover_with_errors）
 pub fn job_file_path(project_dir: &Path, job_name: &str) -> PathBuf {
-    project_dir.join(format!("{}.yaml", sanitize_filename(job_name)))
+    project_dir
+        .join("jobs")
+        .join(format!("{}.yaml", sanitize_filename(job_name)))
 }
 
+/// 新流程的起始步骤模板
 /// 新流程的起始步骤模板
 pub fn starter_steps() -> Vec<Step> {
     vec![Step {
@@ -242,6 +272,30 @@ pub fn starter_steps() -> Vec<Step> {
         enabled: true,
         ..Default::default()
     }]
+}
+
+/// git 仓库项目的起步步骤：版本信息 + 拉取最新。
+/// 用普通步骤而非前置检查——步骤输出实时打印到控制台（git pull 进度可见）、
+/// 可配超时 / 重试 / continue_on_error；前置检查只吃退出码、成功时输出不显示。
+pub fn git_starter_steps() -> Vec<Step> {
+    vec![
+        Step {
+            name: Some("查看当前版本".to_string()),
+            tool: String::new(),
+            command: "git log -1 --oneline".to_string(),
+            step_type: StepType::Exec,
+            enabled: true,
+            ..Default::default()
+        },
+        Step {
+            name: Some("拉取最新代码".to_string()),
+            tool: String::new(),
+            command: "git pull --ff-only".to_string(),
+            step_type: StepType::Exec,
+            enabled: true,
+            ..Default::default()
+        },
+    ]
 }
 
 /// 示范步骤快捷构造（合集生成专用）
@@ -759,7 +813,7 @@ pub fn create_example_project() -> Result<()> {
         ("linux.yaml", linux_job),
         ("deploy.yaml", deploy_job),
     ] {
-        crate::storage::files::save_yaml(&dir.join(file), &job)?;
+        crate::storage::files::save_yaml(&dir.join("jobs").join(file), &job)?;
     }
     Ok(())
 }
@@ -798,20 +852,32 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
         std::env::set_var("REMOTE_BUILD_HOME", &tmp);
 
-        // ── create_project_entry 生成 project.yaml + build.yaml ──
+        // ── create_project_entry 生成 project.yaml + jobs/build.yaml ──
         let code_dir = tmp.join("code");
         std::fs::create_dir_all(&code_dir).unwrap();
         let dir = create_project_entry("demo", &code_dir).unwrap();
 
-        assert!(dir.join("project.yaml").exists());
-        assert!(dir.join("build.yaml").exists());
+        let build_path = job_file_path(&dir, "build");
+        assert!(build_path.exists(), "{}", build_path.display());
+        assert!(!dir.join("build.yaml").exists(), "起步流程应在新布局 jobs/ 下");
         let p: Project =
             crate::storage::files::load_yaml(&dir.join("project.yaml")).unwrap();
         assert_eq!(p.name, "demo");
         assert_eq!(p.local_path, code_dir.to_string_lossy().to_string());
-        let j: Job = crate::storage::files::load_yaml(&dir.join("build.yaml")).unwrap();
+        let j: Job = crate::storage::files::load_yaml(&build_path).unwrap();
         assert_eq!(j.steps.len(), 1);
         assert!(j.steps[0].enabled);
+
+        // ── git 仓库目录（有 .git）→ 起步流程自带「版本信息 + 拉取最新」+ git 前置 ──
+        let git_dir = tmp.join("gitcode");
+        std::fs::create_dir_all(git_dir.join(".git")).unwrap();
+        let gdir = create_project_entry("gdemo", &git_dir).unwrap();
+        let gj: Job = crate::storage::files::load_yaml(&job_file_path(&gdir, "build")).unwrap();
+        assert_eq!(gj.steps.len(), 2, "{:?}", gj.steps);
+        assert_eq!(gj.steps[0].command, "git log -1 --oneline");
+        assert_eq!(gj.steps[1].command, "git pull --ff-only");
+        assert_eq!(gj.preconditions.len(), 1, "{:?}", gj.preconditions);
+        assert_eq!(gj.preconditions[0].check, "git --version");
 
         // ── dev:h5 这类自由命名：文件名净化为 dev_h5.yaml，name 保留冒号 ──
         let job = Job {
@@ -840,22 +906,22 @@ mod tests {
         assert!(p.targets.contains_key("demo-server"), "远端合集占位目标");
         let mut names = Vec::new();
         for f in ["git.yaml", "build.yaml", "linux.yaml", "deploy.yaml"] {
-            let j: Job = crate::storage::files::load_yaml(&ex_dir.join(f)).unwrap();
+            let j: Job = crate::storage::files::load_yaml(&ex_dir.join("jobs").join(f)).unwrap();
             assert!(!j.steps.is_empty(), "{f} 应有示范步骤");
             names.push(j.name);
         }
         assert_eq!(p.jobs, names, "project.yaml 的 jobs 列表与合集文件一致");
         // 分组演示：git/build → 本地构建；linux/deploy → 远端发布（YAML 往返保真）
         assert_eq!(p.groups, vec!["本地构建".to_string(), "远端发布".to_string()]);
-        let g: Job = crate::storage::files::load_yaml(&ex_dir.join("git.yaml")).unwrap();
+        let g: Job = crate::storage::files::load_yaml(&ex_dir.join("jobs").join("git.yaml")).unwrap();
         assert_eq!(g.group.as_deref(), Some("本地构建"));
-        let d: Job = crate::storage::files::load_yaml(&ex_dir.join("deploy.yaml")).unwrap();
+        let d: Job = crate::storage::files::load_yaml(&ex_dir.join("jobs").join("deploy.yaml")).unwrap();
         assert_eq!(d.group.as_deref(), Some("远端发布"));
 
         // 干跑预览 Linux 合集：占位目标/变量应全部解析（无「未定义」警告），
         // upload 相对路径应拼上 demo-server 的 work_root /opt/demo
         let linux_job: Job =
-            crate::storage::files::load_yaml(&ex_dir.join("linux.yaml")).unwrap();
+            crate::storage::files::load_yaml(&ex_dir.join("jobs").join("linux.yaml")).unwrap();
         let input = crate::engine::RunInput {
             project: p.clone(),
             job: linux_job,

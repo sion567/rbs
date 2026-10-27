@@ -130,7 +130,7 @@ pub fn show(ctx: &egui::Context, main: &mut MainState) {
     if open {
         crate::ui::modal_backdrop(ctx, "mask_targets");
     }
-    egui::Window::new("🎯 目标管理")
+    crate::ui::centered_window(egui::Window::new("🎯 目标管理"), ctx)
         .open(&mut open)
         .order(egui::Order::Foreground)
         .default_width(720.0)
@@ -173,7 +173,8 @@ fn target_list_and_form(ui: &mut egui::Ui, main: &mut MainState) {
     let mut names: Vec<String> = scope_map_ref(main)
         .map(|m| m.keys().cloned().collect())
         .unwrap_or_default();
-    names.sort();
+    // local（本机）固定排第一，其余按名称排
+    names.sort_by_key(|n| (n != "local", n.clone()));
 
     ui.columns(2, |columns| {
         columns[0].set_min_width(170.0);
@@ -267,8 +268,9 @@ fn target_list_and_form(ui: &mut egui::Ui, main: &mut MainState) {
                 }
             }
         }
+        let testing = main.target_editor.test_rx.is_some();
         if ui
-            .button("🔌 测试连接")
+            .add_enabled(!testing, egui::Button::new("🔌 测试连接"))
             .on_hover_text(
                 "SSH 连接测试 + 服务器体检：CPU / 内存 / 磁盘 / 负载（8 秒超时）。\n\
                  直接用当前表单值测试（无需先保存）；密码栏已输入未保存的密码也会参与本次测试",
@@ -276,6 +278,10 @@ fn target_list_and_form(ui: &mut egui::Ui, main: &mut MainState) {
             .clicked()
         {
             start_test(main);
+        }
+        if testing {
+            ui.add(egui::Spinner::new().size(14.0));
+            ui.weak("测试中…");
         }
         if ui.button("💾 保存 project.yaml").clicked() {
             let result = match main.selected_project {

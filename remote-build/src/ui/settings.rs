@@ -196,7 +196,7 @@ pub fn show(ctx: &egui::Context, main: &mut MainState) {
     if open {
         crate::ui::modal_backdrop(ctx, "mask_settings");
     }
-    egui::Window::new("⚙ 设置")
+    crate::ui::centered_window(egui::Window::new("⚙ 设置"), ctx)
         .open(&mut open)
         .order(egui::Order::Foreground)
         .default_width(780.0)
@@ -936,7 +936,15 @@ fn history_section(ui: &mut egui::Ui, main: &mut MainState) {
                     ui.strong("耗时");
                     ui.end_row();
                     for r in &rows {
-                        ui.monospace(&r.started_at).on_hover_text(format!(
+                        // RFC3339(UTC) → 本地时区 yyyy-MM-dd HH:mm:ss
+                        let started = chrono::DateTime::parse_from_rfc3339(&r.started_at)
+                            .map(|t| {
+                                t.with_timezone(&chrono::Local)
+                                    .format("%Y-%m-%d %H:%M:%S")
+                                    .to_string()
+                            })
+                            .unwrap_or_else(|_| r.started_at.clone());
+                        ui.monospace(&started).on_hover_text(format!(
                             "run_id: {}
 日志: {}",
                             r.run_id,
