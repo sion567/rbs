@@ -92,7 +92,7 @@ remote-build preview <项目名> <流程名>           # 干跑预览：解析�
   目标编辑器支持用未保存密码直接「🔌 测试连接」。
 - host key 指纹固定（TOFU）：首次连接测试输出指纹 → 填入「主机键指纹」字段即信任；
   未登记指纹 russh 直接拒连并给出指纹（不自动信任）。
-- russh 私钥须为 OpenSSH 格式；PuTTY PPK 请先用捆绑的 puttygen 转换
+- russh 私钥须为 OpenSSH 格式；PuTTY PPK 请先用 PuTTY 自带的 puttygen 转换
   （`puttygen key.ppk -O private-openssh -o key.pem`）。
 
 ## 示例工程（~/.remote-build/projects/）
@@ -111,8 +111,9 @@ remote-build preview <项目名> <流程名>           # 干跑预览：解析�
 prod-deploy（编译 → pack 打 zip → 多行映射 upload 到 prod 目标 → 远端发布脚本）。
 工程源码在 `E:\workspace\rbs\project-samples\`，配置与代码两层分离（§10.1）。
 
-> 前置：russh 目标**零依赖**开箱即用；仅 `transport: putty` 的目标需要 PuTTY 套件
-> （5 个 exe 放入 `tools/putty/`，见 `tools/putty/README.txt`；缺失时运行期回退系统 PATH）。
+> 前置：russh 目标**零依赖**开箱即用；仅 `transport: putty` 的目标需要本机已安装 PuTTY
+> （安装器默认进 Program Files 并加入 PATH；绿色版在 ⚙ 设置的「PuTTY 目录」指定位置，
+> 需含 plink.exe / pscp.exe）。探测顺序：自定义目录 → 系统 PATH → Program Files。
 
 ## 已知限制
 

@@ -92,7 +92,8 @@ done
 #   bash release.sh --restore [ts]   还原：无 ts 交互选择，有 ts 直接恢复
 #
 # 可用环境变量覆盖：SOURCE_DIR  TARGETS_DIR  DEPLOY_SH  KEEP_BACKUPS=10
-#                   SH_TIMEOUT=600（发布 sh 超时秒数，0=不限）  MIN_FREE_MB=200
+#                   LOG_KEEP=30（日志保留个数）  SH_TIMEOUT=600（发布 sh 超时秒数，0=不限）
+#                   MIN_FREE_MB=200  DB_HOOK_SOFT=0（=1 时数据库快照失败仍继续发布）
 #
 # 依赖：bash 4+（已兼容 4.0~4.3 的空数组限制，CentOS 7 / 部分国产系统的 4.2 也能跑）、
 #       coreutils（sha256sum/cp/mv/df）；flock、timeout 可选。
@@ -340,6 +341,11 @@ setup_log() {
   LOG_FILE="$LOG_DIR/${MODE}-$(date +%Y%m%d-%H%M%S).log"
   exec > >(tee -a -- "$LOG_FILE") 2>&1
   info "日志：$LOG_FILE"
+  # 旧日志按修改时间只保留最近 LOG_KEEP 个，防无限增长
+  local keep="${LOG_KEEP:-30}" old
+  if [[ "$keep" =~ ^[0-9]+$ && "$keep" -gt 0 ]]; then
+    while IFS= read -r old; do rm -f -- "$old"; done < <(ls -t "$LOG_DIR"/*.log 2>/dev/null | tail -n +"$((keep + 1))")
+  fi
 }
 
 print_summary() { # $@=结果行
@@ -377,7 +383,11 @@ build_plan_from_manifest() {
     fi
     for t in $rest; do
       [[ " ${TARGETS_ALL[*]} " == *" $t "* ]] || die "$MANIFEST 里的目标不存在：'$t'（targets/ 下没有这个目录，是不是拼错了？）"
-      PLAN["$t|$(basename "$path")"]="$SOURCE_DIR/$path"
+      key="$t|$(basename "$path")"
+      if [[ -n "${PLAN[$key]:-}" && "${PLAN[$key]}" != "$SOURCE_DIR/$path" ]]; then
+        die "$MANIFEST 冲突：包 '$(basename "$path")' 发到目标 '$t' 有两个不同来源（${PLAN[$key]} 和 sources/$path），请删掉其中一行"
+      fi
+      PLAN["$key"]="$SOURCE_DIR/$path"
     done
   done < "$MANIFEST"
 
@@ -825,8 +835,13 @@ do_restore() {
         info "[演练] 恢复 $pkg.$choice -> $pkg"
         continue
       fi
+      # 还原前快照当前线上包：还原错了还能再切回来（覆盖不可逆，先留底）
+      snapshot_pkg "$tdir" "$pkg"
+      rrc=$?
+      [[ $rrc -eq 0 ]] && info "还原前快照：$SNAP_NAME"
       if copy_verified "$tdir/$pkg.$choice" "$tdir" "$pkg"; then
         ok "恢复 $pkg（sha256 校验一致）"
+        prune_snapshots "$tdir" "$pkg"
       else
         err "恢复 $pkg 失败！请手动检查 $tdir"
         bad=1

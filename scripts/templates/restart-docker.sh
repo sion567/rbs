@@ -92,7 +92,9 @@ if [ -n "$HEALTH_URL" ] && command -v curl >/dev/null 2>&1; then
   fi
   echo "健康检查通过：$HEALTH_URL"
 fi
-if [ -z "$(docker ps --filter name="$APP_NAME" --filter status=running -q)" ]; then
+# 精确比对容器名：--filter name= 是子串匹配，xx-system 会匹配到 xx-system-v2
+_running="$(docker ps --format '{{.Names}}' | grep -Fx "$APP_NAME")" || true
+if [ -z "$_running" ]; then
   echo "restart.sh：容器没有处于运行状态！最近日志：" >&2
   docker logs --tail 50 "$APP_NAME" 2>&1 || true
   exit 1

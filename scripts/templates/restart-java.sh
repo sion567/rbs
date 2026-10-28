@@ -68,9 +68,10 @@ if [ -f "$PID_FILE" ]; then
   fi
   rm -f "$PID_FILE"
 fi
-# 兜底：清掉按 jar 路径匹配的残留进程（PID 文件丢失的场景）
+# 兜底：清掉按 jar 路径匹配的残留进程（PID 文件丢失的场景）。
+# 模式带 "-jar"：只杀 java 进程，避免误杀恰好打开了同路径文件的编辑器等
 if command -v pgrep >/dev/null 2>&1; then
-  for _pid in $(pgrep -f "$JAR_PATH" 2>/dev/null); do
+  for _pid in $(pgrep -f -- "-jar $JAR_PATH" 2>/dev/null); do
     [ "$_pid" != "$$" ] && kill "$_pid" 2>/dev/null || true
     _stopped=1
   done

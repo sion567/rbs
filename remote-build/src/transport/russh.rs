@@ -201,7 +201,7 @@ async fn authenticate(
             if path.to_ascii_lowercase().ends_with(".ppk") {
                 anyhow::bail!(
                     "russh 传输不支持 PuTTY PPK 私钥（{path}）：\
-                     请用捆绑的 puttygen 转换为 OpenSSH 格式 \
+                     请用 PuTTY 自带的 puttygen 转换为 OpenSSH 格式 \
                      （puttygen \"{path}\" -O private-openssh -o \"{path}.pem\"）后改用转换产物，\
                      或把该目标的传输切回 putty"
                 );

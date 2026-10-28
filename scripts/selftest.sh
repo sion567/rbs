@@ -186,14 +186,14 @@ mkdir -p "$S/bin" "$S/targets/web"
 cat > "$S/bin/docker" <<'EOF'
 #!/bin/sh
 case "$1" in
-  rm) echo rm ;; run) echo run >> "$FAKE_LOG" ;; ps) echo cid ;; logs) echo log ;;
+  rm) echo rm ;; run) echo run >> "$FAKE_LOG" ;; ps) echo web ;; logs) echo log ;;
 esac
 EOF
 chmod +x "$S/bin/docker"
 cp "$HERE/templates/restart-docker.sh" "$S/targets/web/restart.sh"
 echo jar-body > "$S/targets/web/app.jar"
-FAKE_LOG="$S/fake.log" run "$S" env FAKE_LOG="$S/fake.log" PATH="$S/bin:$PATH" sh targets/web/restart.sh app.jar
-chk_rc0 "15. docker 模板部署成功（假 docker）"
+run "$S" env FAKE_LOG="$S/fake.log" PATH="$S/bin:$PATH" sh targets/web/restart.sh app.jar
+chk_rc0 "15. docker 模板部署成功（假 docker，精确容器名匹配）"
 chk_file "fake.log" "15. docker run 被调用"
 
 # ---------- 16. java 模板冒烟（假 java：前台运行 60s） ----------
@@ -363,6 +363,71 @@ chk_rcne "27. 快照失败中止发布"
 chk_eq "targets/t1/app.jar" "v2" "27. 中止时包未被动过（仍是上次发布的 v2）"
 run "$S" env DB_HOOK_SOFT=1 bash release.sh
 chk_rc0 "27. DB_HOOK_SOFT=1 硬发继续"
+
+# ---------- 28. restore 覆盖前快照当前线上（还原错了能反悔） ----------
+fresh
+mk_target t1 0; echo v0 > "$S/targets/t1/app.jar"; echo v1 > "$S/sources/app.jar"
+printf 'app.jar  t1\n' > "$S/manifest.txt"
+run "$S" bash release.sh            # 线上 v1，还原点 v0
+echo v2 > "$S/sources/app.jar"
+run "$S" bash release.sh            # 线上 v2，还原点 v1
+TS="$(snap_oldest "targets/t1")"    # v0 的还原点
+run "$S" bash release.sh --restore "$TS"
+chk_rc0 "28. restore 成功"
+chk_eq "targets/t1/app.jar" "v0" "28. 线上回到 v0"
+[[ "$(snap_count "targets/t1")" == "3" ]] && good "28. 还原前快照了 v2（可再切回）" || bad "28. 还原点数量=$(snap_count "targets/t1")"
+_newest_snap="$(ls "$S/targets/t1" | grep -E '\.[0-9]{8}-[0-9]{6}$' | sort | tail -1)"
+chk_eq "targets/t1/$_newest_snap" "v2" "28. 最新还原点内容是还原前的 v2"
+
+# ---------- 29. manifest 同包同目标双来源 -> 拒绝 ----------
+fresh
+mk_target t1 0
+mkdir -p "$S/sources/t1"
+echo aaa > "$S/sources/dist.tar.gz"; echo bbb > "$S/sources/t1/dist.tar.gz"
+printf 'dist.tar.gz  t1\nt1/dist.tar.gz  t1\n' > "$S/manifest.txt"
+run "$S" bash release.sh --dry-run
+chk_rcne "29. 双来源冲突被拒"
+chk_has "两个不同来源" "29. 报错指明冲突"
+
+# ---------- 30. mysql 模板导入失败必须报错（不能静默成功） ----------
+fresh
+mkdir -p "$S/bin"
+cat > "$S/bin/docker" <<'EOF'
+#!/bin/sh
+[ "$1" = "exec" ] || exit 0
+shift
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -e) shift 2 ;;
+    -i) shift ;;
+    *) break ;;
+  esac
+done
+case "$2" in
+  mysqldump) printf -- '-- MySQL dump\n-- Dump completed\n'; exit 0 ;;
+  mysql) echo "ERROR 1064 syntax" >&2; exit 1 ;;
+esac
+exit 0
+EOF
+chmod +x "$S/bin/docker"
+cp "$HERE/templates/backup-mysql.sh" "$S/backup-db.sh"
+run "$S" env PATH="$S/bin:$PATH" MYSQL_CONTAINER=c1 sh backup-db.sh backup
+chk_rc0 "30. 备份正常"
+_gz2="$(ls "$S"/db-backups/appdb.*.sql.gz 2>/dev/null | head -1)"
+run "$S" env PATH="$S/bin:$PATH" MYSQL_CONTAINER=c1 FORCE=1 sh backup-db.sh import "$_gz2"
+chk_rcne "30. mysql 报错时导入失败被检出"
+chk_has "mysql 导入报错" "30. 人话报错"
+
+# ---------- 31. 日志按 LOG_KEEP 清理 ----------
+fresh
+mk_target t1 0; echo v1 > "$S/targets/t1/app.jar"
+printf 'app.jar  t1\n' > "$S/manifest.txt"
+for _i in 1 2 3; do
+  echo "v$_i" > "$S/sources/app.jar"
+  run "$S" env LOG_KEEP=2 bash release.sh
+done
+chk_rc0 "31. 三连发成功"
+[[ "$(ls "$S/logs"/*.log 2>/dev/null | wc -l)" -le 2 ]] && good "31. 日志只保留 2 个" || bad "31. 日志未清理：$(ls "$S/logs" | wc -l) 个"
 
 echo
 echo "== 结果：PASS=$PASS FAIL=$FAIL =="

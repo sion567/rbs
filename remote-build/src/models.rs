@@ -633,7 +633,6 @@ impl Default for GlobalConfig {
             workspace_root: String::new(), // 由 config::default_global() 填充实际路径
             theme: Theme::Dark,
             putty: PuttyConfig {
-                use_builtin: true,
                 custom_path: None,
             },
         }
@@ -642,9 +641,8 @@ impl Default for GlobalConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PuttyConfig {
-    /// true = 用内置版本
-    pub use_builtin: bool,
-    /// 自定义路径，use_builtin=false 时生效
+    /// 自定义 PuTTY 目录（需含 plink.exe / pscp.exe）；
+    /// 未设置时探测系统 PATH → Program Files（内置捆绑目录 2026-10-28 移除）
     pub custom_path: Option<String>,
 }
 
@@ -1038,15 +1036,18 @@ targets:
         let yaml = "theme: dark";
         let g: GlobalConfig = yaml_serde::from_str(yaml).unwrap();
         assert!(matches!(g.theme, Theme::Dark));
-        assert!(g.putty.use_builtin, "默认用内置 putty");
 
         // 缺字段时用 Default
         let g: GlobalConfig = yaml_serde::from_str("{}").unwrap();
         assert_eq!(g.log_retention_days, 30);
-        // 旧版 config.yaml 的已删除字段（max_concurrent_jobs / auto_update_tools）应被忽略
-        let old: GlobalConfig =
-            yaml_serde::from_str("max_concurrent_jobs: 3\nauto_update_tools: false").unwrap();
+        // 旧版 config.yaml 的已删除字段（max_concurrent_jobs / auto_update_tools /
+        // putty.use_builtin——内置捆绑目录 2026-10-28 移除）应被忽略
+        let old: GlobalConfig = yaml_serde::from_str(
+            "max_concurrent_jobs: 3\nauto_update_tools: false\nputty:\n  use_builtin: true",
+        )
+        .unwrap();
         assert_eq!(old.default_timeout, 600);
+        assert_eq!(old.putty.custom_path, None);
     }
 
     #[test]

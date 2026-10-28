@@ -1,13 +1,12 @@
-内置 PuTTY 捆绑目录（设计文档 §5.4）
-====================================
+本目录已废弃（2026-10-28 移除「内置捆绑目录」探测）
+====================================================
 
-仓库不跟踪二进制文件。请从 https://www.putty.org 下载以下 5 个文件放入本目录：
+putty 传输的套件查找已改为通用来源，不再读取本目录：
 
-  plink.exe       远端命令执行
-  pscp.exe        文件上传/下载
-  psftp.exe       SFTP 传输
-  puttygen.exe    密钥转换（ppk <-> pem）
-  pageant.exe     SSH agent（可选启动）
-  VERSION         版本号文件（首行如 "0.79"）
+  1. ⚙ 设置「PuTTY 目录」自定义路径（config.yaml putty.custom_path）
+  2. 系统 PATH（安装器默认会加入）
+  3. 常见安装路径（C:/Program Files/PuTTY 等）
 
-缺失时 build.rs 会编译告警，运行期回退到系统 PATH 中的 PuTTY。
+原因：内置目录会解析到开发机的仓库路径，导致各机器探测结果不一致。
+
+本目录下的 exe（如有）可安全删除；默认传输 russh 不需要 PuTTY。

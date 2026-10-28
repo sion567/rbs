@@ -99,7 +99,20 @@ do_import() { # $1=备份文件
     fi
   fi
   echo "== 导入 $(basename "$im_f") -> $im_db =="
-  gunzip -c -- "$im_f" | docker exec -i -e MYSQL_PWD="$MYSQL_PASS" "$MYSQL_CONTAINER" mysql -u"$MYSQL_USER"
+  # 先解压到临时文件再导入：管道方式拿不到 mysql 的退出码（sh 无 pipefail），
+  # SQL 出错会静默"成功"；重定向方式能拿到真实退出码
+  im_tmp="$BACKUP_DIR/.importing.$$"
+  if ! gunzip -c -- "$im_f" > "$im_tmp" 2>/dev/null; then
+    rm -f -- "$im_tmp"
+    echo "backup-db.sh：解压失败：$im_f" >&2
+    exit 1
+  fi
+  if ! docker exec -i -e MYSQL_PWD="$MYSQL_PASS" "$MYSQL_CONTAINER" mysql -u"$MYSQL_USER" < "$im_tmp"; then
+    rm -f -- "$im_tmp"
+    echo "backup-db.sh：mysql 导入报错（看上方输出），数据可能处于中间状态，可重新导入" >&2
+    exit 1
+  fi
+  rm -f -- "$im_tmp"
   echo "导入完成：$im_db"
 }
 

@@ -1,6 +1,8 @@
-//! PuTTY 套件传输（设计文档 §5，P0 主传输）。
+//! PuTTY 套件传输（设计文档 §5）。
 //!
-//! - 查找优先级（§5.3）：自定义 → 内置捆绑 → 系统 PATH → 常见安装路径
+//! - 查找优先级：自定义 → 系统 PATH → 常见安装路径。
+//!   「内置捆绑目录」一级已移除（2026-10-28）：它解析到开发机仓库路径，
+//!   造成各机器行为不一致；PuttyConfig.use_builtin 字段随之移除。
 //! - 与 tools.yaml 的关系（§3.4 v0.4 澄清）：tools.yaml 的 putty 条目由探测结果
 //!   自动生成、仅供 UI 展示；本模块路径一律以 detect_putty_tools() 为准，不回读 tools.yaml
 //! - 安全红线（§5.7）：禁止 -pw 明文传密码
@@ -23,7 +25,7 @@ use tokio::sync::broadcast;
 #[derive(Debug, Clone, Default)]
 pub struct PuttyDetection {
     pub found: bool,
-    /// custom / builtin / PATH / Program Files
+    /// custom / PATH / Program Files
     pub source: String,
     pub plink: PathBuf,
     pub pscp: PathBuf,
@@ -36,12 +38,6 @@ pub struct PuttyDetection {
     pub version: Option<String>,
 }
 
-pub fn builtin_dir_hint() -> String {
-    get_builtin_putty_dir()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|| "<未知>".to_string())
-}
-
 /// 探测结果缓存：每步执行 / 每次哈希校验都会探测，逐次读盘解析 config.yaml
 /// 再扫候选目录代价不小；结果进程内缓存，save_global（自定义路径可能变化）时失效。
 static DETECTION_CACHE: std::sync::RwLock<Option<PuttyDetection>> = std::sync::RwLock::new(None);
@@ -50,7 +46,7 @@ pub fn invalidate_detection_cache() {
     *DETECTION_CACHE.write().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
-/// 优先级探测：custom → builtin → PATH → Program Files（带进程内缓存）
+/// 优先级探测：custom → PATH → Program Files（带进程内缓存）
 pub fn detect_putty_tools() -> PuttyDetection {
     if let Some(hit) = DETECTION_CACHE.read().unwrap_or_else(|e| e.into_inner()).clone() {
         return hit;
@@ -70,17 +66,12 @@ fn detect_putty_tools_uncached() -> PuttyDetection {
         }
     }
 
-    // 2. 内置捆绑（§5.3 内置目录定位）
-    if let Some(dir) = get_builtin_putty_dir() {
-        candidates.push(("builtin".to_string(), dir));
-    }
-
-    // 3. 系统 PATH
+    // 2. 系统 PATH
     if let Some(dir) = which_dir("plink.exe") {
         candidates.push(("PATH".to_string(), dir));
     }
 
-    // 4. 常见安装路径
+    // 3. 常见安装路径
     for base in ["C:/Program Files/PuTTY", "C:/Program Files (x86)/PuTTY"] {
         candidates.push(("Program Files".to_string(), PathBuf::from(base)));
     }
@@ -107,40 +98,6 @@ fn detect_putty_tools_uncached() -> PuttyDetection {
     }
 
     PuttyDetection::default()
-}
-
-/// 内置目录定位（§5.3）：
-/// 1. cargo run / cargo test：运行时 CARGO_MANIFEST_DIR/tools/putty/
-/// 2. 开发构建：编译期烙入 manifest 路径（直接双击 target/debug 的 exe 也能找到）
-/// 3. 安装后：exe 同目录/tools/putty/
-/// 4. 兜底：~/.remote-build/tools/putty/
-fn get_builtin_putty_dir() -> Option<PathBuf> {
-    if let Ok(manifest) = std::env::var("CARGO_MANIFEST_DIR") {
-        let p = PathBuf::from(manifest).join("tools").join("putty");
-        if p.join("plink.exe").exists() {
-            return Some(p);
-        }
-    }
-    #[cfg(debug_assertions)]
-    {
-        let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tools").join("putty");
-        if p.join("plink.exe").exists() {
-            return Some(p);
-        }
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            let p = parent.join("tools").join("putty");
-            if p.join("plink.exe").exists() {
-                return Some(p);
-            }
-        }
-    }
-    let p = crate::config::app_root().join("tools").join("putty");
-    if p.join("plink.exe").exists() {
-        return Some(p);
-    }
-    None
 }
 
 /// 在 PATH 中查找包含指定可执行文件的目录（Windows 需拼 PATHEXT）
@@ -1002,17 +959,6 @@ mod tests {
     }
 
     #[test]
-    fn bundled_putty_passes_integrity_when_present() {
-        // 开发机捆绑了真实 exe 时，内置目录必须通过完整性校验；
-        // 未捆绑二进制的环境（如 fresh clone）跳过
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tools").join("putty");
-        if !dir.join("plink.exe").exists() {
-            return;
-        }
-        verify_putty_integrity(&dir).expect("捆绑的 PuTTY 应通过完整性校验");
-    }
-
-    #[test]
     fn sha256sum_batch_parsing() {
         let h1 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
         let h2 = "a".repeat(64);
@@ -1044,20 +990,19 @@ mod tests {
     }
 
     #[test]
-    fn detect_finds_builtin_when_bundled() {
-        // cargo test 会注入 CARGO_MANIFEST_DIR，探测必须命中内置目录
-        let bundled =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tools/putty/plink.exe");
-        if !bundled.exists() {
-            return;
-        }
+    fn detect_never_reports_builtin_source() {
+        // 2026-10-28 移除「内置捆绑目录」后的回归锁：即使仓库里残留 tools/putty/
+        // （开发机手动下载过的 exe），探测也绝不能命中它——它解析到开发路径，
+        // 各机器行为不一致。允许的 source 只有 custom / PATH / Program Files。
         invalidate_detection_cache(); // 排除其他测试留下的缓存
         let d = detect_putty_tools();
-        assert!(d.found, "捆绑了 PuTTY 时必须能探测到");
-        // config.yaml 配了 putty.custom_path 时自定义目录按设计优先（source=custom）；
-        // 未配置时必须命中内置目录
-        if d.source != "custom" {
-            assert_eq!(d.source, "builtin");
+        if d.found {
+            assert!(
+                matches!(d.source.as_str(), "custom" | "PATH" | "Program Files"),
+                "source 不应是 builtin，got: {} ({})",
+                d.source,
+                d.plink.display()
+            );
         }
         // 缓存生效：第二次调用返回同一结果
         let d2 = detect_putty_tools();

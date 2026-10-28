@@ -689,14 +689,14 @@ fn start_verify(main: &mut MainState) {
 }
 
 // ---------------------------------------------------------------------------
-// PuTTY：自定义目录设置（探测在执行时按「custom → builtin → PATH → Program Files」进行）
+// PuTTY：自定义目录设置（探测在执行时按「custom → PATH → Program Files」进行）
 // ---------------------------------------------------------------------------
 
 fn putty_section(ui: &mut egui::Ui, global: &mut crate::models::GlobalConfig) {
     ui.heading("PuTTY");
     ui.weak(
-        "SSH 执行 / 上传依赖 plink / pscp。不设置时按「内置捆绑 → 系统 PATH → Program Files」\
-         自动探测；自定义目录优先级最高，需包含 plink.exe / pscp.exe。",
+        "transport: putty 的目标执行 / 上传依赖 plink / pscp。不设置时按「系统 PATH → \
+         Program Files」自动探测；自定义目录优先级最高，需包含 plink.exe / pscp.exe。",
     );
     ui.add_space(4.0);
 

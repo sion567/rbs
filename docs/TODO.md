@@ -396,6 +396,9 @@
 > 消除 pscp 的 shell 解释告警）、协议级 keepalive（治 VPN/NAT 掐空闲连接）、
 > 结构化回调替代 plink 文本解析；russh 互操作弱一档的风险由 putty 兜底对冲。
 > PuTTY 捆绑分发保留（兜底开箱即用 + puttygen 密钥转换依赖它）。
+> ⚠ 后续调整（2026-10-28）：**「内置捆绑目录」探测移除**——它解析到开发机仓库路径
+> （tools/putty/），各机器行为不一致；putty 套件改只认 ⚙ 自定义目录 → 系统 PATH →
+> Program Files，仓库里的捆绑 exe 已 git rm（PPK 转换提示改为「PuTTY 自带 puttygen」）。
 > 设计：docs/RemoteBuildSystem架构设计文档_v0.5.md §5。
 
 ### ✅ 1. 数据模型与传输选择器（已实现）
@@ -426,7 +429,7 @@
   服务器指纹写进错误信息（填入即可信任）；不匹配 = 明确报「指纹不匹配」。
 - 认证：password（协议内存参数，不进命令行/日志）/ key（OpenSSH 格式，RSA 自动协商
   最高哈希签名）；**偏差**：agent（Pageant）认证暂不支持——人话指引改用 password/key
-  或把该目标切回 putty；PPK 给出 puttygen 转换命令提示（套件已捆绑）。
+  或把该目标切回 putty；PPK 给出 puttygen 转换命令提示（PuTTY 安装自带）。
 - 算法：russh 默认集（已拒 SHA-1 类），不额外收紧，`Preferred` 留口子。
 
 ### ✅ 3. 传输行为变化（已实现）
