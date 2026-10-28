@@ -1,10 +1,10 @@
 //! 传输类步骤实现（upload / download / pack）与 creates 守卫检查。
 //!
-//! upload/download 的完整性校验走批量 sha256：一条 plink 往返校验多个文件，
+//! upload/download 的完整性校验走批量 sha256：一条往返校验多个文件（经传输的
+//! remote_sha256_batch：putty 一条 plink / russh 一条 exec 通道），
 //! 取代旧版逐文件冷启动连接（多 jar 上传的主要耗时）。本地哈希 / zip 压缩等
 //! CPU 密集或大文件 IO 一律 `spawn_blocking`，不阻塞 async worker。
 
-use crate::transport::putty::remote_sha256_batch;
 use crate::transport::{self, LogHandle, RemoteTransport};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -231,7 +231,7 @@ pub(crate) async fn upload_step(
     if !file_hashes.is_empty() {
         let paths: Vec<String> =
             file_hashes.keys().map(|i| items[*i].remote.clone()).collect();
-        match remote_sha256_batch(target, &paths).await {
+        match transport.remote_sha256_batch(target, &paths).await {
             Ok(m) => remote_hashes = m,
             Err(e) => log.line(
                 transport::Stream::Stderr,
@@ -290,7 +290,7 @@ pub(crate) async fn upload_step(
             format!("[verify] 批量校验远端 sha256：{} 个文件", uploaded.len()),
         );
         let paths: Vec<String> = uploaded.iter().map(|(r, _)| r.clone()).collect();
-        let remote = remote_sha256_batch(target, &paths).await?;
+        let remote = transport.remote_sha256_batch(target, &paths).await?;
         for (path, local_hash) in &uploaded {
             match remote.get(path) {
                 Some(h) if h == local_hash => {}
@@ -359,7 +359,7 @@ pub(crate) async fn download_step(
     // 下载完整性校验：远端批量 + 本地批量，逐条比对
     if !files.is_empty() {
         let paths: Vec<String> = files.iter().map(|(r, _)| r.clone()).collect();
-        let remote = remote_sha256_batch(target, &paths).await?;
+        let remote = transport.remote_sha256_batch(target, &paths).await?;
         let local_hashes: HashMap<String, String> =
             tokio::task::spawn_blocking(move || {
                 let mut out = HashMap::new();

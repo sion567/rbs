@@ -125,7 +125,7 @@ fn test_conn(args: &[String]) {
         format!("（{owner}）")
     };
     println!("测试连接 {name}{owner_note} ...");
-    match crate::transport::putty::probe_server(&t) {
+    match crate::transport::probe_target(&t, None) {
         Ok((info, elapsed)) => println!("✅ {}", info.display(elapsed)),
         Err(e) => {
             eprintln!("❌ {e}");

@@ -312,13 +312,14 @@ mod tests {
                     host: "10.0.0.1".to_string(),
                     port: 2222,
                     user: "root".to_string(),
-                    auth: crate::models::AuthMethod::None,
-                    host_key: None,
-                },
-                work_root: Some("/opt/builds".to_string()),
-                env: HashMap::new(),
-                cred_key: None,
+                auth: crate::models::AuthMethod::None,
+                host_key: None,
             },
+            transport: None,
+            work_root: Some("/opt/builds".to_string()),
+            env: HashMap::new(),
+            cred_key: None,
+        },
         );
         VarContext { variables, env, targets, run_id: None, now: BuiltinNow::generate() }
     }

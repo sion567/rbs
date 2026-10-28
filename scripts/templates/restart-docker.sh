@@ -1,8 +1,9 @@
 #!/bin/sh
 # restart.sh —— docker 方式重启服务（由 release.sh 在包发布完后自动调用）
 # ---------------------------------------------------------------------------
-# 调用方式：sh restart.sh <包名>...     包名由 release.sh 传入（可多个）
-#           当前目录 = targets/<目标名>/，jar 和配置文件都在这个目录里
+# 调用方式：① release.sh 自动调用：cd 到目标目录后执行 sh restart.sh <包名>...
+#           ② 手动重启（不发新包、不带参数）：sh targets/<目标名>/restart.sh
+#              —— 脚本按自己所在位置定位目标目录，在哪个目录执行都行
 # 返回值：  容器没起来 / 健康探测超时 -> 退出码非 0；
 #           release.sh 据此自动把 jar 回滚到上一个安全版本，并重新执行本脚本
 # 语法：    纯 POSIX sh（release.sh 用 sh restart.sh 方式执行，
@@ -17,30 +18,41 @@
 
 set -e
 
-# ===== 【按项目改】 =====
-APP_PORT=8080                       # 对外端口（宿主机与容器同端口）
-JRE_IMAGE=eclipse-temurin:8-jre     # JRE 镜像，按项目 JDK 版本改（17-jre / 21-jre ...）
-HEALTH_URL=""                       # 启动探测地址，如 http://127.0.0.1:8080/actuator/health
-                                    # 留空 = 只检查容器是否运行；填了 = 等到返回 200 才算成功
-WAIT_SECONDS=60                     # HEALTH_URL 的最长等待秒数
-JAVA_OPTS=""                        # JVM 参数，如 "-Xms512m -Xmx1024m"
+# ===== 【按项目改】（均可被环境变量覆盖，如 APP_PORT=9090 sh restart.sh xxx.jar）=====
+APP_PORT="${APP_PORT:-8080}"                        # 对外端口（宿主机与容器同端口）
+JRE_IMAGE="${JRE_IMAGE:-eclipse-temurin:8-jre}"     # JRE 镜像，按项目 JDK 版本改（17-jre / 21-jre ...）
+HEALTH_URL="${HEALTH_URL:-}"                        # 启动探测地址，如 http://127.0.0.1:8080/actuator/health
+                                                    # 留空 = 只检查容器是否运行；填了 = 等到返回 200 才算成功
+WAIT_SECONDS="${WAIT_SECONDS:-60}"                  # HEALTH_URL 的最长等待秒数
+JAVA_OPTS="${JAVA_OPTS:-}"                          # JVM 参数，如 "-Xms512m -Xmx1024m"
 # ========================
 
-# 取 jar 名：优先用 release.sh 传入的第一个 .jar 参数；没传则用目录里的 jar
+# 目标目录 = 本脚本所在目录（release.sh 会 cd 进来执行；手动执行也能定位）
+APP_DIR="$(cd "$(dirname "$0")" && pwd)"
+APP_NAME="$(basename "$APP_DIR")"   # 容器名 = 目标目录名，如 xx-system
+
+# 取 jar 名：优先用 release.sh 传入的第一个 .jar 参数（相对目标目录）；
+# 没传则用目标目录里的 jar
 JAR=""
 for _a in "$@"; do
   case "$_a" in *.jar) JAR="$_a"; break ;; esac
 done
-if [ -z "$JAR" ]; then
-  set -- *.jar
-  [ -f "$1" ] && JAR="$1"
+if [ -n "$JAR" ]; then
+  case "$JAR" in
+    /*) JAR_PATH="$JAR" ;;
+    *)  JAR_PATH="$APP_DIR/$JAR" ;;
+  esac
+else
+  set -- "$APP_DIR"/*.jar
+  if [ -f "$1" ]; then
+    JAR="$1"
+    JAR_PATH="$1"
+  fi
 fi
-if [ -z "$JAR" ] || [ ! -f "$JAR" ]; then
-  echo "restart.sh：当前目录找不到 jar 包（参数 $*，目录 $(pwd)）" >&2
+if [ -z "${JAR_PATH:-}" ] || [ ! -f "$JAR_PATH" ]; then
+  echo "restart.sh：$APP_DIR 里找不到 jar 包（参数 $*）" >&2
   exit 1
 fi
-
-APP_NAME="$(basename "$(pwd)")"     # 容器名 = 目标目录名，如 xx-system
 
 echo "== [1/3] 删除旧容器 $APP_NAME =="
 if docker rm -f "$APP_NAME" >/dev/null 2>&1; then
@@ -52,13 +64,17 @@ fi
 echo "== [2/3] 启动新容器（$JAR）=="
 RUN_ARGS="-d --name $APP_NAME --restart=always -e TZ=Asia/Shanghai"
 RUN_ARGS="$RUN_ARGS -p $APP_PORT:$APP_PORT"
-RUN_ARGS="$RUN_ARGS -v $(pwd)/$JAR:/app/app.jar:ro"
-if [ -f application.yml ]; then
+RUN_ARGS="$RUN_ARGS -v $JAR_PATH:/app/app.jar:ro"
+if [ -f "$APP_DIR/application.yml" ]; then
   # 挂到 /app/config/ 下，Spring Boot 会自动读取 ./config/application.yml
-  RUN_ARGS="$RUN_ARGS -v $(pwd)/application.yml:/app/config/application.yml:ro"
+  RUN_ARGS="$RUN_ARGS -v $APP_DIR/application.yml:/app/config/application.yml:ro"
 fi
 # 下行 $RUN_ARGS / $JAVA_OPTS 不加引号是有意的（多个参数需要分词）
-docker run $RUN_ARGS --workdir /app "$JRE_IMAGE" java $JAVA_OPTS -jar /app/app.jar
+if ! docker run $RUN_ARGS --workdir /app "$JRE_IMAGE" java $JAVA_OPTS -jar /app/app.jar; then
+  echo "restart.sh：docker run 失败！容器最近日志：" >&2
+  docker logs --tail 50 "$APP_NAME" 2>&1 || true
+  exit 1
+fi
 
 echo "== [3/3] 检查容器状态 =="
 sleep 5

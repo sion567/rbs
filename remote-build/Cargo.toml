@@ -44,6 +44,11 @@ flate2 = "1"                     # gzip 压缩（tar.gz 用）
 glob = "0.3"                     # pack 源通配匹配（如 target/*.jar）+ creates 通配 + pack 排除
 regex = "1"                      # step outputs：从 stdout 按正则捕获运行时变量
 rusqlite = { version = "0.41", features = ["bundled"], optional = true }  # 运行历史（bundled：SQLite 源码编进 exe，免系统安装/DLL）
+# 进程内 SSH 传输（v0.5 默认传输，§5.2）：ring 后端（默认的 aws-lc-rs 需要
+# cmake/nasm，发版机环境不可假设有）；rsa 保留以兼容老服务端 RSA 主机键
+russh = { version = "0.65", default-features = false, features = ["ring", "rsa"] }
+russh-sftp = { version = "3.0", default-features = false }
+ssh-key = "0.7.0-rc.11"          # russh 的主机键指纹计算（HashAlg / PublicKey 类型来源）
 
 [features]
 default = ["sqlite"]

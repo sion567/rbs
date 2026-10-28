@@ -28,7 +28,7 @@ remote-build preview <项目名> <流程名>           # 干跑预览：解析�
 
 | 类型 | 说明 |
 |------|------|
-| `exec` | 执行命令（本地 cmd / 远端 plink） |
+| `exec` | 执行命令（本地 cmd / 远端经目标所选传输：russh 或 plink） |
 | `wait` | 轮询等待就绪：命令 / tcp 可连 / http 2xx 三种探测模式；`fail_exit_code` 让"任务已死"立即失败（长任务配方） |
 | `upload` | 上传（多行映射 `本地 -> 远端`；sha256 校验；内容未变自动跳过传输） |
 | `download` | 下载（`远端 -> 本地`；sha256 校验；父目录自动创建） |
@@ -76,11 +76,24 @@ remote-build preview <项目名> <流程名>           # 干跑预览：解析�
 - **控制台**：实时流式输出、「只看错误」过滤器、复制 / 导出 .log
 - **危险命令提醒**：`rm -rf /`、`chmod -R 777` 等模式预览 ⚠ + 执行前告警（不拦截）
 
+## SSH 传输（v0.5 换防）
+
+- **russh（默认）**：进程内 SSH/SFTP 实现，免装任何外部套件、单 exe 分发；协议级 keepalive
+  30s（治 VPN/NAT 掐空闲连接）；SFTP 远端路径按字面处理（无 shell 解释问题）；
+  上传自动创建远端父目录。
+- **putty（兜底）**：目标配置 `transport: putty` 时走 plink/pscp——怪服务端互操作兜底。
+  旧配置未写 transport 字段 = 兼容按 putty 执行（升级前行为不变），目标编辑器可切换。
+- 主机键指纹（TOFU）两种传输同 UX：russh 只认 `SHA256:…` 形式（putty 兼容 MD5）。
+
 ## 认证与安全
 
-- SSH 密码存 Windows Credential Manager（键 `{项目}/{目标}`），YAML 不落密码；执行经 plink `-pw`
-  （内网可接受；高安全场景用 key / Pageant）。目标编辑器支持用未保存密码直接「🔌 测试连接」。
-- host key 指纹固定（TOFU）：首次连接测试输出指纹 → 填入「主机键指纹」字段即信任。
+- SSH 密码存 Windows Credential Manager（键 `{项目}/{目标}`），YAML 不落密码；russh 经协议
+  内存参数传递（不进命令行），putty 经 plink `-pw`（本机进程列表短暂可见，高安全场景用 key）。
+  目标编辑器支持用未保存密码直接「🔌 测试连接」。
+- host key 指纹固定（TOFU）：首次连接测试输出指纹 → 填入「主机键指纹」字段即信任；
+  未登记指纹 russh 直接拒连并给出指纹（不自动信任）。
+- russh 私钥须为 OpenSSH 格式；PuTTY PPK 请先用捆绑的 puttygen 转换
+  （`puttygen key.ppk -O private-openssh -o key.pem`）。
 
 ## 示例工程（~/.remote-build/projects/）
 
@@ -98,12 +111,13 @@ remote-build preview <项目名> <流程名>           # 干跑预览：解析�
 prod-deploy（编译 → pack 打 zip → 多行映射 upload 到 prod 目标 → 远端发布脚本）。
 工程源码在 `E:\workspace\rbs\project-samples\`，配置与代码两层分离（§10.1）。
 
-> 前置：把 PuTTY 套件 5 个 exe 放入 `tools/putty/`（见 `tools/putty/README.txt`）。
-> 缺失时编译有告警，运行期回退到系统 PATH 中的 PuTTY。
+> 前置：russh 目标**零依赖**开箱即用；仅 `transport: putty` 的目标需要 PuTTY 套件
+> （5 个 exe 放入 `tools/putty/`，见 `tools/putty/README.txt`；缺失时运行期回退系统 PATH）。
 
 ## 已知限制
 
 - YAML 变量值请写字符串（`PORT: "8080"` 而非 `PORT: 8080`），flatten 反序列化不收数字
-- upload/download 为 pscp 整文件复制（无增量/断点续传）；大量小文件先 pack 成单 zip
+- upload/download 为整文件复制（russh SFTP / pscp 均无增量、无断点续传）；大量小文件先 pack 成单 zip
+- russh 传输暂不支持 agent（Pageant）认证——需要 agent 的目标请切回 putty 传输
 - wait 的 http 探测仅支持 http://（https 请用命令模式 `curl -k`）
 - SQLite 历史在编译期可用 `--no-default-features` 裁掉（UI 显示提示，不建库）

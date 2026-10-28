@@ -268,32 +268,7 @@ impl PuttyTransport {
                         // 不落 YAML；执行时经 -pw 传递（本机进程列表存在短暂暴露窗口，
                         // 内网工具可接受，高安全场景请用 key / agent）。
                         // 连接测试场景允许用表单临时密码（不落任何存储）。
-                        let pwd = match transient_password {
-                            Some(p) => p.to_string(),
-                            None => {
-                                let key = target
-                                    .cred_key
-                                    .clone()
-                                    .unwrap_or_else(|| target.name.clone());
-                                match crate::secrets::get_password(&key) {
-                                    Ok(Some(p)) => p,
-                                    Ok(None) => {
-                                        return Err(anyhow::anyhow!(
-                                            "目标「{}」未存储密码（凭据键: {key}）：\
-                                             请在 🎯 目标管理中配置，或改用 key / agent 认证",
-                                            target.name
-                                        ))
-                                    }
-                                    Err(e) => {
-                                        // 凭据管理器故障与「没存过密码」分开报，避免误导排查方向
-                                        return Err(e.context(format!(
-                                            "读取目标「{}」的存储密码失败（凭据键: {key}）",
-                                            target.name
-                                        )));
-                                    }
-                                }
-                            }
-                        };
+                        let pwd = super::resolve_target_password(target, transient_password)?;
                         args.push("-pw".to_string());
                         args.push(pwd);
                     }
@@ -417,6 +392,14 @@ impl RemoteTransport for PuttyTransport {
             anyhow::bail!("pscp download failed with code {}", status.code);
         }
         Ok(())
+    }
+
+    async fn remote_sha256_batch(
+        &self,
+        target: &Target,
+        remote_paths: &[String],
+    ) -> anyhow::Result<HashMap<String, String>> {
+        remote_sha256_batch(target, remote_paths).await
     }
 }
 
@@ -565,13 +548,6 @@ pub const PROBE_CMD: &str = concat!(
     "df -lP; ",
     "echo __RBS_END__",
 );
-
-/// 连接测试 + 服务器体检：一次 plink 往返同时验证 SSH 可达（网络/端口/认证）
-/// 并采集 CPU / 内存 / 磁盘等基础信息。超时 8s（df 比单条 echo 慢）。
-/// 成功返回 (ServerInfo, 耗时毫秒)；失败语义与原 test_connection 一致（含指纹引导）。
-pub fn probe_server(target: &Target) -> Result<(ServerInfo, u128), String> {
-    probe_server_with(target, None)
-}
 
 /// 同 probe_server，但 password 认证可用表单临时密码覆盖 Credential Manager
 /// （目标管理「连接测试」支持验证已输入、尚未保存的密码）。
@@ -856,7 +832,8 @@ fn extract_fingerprint(text: &str) -> Option<String> {
 /// 裸 `SHA256:base64`（PuTTY ≥0.75）或 MD5 十六进制冒号串；
 /// 粘贴整行（如 `ssh-ed25519 255 SHA256:...`）时从中提取指纹。
 /// 认不出（漏抄/多抄字符）返回 None，由调用方给出中文错误。
-fn normalize_host_key(raw: &str) -> Option<String> {
+/// russh 路径同样用它解析目标 host_key（russh 只接受 SHA256 形式，见 russh.rs）。
+pub(crate) fn normalize_host_key(raw: &str) -> Option<String> {
     let raw = raw.trim();
     if raw.is_empty() {
         return None;
@@ -905,6 +882,7 @@ mod tests {
                 auth,
                 host_key: None,
             },
+            transport: None,
             work_root: None,
             env: HashMap::new(),
             cred_key: None,

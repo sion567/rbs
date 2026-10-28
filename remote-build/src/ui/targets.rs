@@ -5,12 +5,14 @@
 //! Windows Credential Manager（§14），不落 YAML。
 
 use crate::app::MainState;
-use crate::models::{AuthMethod, Target, TargetType};
+use crate::models::{AuthMethod, Target, TargetType, TransportKind};
 use eframe::egui;
 use egui::Color32;
 
 const KINDS: [&str; 3] = ["SSH（远端 Linux）", "Kubernetes（本地 kubectl）", "本地"];
 const AUTHS: [&str; 4] = ["key（私钥文件）", "password（密码）", "agent（pageant）", "none"];
+/// SSH 传输实现（v0.5 §5.2 换防）
+const TRANSPORTS: [&str; 2] = ["russh（内置，默认）", "putty（PuTTY 套件兜底）"];
 
 #[derive(Default)]
 pub struct TargetEditorState {
@@ -21,6 +23,9 @@ pub struct TargetEditorState {
     pub name_buf: String,
     pub kind_idx: usize,
     pub auth_idx: usize,
+    pub transport_idx: usize,
+    /// 旧配置未写 transport 字段（兼容按 putty 执行）：表单给出可切换提示
+    pub transport_was_unset: bool,
     /// 新密码输入（写时才读；留空 = 不修改已存密码）
     pub password_buf: String,
     /// Credential Manager 里是否已存密码
@@ -221,9 +226,11 @@ fn target_list_and_form(ui: &mut egui::Ui, main: &mut MainState) {
                             host: String::new(),
                             port: 22,
                             user: String::new(),
-                            auth: AuthMethod::Password { encrypted: String::new() },
-                            host_key: None,
+                        auth: AuthMethod::Password { encrypted: String::new() },
+                        host_key: None,
                         },
+                        // v0.5 §5.2：新建目标默认 russh 传输（免安装 PuTTY 套件）
+                        transport: Some(crate::models::TransportKind::Russh),
                         work_root: None,
                         env: Default::default(),
                         cred_key: None,
@@ -543,6 +550,60 @@ fn edit_form(ui: &mut egui::Ui, main: &mut MainState) {
             }
 
             if matches!(target.target_type, TargetType::Ssh { .. }) {
+                // 传输实现（v0.5 §5.2）：russh 默认 / putty 兜底；改动直接写 target.transport。
+                // 套件缺失且目标不走 putty 时选择器只剩一个有效选项——收起下拉显示
+                // 静态文本；目标正走 putty（含旧配置缺省）时仍要给选择器，用户才有
+                // 入口切走，putty 选项标注套件缺失（选它运行期会报「未找到 PuTTY」）。
+                let putty_found = crate::transport::putty::detect_putty_tools().found;
+                let effective_putty =
+                    target.transport.map(|k| k == TransportKind::Putty).unwrap_or(true);
+                ui.label("传输:");
+                if putty_found || effective_putty {
+                    let t_idx = main.target_editor.transport_idx;
+                    let mut new_t = t_idx;
+                    let labels: [String; 2] = if putty_found {
+                        TRANSPORTS.map(|s| s.to_string())
+                    } else {
+                        ["russh（内置，默认）".to_string(), "putty（⚠ 未检测到套件）".to_string()]
+                    };
+                    egui::ComboBox::from_id_salt("transport_combo")
+                        .selected_text(&labels[t_idx])
+                        .width(220.0)
+                        .show_ui(ui, |ui| {
+                            for (i, label) in labels.iter().enumerate() {
+                                ui.selectable_value(&mut new_t, i, label);
+                            }
+                        });
+                    if new_t != t_idx {
+                        main.target_editor.transport_idx = new_t;
+                        target.transport = Some(match new_t {
+                            0 => TransportKind::Russh,
+                            _ => TransportKind::Putty,
+                        });
+                        main.target_editor.transport_was_unset = false;
+                        main.target_editor.unsaved = true;
+                    }
+                } else {
+                    // Grid 一行只有两格：值格只放 strong，说明文字必须挪到独立提示行
+                    //（同下方 was_unset 行的写法；三格会把后续所有行顶歪）
+                    ui.strong("russh（内置）");
+                    ui.end_row();
+                    ui.label("");
+                    ui.weak("免装 PuTTY 套件；如需 putty 兜底请先安装套件");
+                }
+                ui.end_row();
+                if main.target_editor.transport_was_unset {
+                    ui.label("");
+                    ui.weak(if putty_found {
+                        "旧配置未指定传输，按 putty 执行（行为与升级前一致）；\
+                         可切 russh 免装 PuTTY 套件"
+                    } else {
+                        "旧配置未指定传输，按 putty 执行——但本机未检测到 PuTTY 套件，\
+                         运行会失败；建议切 russh（内置）"
+                    });
+                    ui.end_row();
+                }
+
                 // 注意：一行只能占 Grid 的两格（label + 值控件）。此前在外面多加了
                 // 「远端根目录:」label，把值控件挤到第 2 列、推出可视区（点 ＋ 后
                 // 输入框只露一半），现在 label 直接由 option_text_row 渲染
@@ -848,18 +909,31 @@ fn load_buffers(main: &mut MainState, name: &str) {
     // 克隆目标后在 owned 数据上操作，避免整表借用与 target_editor 写入冲突
     let Some(t) = scope_map_ref(main).and_then(|m| m.get(name)).cloned() else {
         main.target_editor.password_saved = false;
+        main.target_editor.transport_was_unset = false;
         return;
     };
     match &t.target_type {
         TargetType::Ssh { auth, .. } => {
             main.target_editor.kind_idx = 0;
             main.target_editor.auth_idx = auth_index(auth);
+            main.target_editor.transport_was_unset = false;
+            main.target_editor.transport_idx = match t.transport {
+                Some(TransportKind::Russh) => 0,
+                Some(TransportKind::Putty) => 1,
+                // 旧配置缺省：兼容按 putty，表单提示可切换
+                None => {
+                    main.target_editor.transport_was_unset = true;
+                    1
+                }
+            };
         }
         TargetType::Kubernetes { .. } => {
             main.target_editor.kind_idx = 1;
+            main.target_editor.transport_was_unset = false;
         }
         TargetType::Local => {
             main.target_editor.kind_idx = 2;
+            main.target_editor.transport_was_unset = false;
         }
     }
     main.target_editor.password_buf.clear();
@@ -867,7 +941,7 @@ fn load_buffers(main: &mut MainState, name: &str) {
         crate::secrets::get_password(&key).map(|p| p.is_some()).unwrap_or(false);
 }
 
-/// 后台线程做 SSH 连接测试 + 服务器体检（复用 putty::probe_server，8 秒超时）；
+/// 后台线程做 SSH 连接测试 + 服务器体检（按目标传输分发 russh/putty，8 秒超时）；
 /// 回填凭据键，保证密码取自本项目的条目。
 /// 表单里已输入、尚未点「保存密码」的密码直接参与本次测试（DBeaver 式：
 /// 首次配置即可验证连通性，不必先落凭据管理器；临时密码不落任何存储）。
@@ -901,7 +975,7 @@ fn start_test(main: &mut MainState) {
     let (tx, rx) = std::sync::mpsc::channel();
     main.target_editor.test_rx = Some(rx);
     std::thread::spawn(move || {
-        let res = crate::transport::putty::probe_server_with(&t, typed_password.as_deref())
+        let res = crate::transport::probe_target(&t, typed_password.as_deref())
             .map(|(info, elapsed)| {
                 let mut text = info.display(elapsed);
                 if typed_password.is_some() {

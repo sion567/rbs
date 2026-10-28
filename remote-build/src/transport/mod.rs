@@ -1,15 +1,15 @@
 //! 传输抽象（设计文档 §5.1）。
 //!
-//! P0 主传输 = PuttyTransport（§5.2）；本机执行走 LocalTransport；
-//! OpenSshTransport（P1）/ RusshTransport（P2）为预留实现。
+//! v0.5 换防（§5.2）：默认传输 = RusshTransport（进程内，免装 PuTTY）；
+//! PuttyTransport 转为按目标兜底（`transport: putty` 或旧配置缺省）；
+//! 本机执行走 LocalTransport。OpenSshTransport 已移除（硬化参数语义移植进 russh）。
 
 pub mod local;
-pub mod openssh;
 pub mod putty;
 pub mod russh;
 pub mod win_job;
 
-use crate::models::{LogEvent, Target, TargetType};
+use crate::models::{LogEvent, Target, TargetType, TransportKind};
 use async_trait::async_trait;
 use std::collections::HashMap;
 use tokio::sync::{broadcast, mpsc};
@@ -143,8 +143,7 @@ pub trait RemoteTransport: Send + Sync {
         cancel: &mut broadcast::Receiver<()>,
     ) -> anyhow::Result<()>;
 
-    /// P1 预留：step_type=download 落地前无调用方（PuttyTransport 已实现 pscp 下载）
-    #[allow(dead_code)]
+    /// download 步骤的传输通道（远端 -> 本地，单文件；putty=pscp / russh=SFTP）
     async fn download(
         &self,
         target: &Target,
@@ -153,23 +152,90 @@ pub trait RemoteTransport: Send + Sync {
         log: &LogHandle,
         cancel: &mut broadcast::Receiver<()>,
     ) -> anyhow::Result<()>;
+
+    /// 批量取远端文件 sha256（上传预检 / 上传后校验 / 下载校验共用）。
+    /// 缺失文件不出现在结果里（sha256sum 部分成功语义）；完全失败返回 Err，
+    /// 由调用方决定 fail-open（上传前预检）还是判步骤失败（上传后校验）。
+    async fn remote_sha256_batch(
+        &self,
+        target: &Target,
+        remote_paths: &[String],
+    ) -> anyhow::Result<HashMap<String, String>>;
 }
 
-/// 按 target 类型构造传输实现（§5.1 实现计划表）
+/// SSH 目标的实际传输实现（§5.2 迁移策略）：旧配置缺省 = 兼容按 putty（升级前行为不变）
+pub fn effective_transport(target: &Target) -> TransportKind {
+    target.transport.unwrap_or(TransportKind::Putty)
+}
+
+/// 按 target 类型 + transport 字段构造传输实现（§5.1 实现计划表 v0.5 换防）
 pub fn make_transport(target: Option<&Target>) -> anyhow::Result<std::sync::Arc<dyn RemoteTransport>> {
     match target.map(|t| &t.target_type) {
         Some(TargetType::Ssh { .. }) => {
-            let detection = putty::detect_putty_tools();
-            if !detection.found {
-                anyhow::bail!(
-                    "未找到 PuTTY（plink/pscp）。请安装 PuTTY、或在设置中指定路径、\
-                     或把套件放入 {}",
-                    putty::builtin_dir_hint()
-                );
+            let t = target.expect("matched Some above");
+            match effective_transport(t) {
+                TransportKind::Russh => {
+                    Ok(std::sync::Arc::new(russh::RusshTransport::new()))
+                }
+                TransportKind::Putty => {
+                    let detection = putty::detect_putty_tools();
+                    if !detection.found {
+                        anyhow::bail!(
+                            "目标「{}」选择 putty 传输，但未找到 PuTTY（plink/pscp）。\
+                             请安装 PuTTY、或在设置中指定路径、或把套件放入 {}；\
+                             也可以在目标编辑器把「传输」切换为 russh（免装套件）",
+                            t.name,
+                            putty::builtin_dir_hint()
+                        );
+                    }
+                    Ok(std::sync::Arc::new(putty::PuttyTransport::from_detection(&detection)))
+                }
             }
-            Ok(std::sync::Arc::new(putty::PuttyTransport::from_detection(&detection)))
         }
         _ => Ok(std::sync::Arc::new(local::LocalTransport)),
+    }
+}
+
+/// password 认证的密码来源：临时密码（连接测试）优先，其次 Windows Credential Manager。
+/// putty / russh 两条传输路径共用（§14：密码不落 YAML）。
+pub(crate) fn resolve_target_password(
+    target: &Target,
+    transient_password: Option<&str>,
+) -> anyhow::Result<String> {
+    if let Some(p) = transient_password {
+        return Ok(p.to_string());
+    }
+    let key = target.cred_key.clone().unwrap_or_else(|| target.name.clone());
+    match crate::secrets::get_password(&key) {
+        Ok(Some(p)) => Ok(p),
+        Ok(None) => Err(anyhow::anyhow!(
+            "目标「{}」未存储密码（凭据键: {key}）：\
+             请在 🎯 目标管理中配置，或改用 key / agent 认证",
+            target.name
+        )),
+        Err(e) => Err(e.context(format!(
+            "读取目标「{}」的存储密码失败（凭据键: {key}）",
+            target.name
+        ))),
+    }
+}
+
+/// 连接测试 + 服务器体检，按目标传输分发（russh 进程内 / putty 走 plink）。
+/// UI 目标编辑器与 CLI test-conn 共用；transient_password 支持表单临时密码。
+pub fn probe_target(
+    target: &Target,
+    transient_password: Option<&str>,
+) -> Result<(putty::ServerInfo, u128), String> {
+    match effective_transport(target) {
+        TransportKind::Russh => {
+            // 调用方在 std::thread 上同步等待：russh 需要临时 runtime 承载
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| format!("初始化异步运行时失败: {e}"))?;
+            rt.block_on(russh::probe_server_russh(target, transient_password))
+        }
+        TransportKind::Putty => putty::probe_server_with(target, transient_password),
     }
 }
 
@@ -263,6 +329,52 @@ fn decode_with_oem_codepage(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transport_kind_dispatch_legacy_defaults_to_putty() {
+        use crate::models::{AuthMethod, TransportKind};
+        let mut t = Target {
+            name: "t".into(),
+            target_type: TargetType::Ssh {
+                host: "h".into(),
+                port: 22,
+                user: "u".into(),
+                auth: AuthMethod::None,
+                host_key: None,
+            },
+            transport: None,
+            ..Default::default()
+        };
+        // 旧配置缺 transport 字段 = 兼容按 putty（升级前行为不变，§5.2 迁移策略）
+        assert_eq!(effective_transport(&t), TransportKind::Putty);
+        t.transport = Some(TransportKind::Russh);
+        assert_eq!(effective_transport(&t), TransportKind::Russh);
+        t.transport = Some(TransportKind::Putty);
+        assert_eq!(effective_transport(&t), TransportKind::Putty);
+    }
+
+    #[test]
+    fn make_transport_russh_and_local_do_not_require_putty() {
+        use crate::models::{AuthMethod, TransportKind};
+        // russh 目标：构造期不探测 PuTTY 套件（无 PuTTY 环境照常可用，§5 验收清单）
+        let t = Target {
+            name: "t".into(),
+            target_type: TargetType::Ssh {
+                host: "h".into(),
+                port: 22,
+                user: "u".into(),
+                auth: AuthMethod::None,
+                host_key: None,
+            },
+            transport: Some(TransportKind::Russh),
+            ..Default::default()
+        };
+        assert!(make_transport(Some(&t)).is_ok());
+        // 本机目标：无 SSH 语义，恒走 LocalTransport
+        assert!(make_transport(None).is_ok());
+        let local = Target { name: "l".into(), target_type: TargetType::Local, ..Default::default() };
+        assert!(make_transport(Some(&local)).is_ok());
+    }
 
     #[test]
     fn path_helpers_prepend_and_merge() {

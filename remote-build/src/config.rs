@@ -159,6 +159,7 @@ pub fn local_target() -> Target {
     Target {
         name: "local".to_string(),
         target_type: TargetType::Local,
+        transport: None,
         work_root: None,
         env: HashMap::new(),
         cred_key: None,
@@ -332,6 +333,7 @@ pub fn create_example_project() -> Result<()> {
                 auth: AuthMethod::None,
                 host_key: None,
             },
+            transport: None,
             work_root: Some("/opt/demo".to_string()),
             env: HashMap::new(),
             cred_key: None,

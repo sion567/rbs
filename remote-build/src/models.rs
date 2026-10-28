@@ -339,6 +339,10 @@ pub struct ToolsFile {
 pub struct Target {
     pub name: String,
     pub target_type: TargetType,
+    /// SSH 传输实现（v0.5 §5.2 换防）：russh = 进程内默认传输；
+    /// putty = 按目标兜底（需要 PuTTY 套件在位）。
+    /// None（旧配置缺字段）= 兼容模式按 putty 执行，升级前行为不变。
+    pub transport: Option<TransportKind>,
     /// 远端工作目录
     pub work_root: Option<String>,
     pub env: HashMap<String, String>,
@@ -346,6 +350,19 @@ pub struct Target {
     #[serde(skip)]
     pub cred_key: Option<String>,
 }
+
+/// SSH 传输实现（v0.5 §5.2 换防）：russh = 进程内默认传输；putty = PuTTY 套件兜底。
+/// Target.transport 缺省（None）= 兼容模式按 putty（升级前行为不变），与枚举的
+/// 字面量解析无关。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportKind {
+    Russh,
+    Putty,
+}
+kebab_string_enum!(TransportKind {
+    Russh => "russh",
+    Putty => "putty",
+});
 
 #[derive(Debug, Clone, PartialEq, Default)]
 pub enum TargetType {

@@ -73,6 +73,14 @@ impl RemoteTransport for LocalTransport {
     ) -> anyhow::Result<()> {
         anyhow::bail!("local target 不支持 download，请改用 SSH target")
     }
+
+    async fn remote_sha256_batch(
+        &self,
+        _target: &Target,
+        _remote_paths: &[String],
+    ) -> anyhow::Result<HashMap<String, String>> {
+        anyhow::bail!("local target 无远端 sha256 可查（不应用于远端步骤）")
+    }
 }
 
 /// 把子进程 stdout/stderr 双任务转发到 log（§5.6「双 task 并发读」）

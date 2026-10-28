@@ -153,8 +153,8 @@
   相对路径与文件名。upload 的 exclude 仍受 pscp 限制（落到 pack 层做）。
 - **`--dry-run` 输出形态**：列出"会传哪些、跳过哪些"——已实现的干跑预览（✅ 2）
   后续增强上传清单展示时可参照此形态。
-- 已知差距：pscp 整文件复制，rsync 有增量传输；大文件高频场景在 P1 换 OpenSSH
-  transport 后可评估 sftp / rsync 类方案。
+- 已知差距：pscp 整文件复制，rsync 有增量传输；大文件高频场景待第六批 russh/sftp
+  落地后再评估增量传输（SFTP 按偏移续传是第一候选）。
 
 ### kubectl（k8s-apply 步骤的两条现成模式）
 
@@ -306,7 +306,8 @@
 ### 设计文档盘点出的剩余未做项（第五批候选）
 
 - k8s_watch 轮询（§8.3，需要 k8s 环境验证）；步骤级并行（§12.1，单人桌面暂不痛）；
-  OpenSshTransport（P1）；全局 variables.yaml 兜底（§3.7）；watch 跟随模式增强、
+  ~~OpenSshTransport（P1）~~（v0.5 决策：不实现，被 russh 默认传输取代，见第六批）；
+  全局 variables.yaml 兜底（§3.7）；watch 跟随模式增强、
   trace 导出；传输队列面板（需文件粒度事件）；Capistrano 回滚 + Argo 自动回滚（等目录约定设计）。
 
 ## 第五批（Spinnaker / Octopus Deploy 参照）
@@ -333,6 +334,7 @@
   `BatchMode=yes`（等价 plink -batch）；单测锁死三参数必须在场。
 - 密码目标构建期即报人话错误（BatchMode 无法传密码）；P1 取舍：密码走 plink、key 走 OpenSSH。
 - plink 没有 CLI 保活参数，现状由步骤超时兜底，不专门改。
+- v0.5 后续：OpenSshTransport 不再实现，三参数语义移植进 RusshTransport（见第六批）。
 
 ### 备份校验三件套（并入 Capistrano 回滚线，未单独做）
 
@@ -382,5 +384,90 @@
 2. ✅ 组运行（串行 + 失败即停 + 确认合并开始前）——已实现，金丝雀的第一个具体落点：
    组内目标不同的发布 job 串行走，配合单 job 内 step.target 序列即可裸机金丝雀；
 3. 备份校验三件套 → 随 Capistrano 回滚线走（第三批 PM2/Argo 优先级 4 的配套）；
-4. OpenSSH 硬化 → P1 传输替换时直接用（第五批候选的 OpenSshTransport 项）；
+4. OpenSSH 硬化三件套 → 随 v0.5 传输换防语义移植进 russh 配置（OpenSshTransport 本体取消，见第六批）；
 5. 目标组 batch_size 循环（引擎级分批）与并行组运行，等真实多机 / 无关服务批量需求再启动。
+
+## 第六批（传输换防：russh 默认 + PuTTY 按目标兜底，✅ 已实现）
+
+> 来源：设计文档 v0.5（2026-10-27）拍板 §19 待确认问题 4「russh 的定位」——结论与原提案相反：
+> russh + russh-sftp 从 P3 远期预留升级为**默认传输**，PuTTY 套件转为**按目标可选的兜底**，
+> OpenSshTransport（P1 占位）**移除不实现**。
+> 动机：免安装单分发（不再要求 PuTTY 套件在位）、SFTP 替代 SCP（远端路径按字面，
+> 消除 pscp 的 shell 解释告警）、协议级 keepalive（治 VPN/NAT 掐空闲连接）、
+> 结构化回调替代 plink 文本解析；russh 互操作弱一档的风险由 putty 兜底对冲。
+> PuTTY 捆绑分发保留（兜底开箱即用 + puttygen 密钥转换依赖它）。
+> 设计：docs/RemoteBuildSystem架构设计文档_v0.5.md §5。
+
+### ✅ 1. 数据模型与传输选择器（已实现）
+
+- `Target.transport: Option<TransportKind>`（YAML kebab-case：`russh` / `putty`）：
+  - `None`（旧配置缺字段）= 兼容模式**按 putty 执行**（升级前行为不变），UI 提示可切换；
+  - 新建目标默认写 `russh`。
+- `make_transport` 按目标分支（`effective_transport` 解析缺省）：`russh` → RusshTransport；
+  `putty` → `detect_putty_tools()`，找不到套件才报人话错误（含安装/路径指引 +
+  「可切 russh 免装套件」提示）——**russh 目标不再因缺 PuTTY 而失败**。
+- 目标编辑器加「传输」下拉（russh 默认 / putty）；「测试连接」与 CLI test-conn 走
+  `probe_target` 按所选传输分发（russh = 临时 current_thread runtime 承载 probe_server_russh）。
+  下拉按套件状态收敛：本机未检测到 PuTTY 且目标不走 putty → 收起下拉显示静态
+  「russh（内置）」；目标正走 putty（含旧配置缺省）→ 保留下拉给切换入口，
+  putty 选项标注「⚠ 未检测到套件」，旧配置缺省 + 无套件时提示语改为「运行会失败，建议切 russh」。
+
+### ✅ 2. RusshTransport（transport/russh.rs，已实现）
+
+- 依赖：`russh` 0.65 + `russh-sftp` 3.0（设计写 0.64 系，实现时取当期 0.65）；
+  crypto 后端用 **ring**（默认的 aws-lc-rs 需要 cmake/nasm，发版机环境不可假设有）；
+  rsa feature 保留兼容老服务端 RSA 主机键。
+- 进程内实现——无外部进程、无进程树守卫，取消/超时 = drop 连接（远端进程随会话终止）。
+- 连接语义与 plink 现状一致：**每步/每作业新建连接，不做透明重连状态机**；
+  断连直接失败，落引擎既有兜底（upload 默认重试 1 次 + 完整性校验 + job 级 on_failure: retry）。
+- keepalive 30s（无响应 3 次断连）+ 连接超时 10s（openssh.rs `build_ssh_args`
+  ConnectTimeout / ServerAliveInterval 语义移植；openssh.rs 已删除，硬化单测迁移进 russh）。
+- 主机键 TOFU：`check_server_key` 回调算 SHA256 指纹与目标 host_key 比对；未设置 = 拒连并把
+  服务器指纹写进错误信息（填入即可信任）；不匹配 = 明确报「指纹不匹配」。
+- 认证：password（协议内存参数，不进命令行/日志）/ key（OpenSSH 格式，RSA 自动协商
+  最高哈希签名）；**偏差**：agent（Pageant）认证暂不支持——人话指引改用 password/key
+  或把该目标切回 putty；PPK 给出 puttygen 转换命令提示（套件已捆绑）。
+- 算法：russh 默认集（已拒 SHA-1 类），不额外收紧，`Preferred` 留口子。
+
+### ✅ 3. 传输行为变化（已实现）
+
+- upload / download 走 SFTP（先 `request_subsystem("sftp")` 再建会话）：远端路径按字面处理
+  （putty.rs 的「远端路径含空格/shell 特殊字符」告警在 russh 路径不适用）；
+  **上传前自动逐级创建远端父目录**（pscp 做不到的增强）；目录上传 = 内容递归合并到
+  远端路径（§5.9 目录映射语义）；逐文件字节进度事件可发（传输队列面板的地基，UI 未做）。
+- `remote_sha256_batch` 提升为 `RemoteTransport` trait 方法（两条传输各自实现：
+  putty 一条 plink / russh 一条 exec 通道），上传预检/上传后校验/下载校验
+  统一经 trait 分发——steps.rs 不再直接依赖 putty。
+- 上传 zip 打包优化（§5.8）对 SFTP 同样适用，继续保留。
+
+### ✅ 4. OpenSSH 封存（已完成）
+
+- transport/openssh.rs 已删除（P1 占位、全 bail、不支持密码认证）；
+  硬化语义（ConnectTimeout=10s / keepalive=30s+max3）移植进 russh Config，
+  「三参数必须在场」式单测由 Config 构造 + TOFU/超时行为测试承接。
+
+### ✅ 验收（进程内 SSH 服务端 e2e + 全量单测）
+
+- **e2e 手段**：russh server + russh-sftp server 在 127.0.0.1 起真实 SSH 服务端
+  （transport/russh/e2e.rs，SFTP 文件操作 chroot 到临时目录、exec 命令仿真：
+  sha256sum 真算 / test -e 真判 / 探测命令给样例输出），固定 ed25519 主机键嵌入测试。
+  ⚠ 坑：std listener 转 tokio 必须先 `set_nonblocking(true)` 再 `from_std`——
+  阻塞模式 socket 注册进 IOCP 驱动会让握手期整个 runtime 卡死（连定时器都饿死），
+  曾导致 e2e 无限挂起，已在 spawn_server 修复并注释锁定。
+- ✅ TOFU：未登记拒连（错误含服务器指纹与填入指引）/ 指纹不匹配报错 / 登记后放行；
+  ✅ 认证：错误密码拒绝（人话报错）+ 正确密码经 Credential Manager 放行；
+  ✅ exec：stdout 逐行转发 + 退出码透传；✅ 上传（单文件 + 嵌套目录自动创建）；
+  ✅ sha256 批量（缺失文件部分成功语义与 putty 一致）；✅ 下载内容一致；
+  ✅ probe：PROBE_CMD 解析出体检信息（os/host/cores/mem）。
+- ✅ putty 目标回归：transport 缺省 → putty 分支单测锁定（`effective_transport`），
+  plink/pscp 路径零改动。
+- ✅ 无 PuTTY 环境：make_transport 的 russh 分支不探测 PuTTY（单测
+  `make_transport_russh_and_local_do_not_require_putty` 锁定）。
+- ✅ key 认证 e2e（进程内服务端补齐，无需真实 Linux）：服务端 `auth_publickey`
+  只认嵌入主机键的公钥，e2e 复用主机键当用户私钥（免 rand 依赖）；比较用
+  `key_data()`——`PublicKey` 的派生 PartialEq 连 PEM comment 一起比，而 comment
+  不随 SSH 线上协议传输。PPK 路径 e2e 验证给出 puttygen 转换指引。
+- 硬化语义单测迁移落点：`russh::tests::openssh_hardening_semantics_migrated`
+  （keepalive 30s / max 3 / 无闲置 GC / 连接超时 10s 四项断言）。
+- 全量 `cargo test`：113 通过 0 失败（e2e 含 TOFU 三态 / 密码正反 / key / exec /
+  SFTP 上传下载 / sha256 部分成功 / probe）。
