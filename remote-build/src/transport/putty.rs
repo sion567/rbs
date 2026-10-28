@@ -775,8 +775,10 @@ impl ServerInfo {
     }
 }
 
-/// 从 plink 输出提取主机键指纹（SHA256:...）
-fn extract_fingerprint(text: &str) -> Option<String> {
+/// 从连接测试的错误输出提取主机键指纹（SHA256:...）：
+/// russh 的 TOFU 拒连与 putty 首连提示两种文案都带该 token；
+/// 目标编辑器「📌 一键登记指纹」按钮据此回填（targets.rs）。
+pub(crate) fn extract_fingerprint(text: &str) -> Option<String> {
     let idx = text.find("SHA256:")?;
     let rest = &text[idx..];
     let end = rest
@@ -868,6 +870,27 @@ mod tests {
     fn build_ssh_args_rejects_non_ssh() {
         let target = Target { name: "l".into(), target_type: TargetType::Local, ..Default::default() };
         assert!(PuttyTransport::build_ssh_args(&target).is_err());
+    }
+
+    #[test]
+    fn extract_fingerprint_from_both_transport_messages() {
+        // russh TOFU 拒连文案（中文，含完整指纹 token）
+        let russh_err = "该主机尚未登记主机键指纹（TOFU，不自动信任）：\n\
+                         把服务器指纹 SHA256:E4Wpmw1njCQ2d/UhkEpm9xMOTGDIZhgVLIsa0SnpGw4 \
+                         填入目标配置的「主机键指纹」字段后重试";
+        assert_eq!(
+            extract_fingerprint(russh_err).as_deref(),
+            Some("SHA256:E4Wpmw1njCQ2d/UhkEpm9xMOTGDIZhgVLIsa0SnpGw4")
+        );
+        // putty 首连文案（英文 plink 输出）
+        let plink_err = "The server's host key is not cached.\n\
+                         ssh-ed25519 255 SHA256:abc+/43chars== more text";
+        assert_eq!(
+            extract_fingerprint(plink_err).as_deref(),
+            Some("SHA256:abc+/43chars==")
+        );
+        // 无指纹的普通错误 → None
+        assert_eq!(extract_fingerprint("连接超时（10s）"), None);
     }
 
     #[test]

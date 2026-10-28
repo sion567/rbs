@@ -399,6 +399,9 @@
 > ⚠ 后续调整（2026-10-28）：**「内置捆绑目录」探测移除**——它解析到开发机仓库路径
 > （tools/putty/），各机器行为不一致；putty 套件改只认 ⚙ 自定义目录 → 系统 PATH →
 > Program Files，仓库里的捆绑 exe 已 git rm（PPK 转换提示改为「PuTTY 自带 puttygen」）。
+> 配套修复：tools.yaml 的 merge_detection 只增改不删，捆绑时代写入的 putty 条目
+> 会在目标面板永远刷出来——探测 not found 时现在会清理**自动探测**的 putty 条目
+> （detected_from ∈ custom/builtin/PATH/Program Files；手动添加的保留）。
 > 设计：docs/RemoteBuildSystem架构设计文档_v0.5.md §5。
 
 ### ✅ 1. 数据模型与传输选择器（已实现）
@@ -427,6 +430,10 @@
   ConnectTimeout / ServerAliveInterval 语义移植；openssh.rs 已删除，硬化单测迁移进 russh）。
 - 主机键 TOFU：`check_server_key` 回调算 SHA256 指纹与目标 host_key 比对；未设置 = 拒连并把
   服务器指纹写进错误信息（填入即可信任）；不匹配 = 明确报「指纹不匹配」。
+- **📌 一键登记指纹**（2026-10-28）：连接测试失败时从错误输出自动提取服务器指纹
+  （`extract_fingerprint`，russh TOFU 中文文案与 plink 英文输出都覆盖），结果区给出
+  「一键登记指纹」按钮——点一下写进「主机键指纹」字段（不用再拖选复制 43 位串）；
+  切换目标 / 重新测试即作废旧指纹，防跨主机误回填。
 - 认证：password（协议内存参数，不进命令行/日志）/ key（OpenSSH 格式，RSA 自动协商
   最高哈希签名）；**偏差**：agent（Pageant）认证暂不支持——人话指引改用 password/key
   或把该目标切回 putty；PPK 给出 puttygen 转换命令提示（PuTTY 安装自带）。

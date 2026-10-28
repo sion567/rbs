@@ -33,6 +33,9 @@ pub struct TargetEditorState {
     /// 连接测试（后台线程）
     pub test_rx: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
     pub test_result: Option<(bool, String)>,
+    /// 本次测试失败输出里提取到的服务器指纹（TOFU 首连 / 指纹更换场景）；
+    /// 「📌 一键登记指纹」回填进「主机键指纹」字段，免手动拖选 43 位串
+    pub seen_fp: Option<String>,
     /// local 目标的本机信息（后台采集一次，面板展示）
     pub local_info: Option<crate::env_detect::LocalSystemInfo>,
     pub local_info_rx: Option<std::sync::mpsc::Receiver<crate::env_detect::LocalSystemInfo>>,
@@ -75,9 +78,13 @@ pub fn show(ctx: &egui::Context, main: &mut MainState) {
         match rx.try_recv() {
             Ok(Ok(line)) => {
                 main.target_editor.test_result = Some((true, line));
+                main.target_editor.seen_fp = None;
                 main.target_editor.test_rx = None;
             }
             Ok(Err(e)) => {
+                // TOFU 场景提取服务器指纹，供「📌 一键登记指纹」回填
+                main.target_editor.seen_fp =
+                    crate::transport::putty::extract_fingerprint(&e);
                 main.target_editor.test_result = Some((false, e));
                 main.target_editor.test_rx = None;
             }
@@ -331,8 +338,37 @@ fn target_list_and_form(ui: &mut egui::Ui, main: &mut MainState) {
             )
             .selectable(true),
         );
-        if !ok && msg.contains("host key") {
-            ui.weak("提示：把连接测试输出中的 SHA256 指纹（可选中复制）填入「主机键指纹」字段即可信任（TOFU）。");
+        if !ok && (msg.contains("host key") || main.target_editor.seen_fp.is_some()) {
+            // TOFU：从错误输出提取到指纹 → 给一键回填（拖选复制 43 位串太费劲）
+            let fp = main.target_editor.seen_fp.clone();
+            if let Some(fp) = fp {
+                ui.horizontal(|ui| {
+                    let name = main.target_editor.selected.clone().unwrap_or_default();
+                    if ui
+                        .button("📌 一键登记指纹")
+                        .on_hover_text(format!("把 {fp} 写入「主机键指纹」字段（TOFU 信任登记）"))
+                        .clicked()
+                    {
+                        if let Some(t) =
+                            scope_map_mut(main).and_then(|m| m.get_mut(&name))
+                        {
+                            if let TargetType::Ssh { host_key, .. } = &mut t.target_type {
+                                *host_key = Some(fp.clone());
+                            }
+                        }
+                        main.target_editor.seen_fp = None;
+                        main.target_editor.unsaved = true;
+                        main.status_msg = Some(
+                            "📌 指纹已回填到「主机键指纹」——点「💾 保存」落盘，\
+                             再点「🔌 测试连接」验证"
+                                .to_string(),
+                        );
+                    }
+                    ui.weak(format!("服务器指纹：{fp}"));
+                });
+            } else {
+                ui.weak("提示：把连接测试输出中的 SHA256 指纹（可选中复制）填入「主机键指纹」字段即可信任（TOFU）。");
+            }
         }
     }
 }
@@ -905,6 +941,9 @@ fn option_text_row(
 
 fn load_buffers(main: &mut MainState, name: &str) {
     main.target_editor.name_buf = name.to_string();
+    // 切换目标：上一次测试提取的指纹属于旧主机，作废防止误回填
+    main.target_editor.seen_fp = None;
+    main.target_editor.test_result = None;
     let key = cred_key_for(main, name);
     // 克隆目标后在 owned 数据上操作，避免整表借用与 target_editor 写入冲突
     let Some(t) = scope_map_ref(main).and_then(|m| m.get(name)).cloned() else {
@@ -972,6 +1011,8 @@ fn start_test(main: &mut MainState) {
     .filter(|p| !p.is_empty());
 
     main.target_editor.test_result = None;
+    // 旧指纹作废：换目标重测后回填的必须是新错误里的指纹，不能是上一台主机的
+    main.target_editor.seen_fp = None;
     let (tx, rx) = std::sync::mpsc::channel();
     main.target_editor.test_rx = Some(rx);
     std::thread::spawn(move || {

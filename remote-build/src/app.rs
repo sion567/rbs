@@ -491,8 +491,24 @@ impl MainState {
                     if ui.add_enabled(!running, egui::Button::new("🎯 目标")).clicked() {
                         self.target_editor.open = !self.target_editor.open;
                     }
+                    // 状态消息截断：right_to_left 布局里文字从右往左长，
+                    // 长作业名 / 监听路径 / ⚠ 长提示会无边界延伸，压到 ⟳ Reload
+                    // 等左侧按钮上叠画（实测 bug）。truncate 显示省略号，悬停看全文。
                     if let Some(msg) = &self.status_msg {
-                        ui.weak(msg);
+                        ui.with_layout(
+                            egui::Layout::left_to_right(egui::Align::Center)
+                                .with_main_justify(true),
+                            |ui| {
+                                // justify 撑满 right_to_left 分剩的全部宽度 →
+                                // Label::truncate 按剩余宽度截断，永远不会压到左侧按钮
+                                ui.add(
+                                    egui::Label::new(egui::RichText::new(msg).weak())
+                                        .truncate()
+                                        .selectable(false),
+                                )
+                                .on_hover_text(msg);
+                            },
+                        );
                     }
                 });
             });

@@ -150,6 +150,19 @@ pub fn merge_detection(report: &DetectionReport) -> Result<usize> {
         entry.version = report.putty.version.clone();
         entry.detected_from = Some(report.putty.source.clone());
         count += 1;
+    } else {
+        // 探测不到 putty 时清掉**自动探测**留下的旧条目（内置捆绑目录时代的
+        // 残留就属于此类），否则目标面板的工具清单会一直刷出已不存在的 putty。
+        // 手动添加（detected_from = None / "preset" / 用户改写）的条目保留。
+        const AUTO_SOURCES: [&str; 4] = ["custom", "builtin", "PATH", "Program Files"];
+        if file
+            .tools
+            .get("putty")
+            .and_then(|t| t.detected_from.as_deref())
+            .is_some_and(|src| AUTO_SOURCES.contains(&src))
+        {
+            file.tools.remove("putty");
+        }
     }
     save_tools(&file)?;
     Ok(count)
@@ -947,6 +960,45 @@ mod tests {
             .find(|(l, _, _)| l.ends_with("app.jar"))
             .expect("应有 app.jar 上传示范");
         assert!(upload.1.starts_with("/opt/demo/"), "相对远端路径拼 work_root: {}", upload.1);
+
+        // ── merge_detection：探测不到 putty 时清理自动探测的旧条目 ──
+        // （内置捆绑目录时代写入 tools.yaml 的残留，会在目标面板一直刷出来）
+        let mut file = load_tools().unwrap_or_default();
+        let auto = Tool {
+            name: "putty".into(),
+            tool_type: ToolType::Custom,
+            command: "E:/dev/tools/putty/pscp.exe".into(),
+            version: Some("0.79".into()),
+            version_check: None,
+            detected_from: Some("builtin".into()),
+            env: HashMap::new(),
+        };
+        file.tools.insert("putty".to_string(), auto);
+        save_tools(&file).unwrap();
+        let report = DetectionReport { tools: Vec::new(), putty: Default::default() };
+        merge_detection(&report).unwrap();
+        let t = load_tools().unwrap();
+        assert!(!t.tools.contains_key("putty"), "自动探测的 putty 条目应被清理: {:?}", t.tools.keys());
+
+        // 手动添加的 putty（detected_from = None）保留
+        let manual = Tool {
+            name: "putty".into(),
+            tool_type: ToolType::Custom,
+            command: "D:/tools/putty/pscp.exe".into(),
+            version: None,
+            version_check: None,
+            detected_from: None,
+            env: HashMap::new(),
+        };
+        file.tools.insert("putty".to_string(), manual);
+        save_tools(&file).unwrap();
+        merge_detection(&report).unwrap();
+        let t = load_tools().unwrap();
+        assert!(
+            t.tools.get("putty").map(|p| p.command.as_str()) == Some("D:/tools/putty/pscp.exe"),
+            "手动 putty 条目应保留: {:?}",
+            t.tools.get("putty")
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
         std::env::remove_var("REMOTE_BUILD_HOME");
