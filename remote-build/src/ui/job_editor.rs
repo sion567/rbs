@@ -349,6 +349,9 @@ pub fn show(main: &mut MainState, ui: &mut egui::Ui) {
     ui.separator();
 
     // ── 前置检查（Task preconditions）：执行前本地断言，失败零秒退出 ──
+    // 折叠区设计：条目非空才渲染头部（空时零占位）；有条目默认展开，
+    // 用户手动收起后 egui 记住选择（id_salt 固定，增删条目不重置状态）——
+    // 前置一多不再把下面步骤列表的可视区挤没
     let mut pre_del: Option<usize> = None;
     let mut pre_add = false;
     ui.add_enabled_ui(!running, |ui| {
@@ -365,32 +368,41 @@ pub fn show(main: &mut MainState, ui: &mut egui::Ui) {
             {
                 pre_add = true;
             }
-            if !job.preconditions.is_empty() {
-                ui.weak(format!(
-                    "前置检查 {} 条（只做检查不做动作）：任一失败整个流程不执行",
-                    job.preconditions.len()
-                ));
+            if job.preconditions.is_empty() {
+                ui.weak("（无前置检查——需要发版前断言环境时点左侧添加）");
             }
         });
-        for (i, pre) in job.preconditions.iter_mut().enumerate() {
-            ui.horizontal(|ui| {
-                if ui.small_button("−").clicked() {
-                    pre_del = Some(i);
-                }
-                ui.monospace(format!("{}", i + 1));
-                ui.add(
-                    egui::TextEdit::singleline(&mut pre.check)
-                        .desired_width(crate::ui::input::LONG)
-                        .hint_text("本地命令，如 java -version"),
-                );
-                ui.add(
-                    egui::TextEdit::singleline(&mut pre.message)
-                        .desired_width(crate::ui::input::LONG)
-                        .hint_text("失败时的人话说明（为什么失败 / 该怎么办）"),
-                );
-            });
-        }
     });
+    if !job.preconditions.is_empty() {
+        egui::CollapsingHeader::new(egui::RichText::new(format!(
+            "⚖ 前置检查（{} 条，任一失败整个流程不执行）",
+            job.preconditions.len()
+        )))
+        .id_salt("job_editor_preconditions")
+        .default_open(true)
+        .show(ui, |ui| {
+            ui.add_enabled_ui(!running, |ui| {
+                for (i, pre) in job.preconditions.iter_mut().enumerate() {
+                    ui.horizontal(|ui| {
+                        if ui.small_button("−").clicked() {
+                            pre_del = Some(i);
+                        }
+                        ui.monospace(format!("{}", i + 1));
+                        ui.add(
+                            egui::TextEdit::singleline(&mut pre.check)
+                                .desired_width(crate::ui::input::LONG)
+                                .hint_text("本地命令，如 java -version"),
+                        );
+                        ui.add(
+                            egui::TextEdit::singleline(&mut pre.message)
+                                .desired_width(crate::ui::input::LONG)
+                                .hint_text("失败时的人话说明（为什么失败 / 该怎么办）"),
+                        );
+                    });
+                }
+            });
+        });
+    }
     if let Some(i) = pre_del {
         if i < job.preconditions.len() {
             job.preconditions.remove(i);
@@ -904,34 +916,41 @@ fn edit_step(
                         }
                     }
                 });
-            tool_resp.response.on_hover_text(
-                "选择工具的作用：\n\
+            tool_resp.response.on_hover_text({
+                // 来源徽标（〔全局〕/〔项目〕）与解析路径并入悬停：行内常驻徽标
+                // 会把步骤行撑长，窄窗口下后续控件被挤出卡片显示不全（实测 bug）。
+                // 下拉列表本身的「— 本项目 — / — 全局 —」分组已标来源。
+                let mut hover = "选择工具的作用：\n\
                  1. 该工具的环境变量注入本步骤；\n\
                  2. 工具所在目录前置到 PATH——命令里写裸名（java / mvn / node…）时，\n\
                     用的就是这个工具的版本（多个 java 并存时靠它选版本）。\n\
-                 命令本身不变；具体解析路径见「👁 预览」或 🎯 目标管理 → 本机工具链",
-            );
-            // 来源徽标 + 悬停显示解析到的实际 command
-            if !step.tool.is_empty() {
-                match tool_menu.merged.get(&step.tool) {
-                    Some(tool) => {
-                        let from_project = tool_menu.project.iter().any(|n| n == &step.tool);
-                        let (badge, color) = if from_project {
-                            ("〔项目〕", Color32::from_rgb(230, 180, 80))
-                        } else {
-                            ("〔全局〕", Color32::GRAY)
-                        };
-                        ui.colored_label(color, badge).on_hover_text(format!(
-                            "解析到: {}{}",
-                            tool.command,
-                            if from_project { "\n（项目级覆盖）" } else { "" }
-                        ));
-                    }
-                    None => {
-                        ui.colored_label(Color32::from_rgb(220, 120, 90), "（未映射）")
-                            .on_hover_text("工具清单里没有这个名字；可在 ⚙ 设置或「🔧 工具覆盖」中添加");
+                 命令本身不变；具体解析路径见「👁 预览」或 🎯 目标管理 → 本机工具链"
+                    .to_string();
+                if !step.tool.is_empty() {
+                    match tool_menu.merged.get(&step.tool) {
+                        Some(tool) => {
+                            let from_project =
+                                tool_menu.project.iter().any(|n| n == &step.tool);
+                            hover.push_str(&format!(
+                                "\n\n当前「{}」来源: {}{}\n解析到: {}",
+                                step.tool,
+                                if from_project { "项目级覆盖" } else { "全局" },
+                                if from_project { "（同名覆盖全局）" } else { "" },
+                                tool.command
+                            ));
+                        }
+                        None => hover.push_str(
+                            "\n\n⚠ 未映射：工具清单里没有这个名字；\
+                             可在 ⚙ 设置或「🔧 工具覆盖」中添加",
+                        ),
                     }
                 }
+                hover
+            });
+            // 未映射保留行内红标：需要用户处理的异常，不能只藏在悬停里
+            if !step.tool.is_empty() && !tool_menu.merged.contains_key(&step.tool) {
+                ui.colored_label(Color32::from_rgb(220, 120, 90), "⚠未映射")
+                    .on_hover_text("工具清单里没有这个名字；可在 ⚙ 设置或「🔧 工具覆盖」中添加");
             }
 
             ui.separator();
