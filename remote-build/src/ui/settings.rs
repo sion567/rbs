@@ -59,8 +59,10 @@ pub struct ToolEditorState {
     pub env_buf: String,
     /// 验证结果 (是否成功, 展示文本)
     pub verify: Option<(bool, String)>,
-    /// 后台验证线程回传
-    pub verify_rx: Option<std::sync::mpsc::Receiver<Option<String>>>,
+    /// 后台验证线程回传（工具名, 结果）——名随结果走，切换选中后仍能归位
+    pub verify_rx: Option<std::sync::mpsc::Receiver<(String, Option<String>)>>,
+    /// 本会话内每个工具的最近验证结果（列表 ✓/✗ 标记；会话态不落盘）
+    pub verify_results: std::collections::HashMap<String, (bool, String)>,
     pub unsaved: bool,
 }
 
@@ -69,6 +71,7 @@ fn reset_editor(main: &mut MainState) {
     main.tool_editor.name_buf.clear();
     main.tool_editor.env_buf.clear();
     main.tool_editor.verify = None;
+    main.tool_editor.verify_results.clear();
     main.tool_editor.unsaved = false;
 }
 
@@ -162,15 +165,19 @@ pub fn show(ctx: &egui::Context, main: &mut MainState) {
     // 回收后台验证结果
     if let Some(rx) = &main.tool_editor.verify_rx {
         match rx.try_recv() {
-            Ok(Some(first_line)) => {
+            Ok((name, Some(first_line))) => {
+                main.tool_editor
+                    .verify_results
+                    .insert(name.clone(), (true, first_line.clone()));
                 main.tool_editor.verify = Some((true, first_line));
                 main.tool_editor.verify_rx = None;
             }
-            Ok(None) => {
-                main.tool_editor.verify = Some((
-                    false,
-                    "无输出（超时 3s / 命令不存在 / 启动失败）".to_string(),
-                ));
+            Ok((name, None)) => {
+                let msg = "无输出（超时 3s / 命令不存在 / 启动失败）".to_string();
+                main.tool_editor
+                    .verify_results
+                    .insert(name.clone(), (false, msg.clone()));
+                main.tool_editor.verify = Some((false, msg));
                 main.tool_editor.verify_rx = None;
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {}
@@ -336,7 +343,17 @@ fn tool_editor(ui: &mut egui::Ui, main: &mut MainState) {
                 for name in &names {
                     let sel =
                         main.tool_editor.selected.as_deref() == Some(name.as_str());
-                    if ui.selectable_label(sel, name).clicked() {
+                    // 「最近验证」标记：本会话验证过的工具带 ✓/✗（运行期引擎自检的
+                    // 手动对应物；悬停看验证输出详情）
+                    let mut text = name.clone();
+                    if let Some((ok, _)) = main.tool_editor.verify_results.get(name) {
+                        text.push_str(if *ok { " ✓" } else { " ✗" });
+                    }
+                    let mut resp = ui.selectable_label(sel, egui::RichText::new(&text));
+                    if let Some((_, msg)) = main.tool_editor.verify_results.get(name) {
+                        resp = resp.on_hover_text(format!("最近验证：{msg}"));
+                    }
+                    if resp.clicked() {
                         main.tool_editor.selected = Some(name.clone());
                         load_buffers(main, name);
                         main.tool_editor.verify = None;
@@ -684,7 +701,7 @@ fn start_verify(main: &mut MainState) {
             Some(t) => crate::env_detect::run_version_check_for_tool(&check, &t),
             None => crate::env_detect::run_version_check(&check),
         };
-        let _ = tx.send(result);
+        let _ = tx.send((name, result));
     });
 }
 
@@ -726,10 +743,12 @@ fn putty_section(ui: &mut egui::Ui, global: &mut crate::models::GlobalConfig) {
             }
         }
         if ui.button("📂 浏览…").clicked() {
-            if let Some(dir) = rfd::FileDialog::new()
-                .set_title("选择 PuTTY 所在文件夹（含 plink.exe / pscp.exe）")
-                .pick_folder()
-            {
+            // 起点 = 输入框当前路径（所有浏览按钮统一约定）
+            let starting = global.putty.custom_path.clone().unwrap_or_default();
+            if let Some(dir) = crate::ui::pick_folder(
+                &starting,
+                "选择 PuTTY 所在文件夹（含 plink.exe / pscp.exe）",
+            ) {
                 global.putty.custom_path = Some(dir.to_string_lossy().to_string());
                 changed = true;
             }

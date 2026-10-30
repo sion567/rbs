@@ -40,6 +40,11 @@ impl ToolMenu {
     }
 }
 
+/// 类型下拉收起态用短标签（收起按钮 90px 即可容纳，长说明在弹层里）：
+/// 第一行此前塞不下 checkbox+Step号+名称+工具+类型+超时+5 个按钮（自然宽
+/// 956px，布局回归测试实测），工具/超时移入「执行参数」行、类型用短标签收窄
+const STEP_TYPES_SHORT: [&str; 6] = ["exec", "wait", "upload", "download", "pack", "k8s"];
+
 const STEP_TYPES: [&str; 6] = [
     "exec（执行命令）",
     "wait（轮询等待）",
@@ -48,10 +53,6 @@ const STEP_TYPES: [&str; 6] = [
     "pack（打包 zip）",
     "k8s-apply（kubectl 应用）",
 ];
-
-fn step_type_label(st: &StepType) -> &'static str {
-    STEP_TYPES[step_type_index(st)]
-}
 
 fn step_type_index(st: &StepType) -> usize {
     match st {
@@ -110,6 +111,7 @@ enum StepAction {
     None,
     Delete,
     MoveUp,
+    MoveDown,
     /// 从该步骤执行到流程结束
     RunFrom,
     /// 只执行该步骤（调试）
@@ -120,24 +122,28 @@ pub fn show(main: &mut MainState, ui: &mut egui::Ui) {
     let Some(pi) = main.selected_project else {
         ui.vertical_centered(|ui| {
             ui.add_space(40.0);
-            ui.label("← 从左侧选择一个作业开始");
+            ui.label("← 从左侧选择一个流程开始");
         });
         return;
     };
     let Some(ji) = main.selected_job else {
         ui.vertical_centered(|ui| {
             ui.add_space(40.0);
-            ui.label("← 从左侧选择一个作业开始");
+            ui.label("← 从左侧选择一个流程开始");
         });
         return;
     };
     if main.projects.get(pi).is_none() || main.projects[pi].jobs.get(ji).is_none() {
-        ui.vertical_centered(|ui| ui.label("作业不存在，请点 ⟳ 重新加载"));
+        ui.vertical_centered(|ui| ui.label("流程不存在，请点 ⟳ 重新加载"));
         return;
     }
 
-    // 校验提示（§9.4）——先取 owned，避免与下面的可变借用冲突
-    let issues = crate::config::validate_project(&main.projects[pi].project);
+    // 校验提示（§9.4）——读缓存（reload 时算一次）；先取 owned，避免与下面的可变借用冲突
+    let issues = main
+        .validation
+        .get(&main.projects[pi].project.name)
+        .cloned()
+        .unwrap_or_default();
     for issue in &issues {
         match issue {
             crate::models::ValidationIssue::Error { message, .. } => {
@@ -188,7 +194,14 @@ pub fn show(main: &mut MainState, ui: &mut egui::Ui) {
     // ── 第 2 行：变量组 / 目标 / 失败策略（悬停可见说明）──
     ui.add_enabled_ui(!running, |ui| {
         ui.horizontal(|ui| {
-            ui.heading(format!("📄 {}", job.name));
+            // 长流程名截断 + 悬停看全：heading 不截断，会把整行撑宽、
+            // 把项目目录输入框和浏览按钮推出可视区
+            let shown_name = crate::ui::truncate_label(&job.name, 24);
+            ui.add(
+                egui::Label::new(egui::RichText::new(format!("📄 {shown_name}")).heading())
+                    .truncate(),
+            )
+            .on_hover_text(&job.name);
             ui.separator();
             ui.label("项目目录:");
             let dir_width = (ui.available_width() - 90.0).max(280.0);
@@ -198,10 +211,8 @@ pub fn show(main: &mut MainState, ui: &mut egui::Ui) {
                     .hint_text("D:\\workspace\\my-project"),
             );
             if ui.button("📂 浏览…").clicked() {
-                if let Some(dir) = rfd::FileDialog::new()
-                    .set_title("选择项目本地目录")
-                    .pick_folder()
-                {
+                // 起点 = 输入框当前路径（所有浏览按钮统一约定）
+                if let Some(dir) = crate::ui::pick_folder(&project.local_path, "选择项目本地目录") {
                     project.local_path = dir.to_string_lossy().to_string();
                 }
             }
@@ -214,6 +225,7 @@ pub fn show(main: &mut MainState, ui: &mut egui::Ui) {
                  注意：它不是 Spring profile 那样的运行环境；执行机器由「目标」决定。",
             );
             egui::ComboBox::from_id_salt("env_combo")
+                .truncate()
                 .selected_text(job.environment.clone().unwrap_or_else(|| "无".to_string()))
                 .width(140.0)
                 .show_ui(ui, |ui| {
@@ -231,6 +243,7 @@ pub fn show(main: &mut MainState, ui: &mut egui::Ui) {
                  local = 本机 cmd 执行；SSH 目标 = 远端 Linux（exec 经 plink、upload 经 pscp）。",
             );
             egui::ComboBox::from_id_salt("target_combo")
+                .truncate()
                 .selected_text(job.target.clone().unwrap_or_else(|| "无".to_string()))
                 .width(160.0)
                 .show_ui(ui, |ui| {
@@ -260,6 +273,7 @@ pub fn show(main: &mut MainState, ui: &mut egui::Ui) {
                     ui.selectable_value(&mut job.on_failure, FailureAction::Retry, "retry");
                 });
             // job 级整体重试参数（on_failure: retry 时生效）
+            // 定宽：DragValue 缺省会按内容自适应变宽，输入位数一多把同行后续控件挤出窗口
             if matches!(job.on_failure, FailureAction::Retry) {
                 let r = job.retry.get_or_insert(crate::models::RetryConfig {
                     max_attempts: 2,
@@ -269,12 +283,30 @@ pub fn show(main: &mut MainState, ui: &mut egui::Ui) {
                 ui.add(
                     egui::DragValue::new(&mut r.max_attempts)
                         .suffix("次")
+                        .clip_text(true)
+                        .min_size(egui::vec2(52.0, 0.0))
                         .range(1..=10),
                 );
-                ui.add(egui::DragValue::new(&mut r.backoff_seconds).suffix("s").range(0..=600));
+                ui.add(
+                    egui::DragValue::new(&mut r.backoff_seconds)
+                        .suffix("s")
+                        .clip_text(true)
+                        .min_size(egui::vec2(56.0, 0.0))
+                        .range(0..=600),
+                );
             }
+        });
+    });
 
-            ui.separator();
+    // ── 第 3 行：流程管理按钮 ──（确认门也放这里：第 2 行在 on_failure=retry
+    // 展开重试参数时横向空间不够，会把确认门挤出可视区）
+    let mut open_tool_overrides = false;
+    let mut create_job_requested = false;
+    let mut delete_job_confirmed = false;
+    let mut open_var_help = false;
+    ui.add_space(4.0);
+    ui.add_enabled_ui(!running, |ui| {
+        ui.horizontal(|ui| {
             // 人工确认门（GHA environment protection）：防手滑上生产
             match &mut job.confirm {
                 Some(c) => {
@@ -290,6 +322,7 @@ pub fn show(main: &mut MainState, ui: &mut egui::Ui) {
                     if ui.small_button("×").clicked() {
                         job.confirm = None;
                     }
+                    ui.separator();
                 }
                 None => {
                     if ui
@@ -301,20 +334,15 @@ pub fn show(main: &mut MainState, ui: &mut egui::Ui) {
                     {
                         job.confirm = Some("prod".to_string());
                     }
+                    ui.separator();
                 }
             }
-        });
-    });
-
-    // ── 第 3 行：流程管理按钮 ──
-    let mut open_tool_overrides = false;
-    let mut create_job_requested = false;
-    let mut delete_job_confirmed = false;
-    let mut open_var_help = false;
-    ui.add_space(4.0);
-    ui.add_enabled_ui(!running, |ui| {
-        ui.horizontal(|ui| {
-            if ui.button("🔧 工具覆盖").clicked() {
+            // 与 ⚙ 设置窗口的「🧰 工具管理」页同名：这里是一键直达本项目的工具覆盖页
+            if ui
+                .button("🧰 工具管理")
+                .on_hover_text("管理本项目的工具覆盖（写入 project.yaml 的 tools 段）；\n机器级工具在 ⚙ 设置 → 🧰 工具管理 → 🌐 全局")
+                .clicked()
+            {
                 open_tool_overrides = true;
             }
             if ui.button("？ 变量语法").clicked() {
@@ -383,19 +411,24 @@ pub fn show(main: &mut MainState, ui: &mut egui::Ui) {
         .show(ui, |ui| {
             ui.add_enabled_ui(!running, |ui| {
                 for (i, pre) in job.preconditions.iter_mut().enumerate() {
+                    // 检查命令与人话说明上下两行：并排两个 LONG 定宽输入框在窄窗口
+                    // 会把右半截推出可视区（横向溢出，× 都看不到）
                     ui.horizontal(|ui| {
                         if ui.small_button("−").clicked() {
                             pre_del = Some(i);
                         }
                         ui.monospace(format!("{}", i + 1));
+                        let check_w = (ui.available_width() - 30.0).max(160.0);
                         ui.add(
                             egui::TextEdit::singleline(&mut pre.check)
-                                .desired_width(crate::ui::input::LONG)
+                                .desired_width(check_w)
                                 .hint_text("本地命令，如 java -version"),
                         );
+                    });
+                    ui.indent("pre_msg_indent", |ui| {
                         ui.add(
                             egui::TextEdit::singleline(&mut pre.message)
-                                .desired_width(crate::ui::input::LONG)
+                                .desired_width(ui.available_width())
                                 .hint_text("失败时的人话说明（为什么失败 / 该怎么办）"),
                         );
                     });
@@ -479,7 +512,7 @@ pub fn show(main: &mut MainState, ui: &mut egui::Ui) {
             }
         });
 
-    // 从后往前应用删除/上移，避免索引失效
+    // 从后往前应用删除/上移，避免索引失效（一帧至多一个点击动作，方向混排安全）
     for (si, action) in actions.iter().enumerate().rev() {
         match action {
             StepAction::Delete => {
@@ -490,6 +523,11 @@ pub fn show(main: &mut MainState, ui: &mut egui::Ui) {
             StepAction::MoveUp => {
                 if si > 0 && si < job.steps.len() {
                     job.steps.swap(si - 1, si);
+                }
+            }
+            StepAction::MoveDown => {
+                if si + 1 < job.steps.len() {
+                    job.steps.swap(si, si + 1);
                 }
             }
             StepAction::RunFrom | StepAction::RunOnly => {}
@@ -582,6 +620,7 @@ pub fn show_new_job_window(ctx: &egui::Context, main: &mut MainState) {
                         let selected =
                             main.new_job.preset_group.clone().unwrap_or_else(|| "（不分组）".to_string());
                         egui::ComboBox::from_id_salt("new_job_group")
+                            .truncate()
                             .selected_text(selected)
                             .width(180.0)
                             .show_ui(ui, |ui| {
@@ -731,22 +770,22 @@ pub fn show_var_help_window(ctx: &egui::Context, main: &mut MainState) {
             let rows: Vec<(String, &str, &str)> = vec![
                 (
                     "${{ variables.X }}".into(),
-                    "project.yaml 的 variables.<组名>（「变量组」下拉选中的表）",
+                    "project.yaml 的 variables.<组名>（「变量组」下拉选中的表；YAML 字段名仍为 environment）",
                     "选 prod 组时 ${{ variables.DEPLOY_DIR }} → /opt/yudao/prod",
                 ),
                 (
                     "${{ variables.X || 默认值 }}".into(),
-                    "X 未定义时取默认值（Jinja2 default 语义；默认值可带引号）",
+                    "X 未定义时取默认值（Jinja2 default 语义；默认值可带引号；已定义但为空串仍用空串）",
                     "${{ variables.PORT || 8080 }} → 未定义时展开为 8080",
                 ),
                 (
                     "${{ env.X }}".into(),
-                    "前序步骤产出（往 workspace/.env 写 KEY=VALUE，步骤成功后自动捕获）",
-                    "docker build -t app:${{ env.VERSION }}",
+                    "前序步骤产出（往 workspace/.env 写 KEY=VALUE，步骤成功后自动捕获；与 outputs 捕获同命名空间）",
+                    "前一步 echo VERSION=1.2.0>.env，本步 docker build -t app:${{ env.VERSION }}",
                 ),
                 (
                     "${{ targets.名.字段 }}".into(),
-                    "targets.yaml 目标字段（host/port/user/kubeconfig/context/namespace/registry/work_root）",
+                    "本项目目标（project.yaml targets 表）的字段：host / port / user / kubeconfig /\ncontext / namespace / registry / work_root / name",
                     "${{ targets.prod.host }} → 192.168.40.198",
                 ),
                 (
@@ -778,6 +817,10 @@ pub fn show_var_help_window(ctx: &egui::Context, main: &mut MainState) {
                 });
                 ui.add_space(4.0);
             }
+            ui.weak(
+                "⏱ 时区：now 系列 = 发版机本地时间；要以服务器时间为准，远端（SSH）步骤里直接写 \
+                 $(date +%Y%m%d%H%M%S)——由远端 shell 求值。跨步骤一致性用 ${{ now }}，服务器侧实时值用 $(date …)。",
+            );
 
             ui.add_space(8.0);
             ui.separator();
@@ -786,46 +829,71 @@ pub fn show_var_help_window(ctx: &egui::Context, main: &mut MainState) {
             ui.monospace("${{ env.VERSION != '' }}        # 非空才执行本步；为空/未产出 → 跳过");
             ui.monospace("${{ variables.ENV }} == prod  # 等值比较（YAML 里可写 when: 等价别名）");
             ui.monospace("${{ variables.ENV }} != prod  # 不等比较；未定义变量按空串参与比较");
+            ui.monospace("variables.A == variables.B    # 两侧都可为取值表达式（支持 || 默认值）");
             ui.monospace("creates: node_modules         # 产物路径已存在 → 跳过本步（重跑秒过）");
             ui.weak("条件两侧支持 env. / variables. / targets.名.字段 / now / run.id；解析失败按真值执行并警告。");
+            ui.weak("creates 路径：本地步骤相对项目目录（支持 * ? 通配）；SSH 步骤为远端路径（相对 = work_root），远端用 test -e 判定。");
 
             ui.add_space(8.0);
             ui.separator();
             ui.add_space(4.0);
-            ui.strong("三、env 注入优先级（后者被前者覆盖）");
+            ui.strong("三、关键行为");
+            ui.weak("• 执行前一次性替换：不是运行时动态读。命令可预览、可日志、可审计。");
+            ui.weak("• 未解析的占位符原样保留：${{ variables.TYPO }} 拼错会原样出现在命令里，一眼可见（预览会 ⚠）。");
+            ui.weak("• 步骤间传递：前一步往 workspace/.env 追加 KEY=VALUE，或声明 outputs 正则捕获 stdout；后续步骤 ${{ env.KEY }} 引用。");
+            ui.weak("• 注意：本地命令已由引擎包 cmd /C 执行，直接写 echo VERSION=… 即可；手写 cmd /C 嵌套会引入引号残留。");
+
+            ui.add_space(8.0);
+            ui.separator();
+            ui.add_space(4.0);
+            ui.strong("四、env 注入优先级（后者被前者覆盖）");
             ui.monospace("步骤 env > 工具 env > target env > 系统环境变量");
             ui.weak("JAVA_HOME 这类注入只影响该步骤的子进程，不改系统设置；env.X 特指前序步骤产出，全局配置请走 variables.X。");
 
             ui.add_space(8.0);
             ui.separator();
             ui.add_space(4.0);
-            ui.strong("四、流程级开关（build.yaml）");
+            ui.strong("五、流程级开关（build.yaml）");
             ui.monospace("confirm: prod            # 确认门：运行前弹窗输入 prod 才放行");
             ui.monospace("preconditions:           # 前置检查：发版机本地断言，失败零秒退出（只放检查，别放拉代码/构建等动作）");
             ui.monospace("  - check: java -version");
             ui.monospace("    message: JDK 未安装");
-            ui.monospace("timeout: 600             # 作业级总超时（秒）；步骤级用 step.timeout");
+            ui.monospace("timeout: 600             # 流程级总超时（秒）；步骤级用 step.timeout");
+            ui.monospace("working_dir: sub/dir     # 项目级默认工作目录（相对项目目录）");
             ui.monospace("tools_require:           # 工具版本要求（project.yaml，mise 风格）");
-            ui.monospace("  java: \">=21\"           # 运行前校验，偏差零步失败；预览显示对比");
-            ui.weak("同项目运行互斥（GHA concurrency）：新运行自动取消旧运行，无需配置。");
+            ui.monospace("  java: \">=21\"           # >= > <= < 数字段比较；\"22\" 前缀匹配 22.x；\"22.1.3\" 精确");
+            ui.weak("运行期自动自检：引擎启动时对本次用到的工具逐个跑 version_check 现算版本，\n未配 version_check 的工具降级为检查 command 是否存在；失败零步失败 + 人话报错。\n同项目运行互斥（GHA concurrency）：新运行自动取消旧运行，无需配置。");
 
             ui.add_space(8.0);
             ui.separator();
             ui.add_space(4.0);
-            ui.strong("五、运行时变量与变更触发（handlers / outputs / wait）");
+            ui.strong("六、运行时变量与变更触发（outputs / notify / handlers / wait）");
             ui.monospace("outputs:                 # 步骤 stdout 按正则捕获 → ${{ env.键 }}");
-            ui.monospace("  VER: 'VERSION=(\\S+)'   # 有捕获组取组 1，无则取整行匹配");
+            ui.monospace("  VER: 'VERSION=(\\S+)'   # 有捕获组取组 1，无则取整行匹配；未匹配留空并告警");
             ui.monospace("notify: [重启服务]       # 本步骤真的执行/真传了新内容 → 登记通知");
             ui.monospace("handlers:                # 流程成功收尾后按定义顺序执行被通知到的");
             ui.monospace("  - name: 重启服务");
             ui.monospace("    command: systemctl restart app");
+            ui.weak("creates / when 跳过、上传 hash 未变更 → 不算变更，handler 不执行（Ansible handlers 语义）。");
             ui.monospace("wait: { mode: tcp, target: 1.2.3.4:8080 }");
-            ui.weak("wait 探测三模式：命令 / tcp 可连 / http 2xx（部署后验证可达，从发版机直连）。");
+            ui.weak("wait 探测三模式：命令 / tcp 可连 / http 2xx（部署后验证可达，从发版机直连）；interval_seconds 缺省 5。");
             ui.monospace("wait: { mode: command, target: 探测命令, fail_exit_code: 2 }");
             ui.weak(
                 "fail_exit_code：探测命令返回该退出码 = 任务已死，立即失败不再傻等\n\
                  （长任务配方：远端 nohup 起任务写 status 文件，探测读它，failed 以约定码退出）",
             );
+
+            ui.add_space(8.0);
+            ui.strong("七、组合示例（微服务发布的最小骨架）");
+            ui.monospace("# 1. 本地构建（creates 守卫：产物在就跳过）");
+            ui.monospace("mvn -B clean package -DskipTests     creates: target/*.jar");
+            ui.monospace("# 2. 上传（多 jar 多行映射；内容未变更自动跳过）");
+            ui.monospace("target/user.jar -> release/user.jar");
+            ui.monospace("target/order.jar -> release/order.jar    notify: [重启服务]");
+            ui.monospace("# 3. 远端重启（handler：只有真的传了新包才执行）");
+            ui.monospace("systemctl restart app && ${{ now.iso }} >> /opt/release.log");
+            ui.monospace("# 4. 等健康（wait tcp 从发版机探测，2 分钟总限）");
+            ui.monospace("wait: { mode: tcp, target: ${{ targets.prod.host }}:8080 }   timeout: 120");
 
             ui.add_space(8.0);
             ui.weak("完整说明见 docs/变量速查.md（设计文档 §6）。");
@@ -878,6 +946,10 @@ fn edit_step(
     let mut action = StepAction::None;
 
     status::step_frame(ui, state, dark).show(ui, |ui| {
+        // 运行中显式禁用整张卡片（#12 双保险：外层 ScrollArea 内容已 disable，
+        // 这里再按卡片显式包一层，任何布局调整都不会意外放开输入）
+        ui.add_enabled_ui(!running, |ui| {
+        let steps_len = job.steps.len();
         let step = &mut job.steps[si];
         ui.horizontal(|ui| {
             ui.checkbox(&mut step.enabled, "");
@@ -891,8 +963,62 @@ fn edit_step(
             );
 
             ui.separator();
+            let old_type = step.step_type;
+            let mut st_idx = step_type_index(&step.step_type);
+            egui::ComboBox::from_id_salt(format!("st_{si}"))
+                .selected_text(STEP_TYPES_SHORT[st_idx])
+                .width(90.0)
+                .show_ui(ui, |ui| {
+                    for (i, label) in STEP_TYPES.iter().enumerate() {
+                        ui.selectable_value(&mut st_idx, i, *label);
+                    }
+                });
+            step.step_type = step_type_from_index(st_idx);
+            // 类型切换后命令语义完全不同（exec 的 echo、upload 的映射互不通用），清空遗留内容
+            if step.step_type != old_type {
+                step.command.clear();
+            }
+
+            if ui.add_enabled(
+                !running,
+                egui::Button::new("▶ 从此").small(),
+            )
+            .on_hover_text("从该步骤开始执行到流程结束（之前的步骤跳过，其产出变量不可用）")
+            .clicked()
+            {
+                action = StepAction::RunFrom;
+            }
+            if ui.add_enabled(
+                !running,
+                egui::Button::new("▶ 仅此").small(),
+            )
+            .on_hover_text("只执行这一步（调试用）")
+            .clicked()
+            {
+                action = StepAction::RunOnly;
+            }
+            if ui.small_button("↑").on_hover_text("上移一位").clicked() && si > 0 {
+                action = StepAction::MoveUp;
+            }
+            if ui
+                .small_button("↓")
+                .on_hover_text("下移一位")
+                .clicked()
+                && si + 1 < steps_len
+            {
+                action = StepAction::MoveDown;
+            }
+            if ui.small_button("🗑").clicked() {
+                action = StepAction::Delete;
+            }
+        });
+
+        // ── 执行参数行：工具（env 注入 + PATH 前置选版本）| 超时 ──
+        // 从第一行拆出：第一行塞不下全部控件（自然宽 956px，见布局回归测试）
+        ui.horizontal(|ui| {
             ui.label("工具:");
             let tool_resp = egui::ComboBox::from_id_salt(format!("tool_{si}"))
+                .truncate()
                 .selected_text(if step.tool.is_empty() {
                     "（无）".to_string()
                 } else {
@@ -924,7 +1050,9 @@ fn edit_step(
                  1. 该工具的环境变量注入本步骤；\n\
                  2. 工具所在目录前置到 PATH——命令里写裸名（java / mvn / node…）时，\n\
                     用的就是这个工具的版本（多个 java 并存时靠它选版本）。\n\
-                 命令本身不变；具体解析路径见「👁 预览」或 🎯 目标管理 → 本机工具链"
+                 命令本身不变；具体解析路径见「👁 预览」或 🎯 目标管理 → 本机工具链。\n\
+                 作用边界：只影响发版机本机执行的步骤；SSH 远端步骤在远端 shell 执行，\n\
+                 不受本机工具表影响。运行期引擎会对用到的工具自动自检（version_check）"
                     .to_string();
                 if !step.tool.is_empty() {
                     match tool_menu.merged.get(&step.tool) {
@@ -940,8 +1068,8 @@ fn edit_step(
                             ));
                         }
                         None => hover.push_str(
-                            "\n\n⚠ 未映射：工具清单里没有这个名字；\
-                             可在 ⚙ 设置或「🔧 工具覆盖」中添加",
+                            "\n\n⚠ 未映射：工具清单里没有这个名字（运行自检会失败）；\
+                             可在 ⚙ 设置 → 🧰 工具管理 添加",
                         ),
                     }
                 }
@@ -950,31 +1078,22 @@ fn edit_step(
             // 未映射保留行内红标：需要用户处理的异常，不能只藏在悬停里
             if !step.tool.is_empty() && !tool_menu.merged.contains_key(&step.tool) {
                 ui.colored_label(Color32::from_rgb(220, 120, 90), "⚠未映射")
-                    .on_hover_text("工具清单里没有这个名字；可在 ⚙ 设置或「🔧 工具覆盖」中添加");
-            }
-
-            ui.separator();
-            let old_type = step.step_type;
-            let mut st_idx = step_type_index(&step.step_type);
-            egui::ComboBox::from_id_salt(format!("st_{si}"))
-                .selected_text(step_type_label(&step.step_type))
-                .width(150.0)
-                .show_ui(ui, |ui| {
-                    for (i, label) in STEP_TYPES.iter().enumerate() {
-                        ui.selectable_value(&mut st_idx, i, *label);
-                    }
-                });
-            step.step_type = step_type_from_index(st_idx);
-            // 类型切换后命令语义完全不同（exec 的 echo、upload 的映射互不通用），清空遗留内容
-            if step.step_type != old_type {
-                step.command.clear();
+                    .on_hover_text("工具清单里没有这个名字（运行自检会失败）；可在 ⚙ 设置 → 🧰 工具管理 添加");
             }
 
             ui.separator();
             match &mut step.timeout {
                 Some(v) => {
                     ui.label("超时:");
-                    ui.add(egui::DragValue::new(v).suffix("s").speed(1.0));
+                    // 定宽：DragValue 缺省按内容自适应，输入位数越多框越宽，
+                    // 会把右侧「从此 / 仅此 / ↑ / 🗑」推出卡片可视区
+                    ui.add(
+                        egui::DragValue::new(v)
+                            .suffix("s")
+                            .speed(1.0)
+                            .clip_text(true)
+                            .min_size(egui::vec2(64.0, 0.0)),
+                    );
                     if ui.small_button("×").clicked() {
                         step.timeout = None;
                     }
@@ -986,48 +1105,38 @@ fn edit_step(
                     }
                 }
             }
-
-            if ui.add_enabled(
-                !running,
-                egui::Button::new("▶ 从此").small(),
-            )
-            .on_hover_text("从该步骤开始执行到流程结束（之前的步骤跳过，其产出变量不可用）")
-            .clicked()
-            {
-                action = StepAction::RunFrom;
-            }
-            if ui.add_enabled(
-                !running,
-                egui::Button::new("▶ 仅此").small(),
-            )
-            .on_hover_text("只执行这一步（调试用）")
-            .clicked()
-            {
-                action = StepAction::RunOnly;
-            }
-            if ui.small_button("↑").clicked() && si > 0 {
-                action = StepAction::MoveUp;
-            }
-            if ui.small_button("🗑").clicked() {
-                action = StepAction::Delete;
-            }
         });
 
         ui.add_space(2.0);
-        if matches!(step.step_type, StepType::Upload) {
-            edit_upload_mappings(ui, step);
-        } else {
-            ui.add(
-                egui::TextEdit::multiline(&mut step.command)
-                    .desired_rows(2)
-                    .desired_width(f32::INFINITY)
-                    .font(egui::TextStyle::Monospace)
-                    .hint_text(match step.step_type {
-                        StepType::Pack => "目录或通配 -> 目标.zip [--exclude node_modules --exclude *.map]",
-                        StepType::Download => "远端路径 -> 本地路径（每行一条；本地相对项目目录）",
-                        _ => "命令，支持 ${{ variables.X }} / ${{ env.X }} / ${VAR}",
-                    }),
-            );
+        // upload / download / pack 都是「映射」语义（每行 `源 -> 目标`），统一用
+        // 结构化映射编辑器，不再让手写箭头文本；exec / wait 仍是自由命令
+        match step.step_type {
+            StepType::Upload => edit_mappings(
+                ui,
+                step,
+                "本地路径（相对项目目录）",
+                "远端路径（/ 开头绝对；相对 = work_root）",
+                "本地路径：相对项目目录或绝对路径；具体文件或目录（不支持通配）",
+                "远端路径：/ 开头为绝对路径；相对 = 目标的 work_root",
+            ),
+            StepType::Download => edit_mappings(
+                ui,
+                step,
+                "远端路径（相对 = work_root）",
+                "本地路径（相对项目目录）",
+                "远端路径：/ 开头为绝对路径；相对 = 目标的 work_root（方向与上传相反）",
+                "本地路径：相对项目目录或绝对路径；父目录自动创建，下载后 sha256 校验",
+            ),
+            StepType::Pack => edit_pack_mapping(ui, step),
+            _ => {
+                ui.add(
+                    egui::TextEdit::multiline(&mut step.command)
+                        .desired_rows(2)
+                        .desired_width(f32::INFINITY)
+                        .font(egui::TextStyle::Monospace)
+                        .hint_text("命令，支持 ${{ variables.X }} / ${{ env.X }} / ${VAR}"),
+                );
+            }
         }
 
         // wait 步骤探测模式（Compose healthcheck 同款：命令 / tcp / http）
@@ -1063,6 +1172,8 @@ fn edit_step(
                         ui.add(
                             egui::DragValue::new(&mut p.interval_seconds)
                                 .suffix("s")
+                                .clip_text(true)
+                                .min_size(egui::vec2(56.0, 0.0))
                                 .range(0..=120),
                         );
                         // 致命退出码（fire-and-poll 配方）：仅 command 模式有意义
@@ -1070,7 +1181,10 @@ fn edit_step(
                             let mut fatal = p.fail_exit_code.unwrap_or(0);
                             ui.label("失败码");
                             ui.add(
-                                egui::DragValue::new(&mut fatal).range(0..=255),
+                                egui::DragValue::new(&mut fatal)
+                                    .clip_text(true)
+                                    .min_size(egui::vec2(48.0, 0.0))
+                                    .range(0..=255),
                             )
                             .on_hover_text(
                                 "探测命令返回该退出码 = 任务已死，立即失败停止轮询\n\
@@ -1123,6 +1237,8 @@ fn edit_step(
             });
         }
 
+        // ── 步骤选项按主题分行（#11 布局回归）：单行塞全部选项在展开组合下
+        // 横向溢出；按「执行去向 / 可靠性 / 变更与条件」分行，每行自然宽 ≤620px
         ui.horizontal(|ui| {
             // 步骤级目标（§3.3）：覆盖流程默认——混合流程的关键
             ui.label("目标:");
@@ -1131,6 +1247,7 @@ fn edit_step(
                 None => format!("跟随流程（{job_target_display}）"),
             };
             egui::ComboBox::from_id_salt(format!("steptarget_{si}"))
+                .truncate()
                 .selected_text(sel_text)
                 .width(150.0)
                 .show_ui(ui, |ui| {
@@ -1152,12 +1269,16 @@ fn edit_step(
                     ui.add(
                         egui::DragValue::new(&mut r.max_attempts)
                             .suffix("次")
+                            .clip_text(true)
+                            .min_size(egui::vec2(52.0, 0.0))
                             .range(1..=10),
                     );
                     ui.label("间隔");
                     ui.add(
                         egui::DragValue::new(&mut r.backoff_seconds)
                             .suffix("s")
+                            .clip_text(true)
+                            .min_size(egui::vec2(56.0, 0.0))
                             .range(0..=300),
                     );
                     if ui.small_button("×").clicked() {
@@ -1178,6 +1299,8 @@ fn edit_step(
                     }
                 }
             }
+        });
+        ui.horizontal(|ui| {
             // creates 状态守卫（Ansible creates）：产物已存在 → 跳过本步
             match &mut step.creates {
                 Some(c) => {
@@ -1207,6 +1330,8 @@ fn edit_step(
                     }
                 }
             }
+        });
+        ui.horizontal(|ui| {
             // notify（Ansible handlers）：本步骤实际产生变更时，通知对应 handler 收尾执行
             if step.notify.is_empty() {
                 if ui
@@ -1261,18 +1386,19 @@ fn edit_step(
                 step.condition = Some("${{ env.VERSION != '' }}".to_string());
             }
         });
+        }); // add_enabled_ui（运行中禁用整张卡片）
     });
 
     action
 }
 
 // ---------------------------------------------------------------------------
-// upload 映射的结构化编辑：from/to 输入框 + 加/减行。
-// 落盘仍是引擎 parse_upload_mappings 的行格式（每行 `<本地> -> <远端>`），
-// 旧 YAML / 手写配置零迁移。
+// 映射的结构化编辑（upload / download 共用）：from/to 输入框 + 加/减行。
+// 落盘仍是引擎 parse_upload_mappings 的行格式（每行 `<源> -> <目标>`，
+// download 方向相反），旧 YAML / 手写配置零迁移。
 // ---------------------------------------------------------------------------
 
-/// upload 命令 → 编辑行。与引擎同一格式：按行 split 首个 "->" 并 trim；
+/// upload/download 命令 → 编辑行。与引擎同一格式：按行 split 首个 "->" 并 trim；
 /// 没有 "->" 的行放进 from 槽等待补全；空命令给一行空行起步。
 fn upload_rows(command: &str) -> Vec<(String, String)> {
     let mut rows = Vec::new();
@@ -1292,7 +1418,7 @@ fn upload_rows(command: &str) -> Vec<(String, String)> {
     rows
 }
 
-/// 编辑行 → upload 命令。空行序列化为 "->" 占位：能原样解析回空行（否则
+/// 编辑行 → 命令。空行序列化为 "->" 占位：能原样解析回空行（否则
 /// "＋ 添加映射" 的空行会在写回时被过滤掉、看起来没反应），引擎把空映射当空行跳过。
 fn upload_command(rows: &[(String, String)]) -> String {
     rows.iter()
@@ -1301,7 +1427,16 @@ fn upload_command(rows: &[(String, String)]) -> String {
         .join("\n")
 }
 
-fn edit_upload_mappings(ui: &mut egui::Ui, step: &mut Step) {
+/// 提示文案分离：输入框内只放短提示（长提示会被截断且没有地方看全），
+/// 完整说明放悬停（on_hover_text）
+fn edit_mappings(
+    ui: &mut egui::Ui,
+    step: &mut Step,
+    from_hint: &str,
+    to_hint: &str,
+    from_hover: &str,
+    to_hover: &str,
+) {
     let mut rows = upload_rows(&step.command);
 
     let mut del: Option<usize> = None;
@@ -1318,15 +1453,17 @@ fn edit_upload_mappings(ui: &mut egui::Ui, step: &mut Step) {
             ui.add(
                 egui::TextEdit::singleline(l)
                     .desired_width(from_w)
-                    .hint_text("本地路径：相对项目目录或绝对路径；具体文件或目录（不支持通配）"),
-            );
+                    .hint_text(from_hint),
+            )
+            .on_hover_text(from_hover);
             ui.label("→");
             // to 框吃掉剩余全部宽度：行总宽与 exec 文本框一致，切换类型卡片不跳宽
             ui.add(
                 egui::TextEdit::singleline(r)
                     .desired_width(ui.available_width())
-                    .hint_text("远端路径：/ 开头为绝对路径；相对 = 目标的 work_root"),
-            );
+                    .hint_text(to_hint),
+            )
+            .on_hover_text(to_hover);
         });
     }
     if let Some(ri) = del {
@@ -1334,7 +1471,7 @@ fn edit_upload_mappings(ui: &mut egui::Ui, step: &mut Step) {
     }
     if ui
         .small_button("＋ 添加映射")
-        .on_hover_text("再添加一条 本地 → 远端 映射（微服务多 jar 场景）")
+        .on_hover_text("再添加一条 源 → 目标 映射（微服务多 jar 场景）")
         .clicked()
     {
         rows.push((String::new(), String::new()));
@@ -1342,9 +1479,216 @@ fn edit_upload_mappings(ui: &mut egui::Ui, step: &mut Step) {
     step.command = upload_command(&rows);
 }
 
+/// pack 步骤的结构化编辑：单条映射（源目录/通配 → 目标 .zip/.tar.gz）+ 排除模式。
+/// 落盘仍是引擎 pack_step 的格式 `<源> -> <目标> [--exclude 模式]…`。
+fn edit_pack_mapping(ui: &mut egui::Ui, step: &mut Step) {
+    // 解析：首个 "->" 分出源/其余；其余再按 "--exclude" 切出目标与排除模式
+    let (mut src, mut dst, mut excludes): (String, String, Vec<String>) =
+        match step.command.split_once("->") {
+            Some((l, rest)) => {
+                let mut parts = rest.split("--exclude");
+                let dst = parts.next().unwrap_or("").trim().to_string();
+                let excludes = parts
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect();
+                (l.trim().to_string(), dst, excludes)
+            }
+            None => (step.command.trim().to_string(), String::new(), Vec::new()),
+        };
+
+    ui.horizontal(|ui| {
+        let from_w = ((ui.available_width() - 150.0) * 0.5).max(140.0);
+        ui.add(
+            egui::TextEdit::singleline(&mut src)
+                .desired_width(from_w)
+                .hint_text("源：目录或通配"),
+        )
+        .on_hover_text(
+            "打包源：目录或通配（相对项目目录，绝对路径原样）。\n\
+             源以 /. 结尾 = tar -C 语义：包内条目不带目录根",
+        );
+        ui.label("→");
+        ui.add(
+            egui::TextEdit::singleline(&mut dst)
+                .desired_width(ui.available_width())
+                .hint_text("目标：xxx.zip / xxx.tar.gz（扩展名决定格式）"),
+        )
+        .on_hover_text(
+            "打包目标：.zip / .tar.gz / .tgz（扩展名决定格式；tar 保留可执行权限）。\n\
+             相对项目目录，支持 ${{ now.date }} 等变量",
+        );
+    });
+    ui.horizontal(|ui| {
+        ui.label("排除:");
+        let mut buf = excludes.join(" ");
+        let resp = ui
+            .add(
+                egui::TextEdit::singleline(&mut buf)
+                    .desired_width(ui.available_width())
+                    .hint_text("--exclude 模式，空格分隔；字面量 = 目录分量，* ? 通配"),
+            )
+            .on_hover_text(
+                "rsync --exclude 语义：node_modules 整棵剪枝；*.map 按文件名通配。\n\
+                 例：node_modules *.map",
+            );
+        if resp.changed() {
+            excludes = buf.split_whitespace().map(str::to_string).collect();
+        }
+    });
+    let tail = excludes
+        .iter()
+        .map(|p| format!(" --exclude {p}"))
+        .collect::<String>();
+    // 全空时不写 "->" 占位：保持空命令（pack 空命令在引擎侧有明确报错文案）
+    step.command = if src.trim().is_empty() && dst.trim().is_empty() && tail.is_empty() {
+        String::new()
+    } else {
+        format!("{} -> {}{}", src.trim(), dst.trim(), tail).trim().to_string()
+    };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── 布局稳定性回归（「每个选项都输入一下，布局不能变」的自动化版本）─────
+    // 同一组开关下，把每个输入都换成病态值（超长文本 / 5 位数超时 / 最大枚举），
+    // 卡片总宽必须与默认值一致：任何随输入变宽的控件（DragValue 自适应、
+    // ComboBox 选中文本 Extend、heading 不截断……）都会破坏这个等式。
+    // 新增步骤选项时：把它的病态值加进病态分支，测试不过 = 布局会漂移。
+
+    fn card_width(job: &mut Job, si: usize) -> f32 {
+        let tool_menu = ToolMenu {
+            project: vec!["java".to_string()],
+            global: Vec::new(),
+            merged: std::collections::HashMap::new(),
+        };
+        let target_names = vec![
+            "prod".to_string(),
+            "很长的目标名称用来测试下拉框文本截断".to_string(),
+        ];
+        let panel_w = 720.0;
+        let mut width = 0.0f32;
+        let ctx = egui::Context::default();
+        ctx.set_pixels_per_point(1.0);
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(2400.0, 4000.0),
+            )),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(raw, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.allocate_ui(egui::vec2(panel_w, 3000.0), |ui| {
+                    let _ = edit_step(
+                        ui,
+                        job,
+                        si,
+                        &tool_menu,
+                        false,
+                        &target_names,
+                        "无",
+                        StepVisualState::Idle,
+                        true,
+                        None,
+                    );
+                    width = ui.min_rect().width();
+                });
+            });
+        });
+        // 测试上下文不做真实渲染，字型图集增量直接丢弃（egui 要求显式处理）
+        out.textures_delta.clear();
+        width
+    }
+
+    /// 所有可选开关都打开、值为默认长短的基准步骤
+    fn optioned_job() -> Job {
+        Job {
+            steps: vec![Step {
+                name: Some("步骤A".into()),
+                tool: "java".into(),
+                command: "echo hi".into(),
+                step_type: StepType::Exec,
+                enabled: true,
+                timeout: Some(300),
+                retry: Some(crate::models::RetryConfig {
+                    max_attempts: 3,
+                    backoff_seconds: 5,
+                }),
+                creates: Some("a.jar".into()),
+                notify: vec!["通知".into()],
+                condition: Some("${{ env.V != '' }}".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn step_card_layout_stable_under_input() {
+        let mut def = optioned_job();
+        let w_def = card_width(&mut def, 0);
+
+        let mut patho = optioned_job();
+        {
+            let st = &mut patho.steps[0];
+            st.name = Some("一个特别特别特别长的步骤名称用来验证布局稳定性".into());
+            st.tool = "一个名字特别特别长的工具名称映射".into();
+            st.timeout = Some(99999);
+            st.retry = Some(crate::models::RetryConfig {
+                max_attempts: 10,
+                backoff_seconds: 600,
+            });
+            st.creates = Some("target/very/long/path/to/artifacts/*.jar".into());
+            st.notify = vec!["一个很长的handler通知名字".into()];
+            st.condition =
+                Some("${{ variables.A_VERY_LONG_VARIABLE_NAME }} == 一个很长的比较值".into());
+            st.target = Some("很长的目标名称用来测试下拉框文本截断".into());
+        }
+        let w_patho = card_width(&mut patho, 0);
+
+        assert!(
+            w_def <= 722.0,
+            "默认布局已超出 720 面板（有行溢出，需收紧定宽或拆行）: {w_def}"
+        );
+        assert!(
+            w_patho <= w_def + 2.0,
+            "病态输入使卡片变宽（布局漂移）: {w_def} -> {w_patho}"
+        );
+    }
+
+    #[test]
+    fn wait_probe_row_layout_stable_under_input() {
+        let mut def = optioned_job();
+        def.steps[0].step_type = StepType::Wait;
+        def.steps[0].wait = Some(crate::models::WaitProbe {
+            mode: crate::models::WaitMode::Command,
+            target: "1.2.3.4:8080".into(),
+            interval_seconds: 5,
+            fail_exit_code: Some(2),
+        });
+        let w_def = card_width(&mut def, 0);
+
+        let mut patho = optioned_job();
+        patho.steps[0].step_type = StepType::Wait;
+        patho.steps[0].wait = Some(crate::models::WaitProbe {
+            mode: crate::models::WaitMode::Command,
+            target: "一个特别特别特别长的探测目标地址用来验证布局稳定性:8080".into(),
+            interval_seconds: 120,
+            fail_exit_code: Some(255),
+        });
+        patho.steps[0].target = Some("很长的目标名称用来测试下拉框文本截断".into());
+        let w_patho = card_width(&mut patho, 0);
+
+        assert!(w_def <= 722.0, "默认 wait 布局超出 720 面板: {w_def}");
+        assert!(
+            w_patho <= w_def + 2.0,
+            "病态输入使 wait 行变宽: {w_def} -> {w_patho}"
+        );
+    }
 
     #[test]
     fn upload_mappings_roundtrip() {

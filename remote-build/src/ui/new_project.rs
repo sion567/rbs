@@ -247,9 +247,9 @@ fn git_form(ui: &mut egui::Ui, main: &mut MainState) {
                         .desired_width(crate::ui::input::LONG),
                 );
                 if ui.small_button("📂").clicked() {
-                    if let Some(dir) = rfd::FileDialog::new()
-                        .set_title("选择克隆目标目录（应为空目录）")
-                        .pick_folder()
+                    // 起点 = 输入框当前路径（所有浏览按钮统一约定）
+                    if let Some(dir) =
+                        crate::ui::pick_folder(&main.new_project.git_target, "选择克隆目标目录（应为空目录）")
                     {
                         main.new_project.git_target = dir.to_string_lossy().to_string();
                     }
@@ -273,8 +273,9 @@ fn local_form(ui: &mut egui::Ui, main: &mut MainState) {
                         .hint_text("D:\\workspace\\my-project"),
                 );
                 if ui.button("📂 浏览…").clicked() {
+                    // 起点 = 输入框当前路径（所有浏览按钮统一约定）
                     if let Some(dir) =
-                        rfd::FileDialog::new().set_title("选择项目本地目录").pick_folder()
+                        crate::ui::pick_folder(&main.new_project.local_dir, "选择项目本地目录")
                     {
                         main.new_project.local_dir = dir.to_string_lossy().to_string();
                         // 目录末节直接作为项目名（覆盖旧值）

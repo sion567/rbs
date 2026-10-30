@@ -27,12 +27,17 @@ enum TreeDrag {
     Job(String),
 }
 
-/// 右键菜单的改名目标（分组用名字定位：列表里的名字在 reload 后仍稳定）
+/// 右键菜单的改名目标（分组用名字定位：列表里的名字在 reload 后仍稳定）。
+/// GroupNew = 添加分组流程（占位名已写入 groups 列表，弹窗给它起名）——
+/// 与「改名」区分开：标题 / 按钮文案 / 成功提示都不同（此前添加分组弹的窗口
+/// 标题就是「改名」，用户以为点错了菜单）
 #[derive(Debug, Clone, PartialEq)]
 pub enum TreeRenameTarget {
     Project(usize),
     Job(usize, usize),
     Group(usize, String),
+    /// (项目下标, 占位组名)：占位组已在 project.yaml groups 列表里，弹窗确认后改成正式名
+    GroupNew(usize, String),
 }
 
 pub fn show(main: &mut MainState, ui: &mut egui::Ui) {
@@ -65,9 +70,14 @@ pub fn show(main: &mut MainState, ui: &mut egui::Ui) {
     egui::ScrollArea::vertical().show(ui, |ui| {
         for pi in 0..main.projects.len() {
             // 预取需要的不可变数据并立刻结束借用：右键菜单闭包要 &mut main
-            let (header, error_msgs) = {
+            let (header, error_msgs, hover) = {
                 let entry = &main.projects[pi];
-                let issues = crate::config::validate_project(&entry.project);
+                // 校验结果读缓存：每帧 stat 目录 + .git 在网络盘/死路径上会卡住整个 UI
+                let issues = main
+                    .validation
+                    .get(&entry.project.name)
+                    .cloned()
+                    .unwrap_or_default();
                 let msgs: Vec<String> = issues
                     .iter()
                     .filter_map(|i| match i {
@@ -77,9 +87,27 @@ pub fn show(main: &mut MainState, ui: &mut egui::Ui) {
                         _ => None,
                     })
                     .collect();
+                // Git 仓库 / 本地目录模式的项目头标记（⎇ = git 仓库），
+                // 悬停显示代码目录与配置目录——两套目录分离时一眼可辨
+                let is_git = !entry.project.local_path.trim().is_empty()
+                    && std::path::Path::new(&entry.project.local_path).join(".git").exists();
+                let name_shown = crate::ui::truncate_label(&entry.project.name, 14);
+                let badge = if is_git { " ⎇" } else { "" };
+                let hover = format!(
+                    "{}{}\n配置目录：{}\n代码目录：{}",
+                    if is_git { "⎇ Git 仓库" } else { "本地目录" },
+                    if entry.project.local_path.trim().is_empty() {
+                        "（未配置代码目录）".to_string()
+                    } else {
+                        String::new()
+                    },
+                    entry.dir.display(),
+                    entry.project.local_path.trim(),
+                );
                 (
-                    format!("📁 {}{}", entry.project.name, if !msgs.is_empty() { " ⚠" } else { "" }),
+                    format!("📁 {name_shown}{badge}{}", if !msgs.is_empty() { " ⚠" } else { "" }),
                     msgs,
+                    hover,
                 )
             };
             let body = egui::CollapsingHeader::new(header)
@@ -100,29 +128,38 @@ pub fn show(main: &mut MainState, ui: &mut egui::Ui) {
                         v
                     };
 
-                    for gname in &group_names {
-                        let member_idx: Vec<usize> = main.projects[pi]
-                            .jobs
-                            .iter()
-                            .enumerate()
-                            .filter(|(_, je)| je.job.group.as_deref() == Some(gname.as_str()))
-                            .map(|(i, _)| i)
-                            .collect();
-                        let group_body = egui::CollapsingHeader::new(format!(
-                            "📂 {}{}",
-                            gname,
-                            if member_idx.is_empty() { String::new() } else { format!("（{}）", member_idx.len()) }
-                        ))
-                        .default_open(true)
-                        .show(ui, |ui| {
-                            for &ji in &member_idx {
-                                job_row(main, ui, pi, ji, Some(gname));
+                        for gname in &group_names {
+                            let member_idx: Vec<usize> = main.projects[pi]
+                                .jobs
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, je)| je.job.group.as_deref() == Some(gname.as_str()))
+                                .map(|(i, _)| i)
+                                .collect();
+                            // 长分组名截断显示（悬停看全名）：名字太长会把折叠头撑宽、
+                            // 左栏随之变宽，右侧编辑器的可视宽度被挤坏
+                            let shown_gname = crate::ui::truncate_label(gname, 14);
+                            let group_body = egui::CollapsingHeader::new(format!(
+                                "📂 {}{}",
+                                shown_gname,
+                                if member_idx.is_empty() { String::new() } else { format!("（{}）", member_idx.len()) }
+                            ))
+                            .default_open(true)
+                            .show(ui, |ui| {
+                                for &ji in &member_idx {
+                                    job_row(main, ui, pi, ji, Some(gname));
+                                }
+                                if member_idx.is_empty() {
+                                    ui.weak("（空分组：右键 → ＋ 新建流程）");
+                                }
+                            });
+                            if shown_gname != *gname {
+                                group_body
+                                    .header_response
+                                    .clone()
+                                    .on_hover_text(format!("分组：{gname}"));
                             }
-                            if member_idx.is_empty() {
-                                ui.weak("（空分组：右键 → ＋ 添加任务）");
-                            }
-                        });
-                        // 分组右键：组运行（第五批）/ 添加任务 / 删除
+                        // 分组右键：组运行 / 新建流程 / 改名 / 删除
                         group_body.header_response.context_menu(|ui| {
                             // ▶ 运行组：组内流程按树中顺序串行，任一失败即停
                             if ui
@@ -173,13 +210,18 @@ pub fn show(main: &mut MainState, ui: &mut egui::Ui) {
                             }
                             ui.separator();
                             if ui
-                                .add_enabled(!main.run_active(), egui::Button::new("＋ 添加任务"))
+                                .add_enabled(!main.run_active(), egui::Button::new("＋ 新建流程"))
                                 .on_hover_text("在本分组下新建流程（可复制当前流程步骤）")
                                 .clicked()
                             {
                                 main.selected_project = Some(pi);
                                 main.new_job.open = true;
                                 main.new_job.preset_group = Some(gname.clone());
+                                ui.close();
+                            }
+                            if ui.button("✏ 改名").clicked() {
+                                main.tree_rename_buf = gname.clone();
+                                main.tree_rename = Some(TreeRenameTarget::Group(pi, gname.clone()));
                                 ui.close();
                             }
                             if ui.button("🗑 删除分组").clicked() {
@@ -209,6 +251,8 @@ pub fn show(main: &mut MainState, ui: &mut egui::Ui) {
                     }
                 });
 
+            // 项目头悬停：git 仓库 / 本地目录 + 代码目录与配置目录（#23 提示）
+            body.header_response.clone().on_hover_text(&hover);
             // 折叠头下方显示阻断性错误（§9.4 目录不存在提示）
             if body.body_response.is_some() || !error_msgs.is_empty() {
                 for message in &error_msgs {
@@ -270,9 +314,14 @@ fn job_row(main: &mut MainState, ui: &mut egui::Ui, pi: usize, ji: usize, layer:
         )
     };
     // 📄 强调"一个流程一个 yaml 文件"，与运行按钮的 ▶ 区分开；
-    // 运行中的作业在名字后面带状态圆点（蓝闪/黄闪/绿/红，见 ui::status）
+    // 运行中的作业在名字后面带状态圆点（蓝闪/黄闪/绿/红，见 ui::status）。
+    // 长流程名截断显示（悬停看全名），防止左栏被撑宽挤坏右侧布局
+    let shown = crate::ui::truncate_label(&label, 16);
     let inner = ui.horizontal(|ui| {
-        let r = ui.selectable_label(selected, format!("📄 {label}"));
+        let mut r = ui.selectable_label(selected, format!("📄 {shown}"));
+        if shown != label {
+            r = r.on_hover_text(&label);
+        }
         if let Some(st) = dot_state {
             let dark = !matches!(main.global.theme, crate::models::Theme::Light);
             ui.label(crate::ui::status::status_dot(ui, st, dark))
@@ -467,16 +516,24 @@ fn rename_window(ctx: &egui::Context, main: &mut MainState) {
     let Some(target) = main.tree_rename.clone() else { return; };
     crate::ui::modal_backdrop(ctx, "mask_tree_rename");
 
+    // 添加分组与改名共用输入弹窗，但标题 / 按钮 / 提示按语义区分
+    let is_add_group = matches!(target, TreeRenameTarget::GroupNew(..));
+    let (title, label, confirm_label) = if is_add_group {
+        ("✏ 添加分组", "分组名:", "添加")
+    } else {
+        ("✏ 改名", "新名称:", "确定")
+    };
+
     let mut open = true;
     let mut do_rename = false;
-    crate::ui::centered_window(egui::Window::new("✏ 改名"), ctx)
+    crate::ui::centered_window(egui::Window::new(title), ctx)
         .open(&mut open)
         .order(egui::Order::Foreground)
         .collapsible(false)
         .resizable(false)
         .default_width(420.0)
         .show(ctx, |ui| {
-            ui.label("新名称:");
+            ui.label(label);
             let resp = ui.add(
                 egui::TextEdit::singleline(&mut main.tree_rename_buf)
                     .desired_width(320.0)
@@ -485,12 +542,15 @@ fn rename_window(ctx: &egui::Context, main: &mut MainState) {
             if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                 do_rename = true;
             }
+            if is_add_group {
+                ui.weak("Enter 或「添加」确认；取消则保留默认名（空分组会持久存在，之后可右键改名）");
+            }
             ui.add_space(10.0);
             ui.horizontal(|ui| {
                 if ui.button("取消").clicked() {
                     main.tree_rename = None;
                 }
-                if ui.button("确定").clicked() {
+                if ui.button(confirm_label).clicked() {
                     do_rename = true;
                 }
             });
@@ -500,7 +560,10 @@ fn rename_window(ctx: &egui::Context, main: &mut MainState) {
         match target {
             TreeRenameTarget::Project(pi) => rename_project(main, pi, &buf),
             TreeRenameTarget::Job(pi, ji) => rename_job(main, pi, ji, &buf),
-            TreeRenameTarget::Group(pi, old) => rename_group(main, pi, &old, &buf),
+            TreeRenameTarget::Group(pi, old) => rename_group(main, pi, &old, &buf, false),
+            TreeRenameTarget::GroupNew(pi, placeholder) => {
+                rename_group(main, pi, &placeholder, &buf, true)
+            }
         }
         main.tree_rename = None;
     }
@@ -516,7 +579,7 @@ fn rename_window(ctx: &egui::Context, main: &mut MainState) {
 /// 运行中禁止改动磁盘上的项目/流程文件（引擎正按路径读写）
 fn busy_guard(main: &mut MainState) -> bool {
     if main.run_active() {
-        main.status_msg = Some("⚠ 有作业运行中，先 ⏹ Stop 再执行此操作".to_string());
+        main.status_msg = Some("⚠ 有流程运行中，先停止再执行此操作".to_string());
         true
     } else {
         false
@@ -767,7 +830,8 @@ fn reselect_job(main: &mut MainState, project_name: &str, job_name: &str) {
     }
 }
 
-/// 添加分组：写入 project.yaml 的 groups 列表并直接进入改名弹窗（空分组持久存在）
+/// 添加分组：写入 project.yaml 的 groups 列表（占位名，空分组持久存在），
+/// 随即弹出「添加分组」命名弹窗（与改名的窗口文案区分开）
 fn add_group(main: &mut MainState, pi: usize) {
     if busy_guard(main) {
         return;
@@ -789,12 +853,13 @@ fn add_group(main: &mut MainState, pi: usize) {
     }
     main.reload();
     main.tree_rename_buf = name.clone();
-    main.tree_rename = Some(TreeRenameTarget::Group(pi, name));
-    main.status_msg = Some("分组已添加（可立即改名，Enter 确认）".to_string());
+    main.tree_rename = Some(TreeRenameTarget::GroupNew(pi, name));
+    main.status_msg = Some("分组已创建，请输入名称后确认（Enter / 「添加」）".to_string());
 }
 
-/// 分组改名：改 groups 列表 + 同步引用该组的全部流程 yaml
-fn rename_group(main: &mut MainState, pi: usize, old: &str, new_name: &str) {
+/// 分组改名：改 groups 列表 + 同步引用该组的全部流程 yaml。
+/// is_add = 添加分组的命名确认（成功文案按"添加"而非"改名"）
+fn rename_group(main: &mut MainState, pi: usize, old: &str, new_name: &str, is_add: bool) {
     if busy_guard(main) {
         return;
     }
@@ -826,7 +891,11 @@ fn rename_group(main: &mut MainState, pi: usize, old: &str, new_name: &str) {
     }
     let (dir, project) = (entry.dir.clone(), entry.project.clone());
     if let Err(e) = crate::storage::files::save_yaml(&dir.join("project.yaml"), &project) {
-        main.status_msg = Some(format!("改名失败（project.yaml）: {e}"));
+        main.status_msg = Some(if is_add {
+            format!("添加分组失败（project.yaml）: {e}")
+        } else {
+            format!("改名失败（project.yaml）: {e}")
+        });
         return;
     }
     for (path, job) in job_updates {
@@ -836,7 +905,11 @@ fn rename_group(main: &mut MainState, pi: usize, old: &str, new_name: &str) {
         }
     }
     main.reload();
-    main.status_msg = Some(format!("分组已改名: {old} → {new_name} ✅"));
+    main.status_msg = Some(if is_add {
+        format!("分组「{new_name}」已添加 ✅")
+    } else {
+        format!("分组已改名: {old} → {new_name} ✅")
+    });
 }
 
 /// 流程移动分组：改 job.group 落盘；目标组不在 groups 列表则顺手登记（空组语义成立）

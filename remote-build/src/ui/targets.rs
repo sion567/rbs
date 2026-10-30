@@ -9,7 +9,10 @@ use crate::models::{AuthMethod, Target, TargetType, TransportKind};
 use eframe::egui;
 use egui::Color32;
 
-const KINDS: [&str; 3] = ["SSH（远端 Linux）", "Kubernetes（本地 kubectl）", "本地"];
+/// 可创建的目标类型：local（本机）是每个项目自带的固定目标，不在此列——
+/// 此前把「本地」放进类型下拉，选了 TargetType::Local 后表单整个切成本机面板、
+/// 没有类型下拉可切回，等于把目标改废（#7）
+const KINDS: [&str; 2] = ["SSH（远端 Linux）", "Kubernetes（远端集群，经本机 kubectl + kubeconfig）"];
 const AUTHS: [&str; 4] = ["key（私钥文件）", "password（密码）", "agent（pageant）", "none"];
 /// SSH 传输实现（v0.5 §5.2 换防）
 const TRANSPORTS: [&str; 2] = ["russh（内置，默认）", "putty（PuTTY 套件兜底）"];
@@ -148,15 +151,34 @@ pub fn show(ctx: &egui::Context, main: &mut MainState) {
         .default_width(720.0)
         .default_height(560.0)
         .show(ctx, |ui| {
-            ui.heading("执行目标（随项目走）");
+            // 标题带出当前项目（目标随项目走，不同项目的同名目标可以是不同机器）
+            let project_label = main
+                .selected_project
+                .and_then(|pi| main.projects.get(pi))
+                .map(|p| p.project.name.clone())
+                .unwrap_or_default();
+            // 长项目名截断 + 悬停看全：标题不截断会把窗口撑宽
+            if project_label.is_empty() {
+                ui.heading("执行目标");
+            } else {
+                let shown = crate::ui::truncate_label(&project_label, 20);
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(format!("执行目标（当前项目：{shown}）")).heading(),
+                    )
+                    .truncate(),
+                )
+                .on_hover_text(&project_label);
+            }
             ui.colored_label(
                 Color32::from_rgb(230, 180, 80),
                 "⚠ 本窗口编辑的是内存副本：如果你手动修改过 project.yaml，\
                  请先点工具栏 ⟳ 重新加载再打开本窗口，否则「保存」会用旧内容覆盖你的手改。",
             );
             ui.weak(
-                "目标 = 命令在哪台机器执行：SSH（远端 Linux）、Kubernetes（本地 kubectl + kubeconfig）\
-                 或本地。定义保存在**当前项目**的 project.yaml 里——不同项目的 prod 可以是不同服务器；\
+                "目标 = 命令在哪台机器执行：SSH（远端 Linux）、Kubernetes（kubectl 在发版机本机运行，\
+                 经 kubeconfig 连接远端集群）或 local（本机，每个项目自带、固定存在不可删）。\
+                 定义保存在**当前项目**的 project.yaml 里——不同项目的 prod 可以是不同服务器；\
                  流程的「目标」下拉读取本项目这份配置。",
             );
             ui.add_space(4.0);
@@ -188,31 +210,45 @@ fn target_list_and_form(ui: &mut egui::Ui, main: &mut MainState) {
     // local（本机）固定排第一，其余按名称排
     names.sort_by_key(|n| (n != "local", n.clone()));
 
-    ui.columns(2, |columns| {
-        columns[0].set_min_width(170.0);
-        egui::ScrollArea::vertical()
-            .id_salt("target_list")
-            .max_height(280.0)
-            .show(&mut columns[0], |ui| {
-                for name in &names {
-                    let sel = main.target_editor.selected.as_deref() == Some(name.as_str());
-                    if ui.selectable_label(sel, name).clicked() {
-                        main.target_editor.selected = Some(name.clone());
-                        load_buffers(main, name);
-                        main.target_editor.test_result = None;
+    // 2:8 布局：左边只是目标名清单，1:1 均分浪费一半宽度、右边表单内容挤不下；
+    // ui.columns 只会均分，这里手动分配（左侧 20%，最窄 150px 保证列表可读）
+    let total = ui.available_width();
+    let spacing = ui.spacing().item_spacing.x;
+    let left_w = ((total - spacing) * 0.2).clamp(150.0, 220.0);
+    let right_w = (total - spacing - left_w).max(200.0);
+    ui.horizontal(|ui| {
+        ui.allocate_ui(egui::vec2(left_w, 280.0), |ui| {
+            egui::ScrollArea::vertical()
+                .id_salt("target_list")
+                .max_height(280.0)
+                .show(ui, |ui| {
+                    for name in &names {
+                        let sel = main.target_editor.selected.as_deref() == Some(name.as_str());
+                        // 目标名截断 + 悬停看全：超长名字会把列表列撑宽、把右侧表单顶出窗口
+                        let shown = crate::ui::truncate_label(name, 14);
+                        let resp = ui.selectable_label(sel, shown.clone());
+                        if resp.clicked() {
+                            main.target_editor.selected = Some(name.clone());
+                            load_buffers(main, name);
+                            main.target_editor.test_result = None;
+                        }
+                        if shown != *name {
+                            resp.on_hover_text(name);
+                        }
                     }
-                }
-                if names.is_empty() {
-                    ui.weak("（空，点下方「＋ 添加」）");
-                }
-            });
-
-        egui::ScrollArea::vertical()
-            .id_salt("target_form")
-            .max_height(280.0)
-            .show(&mut columns[1], |ui| {
-                edit_form(ui, main);
-            });
+                    if names.is_empty() {
+                        ui.weak("（空，点下方「＋ 添加」）");
+                    }
+                });
+        });
+        ui.allocate_ui(egui::vec2(right_w, 280.0), |ui| {
+            egui::ScrollArea::vertical()
+                .id_salt("target_form")
+                .max_height(280.0)
+                .show(ui, |ui| {
+                    edit_form(ui, main);
+                });
+        });
     });
 
     ui.add_space(6.0);
@@ -283,12 +319,24 @@ fn target_list_and_form(ui: &mut egui::Ui, main: &mut MainState) {
             }
         }
         let testing = main.target_editor.test_rx.is_some();
+        // 连接测试只有 SSH 目标有意义：非 SSH 直接 disabled（此前点击会弹错误文案，
+        // 用户不知道按钮为什么在那里）
+        let selected_is_ssh = main
+            .target_editor
+            .selected
+            .as_deref()
+            .and_then(|n| scope_map_ref(main).and_then(|m| m.get(n)))
+            .map(|t| matches!(t.target_type, TargetType::Ssh { .. }))
+            .unwrap_or(false);
+        let test_tip = if selected_is_ssh {
+            "SSH 连接测试 + 服务器体检：CPU / 内存 / 磁盘 / 负载（8 秒超时）。\n\
+             直接用当前表单值测试（无需先保存）；密码栏已输入未保存的密码也会参与本次测试"
+        } else {
+            "仅 SSH 目标支持连接测试（Kubernetes / 本地目标没有可测的 SSH 连接）"
+        };
         if ui
-            .add_enabled(!testing, egui::Button::new("🔌 测试连接"))
-            .on_hover_text(
-                "SSH 连接测试 + 服务器体检：CPU / 内存 / 磁盘 / 负载（8 秒超时）。\n\
-                 直接用当前表单值测试（无需先保存）；密码栏已输入未保存的密码也会参与本次测试",
-            )
+            .add_enabled(!testing && selected_is_ssh, egui::Button::new("🔌 测试连接"))
+            .on_hover_text(test_tip)
             .clicked()
         {
             start_test(main);
@@ -465,7 +513,10 @@ fn edit_form(ui: &mut egui::Ui, main: &mut MainState) {
                     ui.end_row();
 
                     ui.label("端口:");
-                    if ui.add(egui::DragValue::new(port).range(1..=65535)).changed() {
+                    if ui
+                        .add(egui::DragValue::new(port).clip_text(true).range(1..=65535))
+                        .changed()
+                    {
                         main.target_editor.unsaved = true;
                     }
                     ui.end_row();
@@ -577,6 +628,13 @@ fn edit_form(ui: &mut egui::Ui, main: &mut MainState) {
                     if option_text_row(ui, "registry:", registry, 220.0) {
                         main.target_editor.unsaved = true;
                     }
+                    ui.label("");
+                    ui.weak(
+                        "kubectl 作为客户端工具在发版机本机执行（与 git / mvn 同类），\
+                         经 kubeconfig 连接远端集群——本机装好 kubectl + 本文件指向哪个集群，\
+                         k8s-apply 步骤就操作哪个集群；运行时引擎自动注入 KUBECONFIG 环境变量",
+                    );
+                    ui.end_row();
                 }
                 TargetType::Local => {
                     ui.label("");
@@ -586,57 +644,52 @@ fn edit_form(ui: &mut egui::Ui, main: &mut MainState) {
             }
 
             if matches!(target.target_type, TargetType::Ssh { .. }) {
-                // 传输实现（v0.5 §5.2）：russh 默认 / putty 兜底；改动直接写 target.transport。
-                // 套件缺失且目标不走 putty 时选择器只剩一个有效选项——收起下拉显示
-                // 静态文本；目标正走 putty（含旧配置缺省）时仍要给选择器，用户才有
-                // 入口切走，putty 选项标注套件缺失（选它运行期会报「未找到 PuTTY」）。
+                // 传输实现（v0.5 §5.2 换防）：russh 默认 / putty 兜底。
+                // 选择器恒为下拉框（此前套件缺失时收起成静态文本，切到 russh 的瞬间
+                // 下拉框"变成文字"，看起来像控件坏了）：putty 未安装时仅把 putty
+                // 选项禁用并标注，russh 永远可选，控件形态稳定不跳变。
                 let putty_found = crate::transport::putty::detect_putty_tools().found;
-                let effective_putty =
-                    target.transport.map(|k| k == TransportKind::Putty).unwrap_or(true);
                 ui.label("传输:");
-                if putty_found || effective_putty {
-                    let t_idx = main.target_editor.transport_idx;
-                    let mut new_t = t_idx;
-                    let labels: [String; 2] = if putty_found {
-                        TRANSPORTS.map(|s| s.to_string())
-                    } else {
-                        ["russh（内置，默认）".to_string(), "putty（⚠ 未检测到套件）".to_string()]
-                    };
-                    egui::ComboBox::from_id_salt("transport_combo")
-                        .selected_text(&labels[t_idx])
-                        .width(220.0)
-                        .show_ui(ui, |ui| {
-                            for (i, label) in labels.iter().enumerate() {
-                                ui.selectable_value(&mut new_t, i, label);
-                            }
-                        });
-                    if new_t != t_idx {
-                        main.target_editor.transport_idx = new_t;
-                        target.transport = Some(match new_t {
-                            0 => TransportKind::Russh,
-                            _ => TransportKind::Putty,
-                        });
-                        main.target_editor.transport_was_unset = false;
-                        main.target_editor.unsaved = true;
-                    }
+                let t_idx = main.target_editor.transport_idx;
+                let mut new_t = t_idx;
+                let labels: [String; 2] = if putty_found {
+                    TRANSPORTS.map(|s| s.to_string())
                 } else {
-                    // Grid 一行只有两格：值格只放 strong，说明文字必须挪到独立提示行
-                    //（同下方 was_unset 行的写法；三格会把后续所有行顶歪）
-                    ui.strong("russh（内置）");
-                    ui.end_row();
-                    ui.label("");
-                    ui.weak("免装 PuTTY 套件；如需 putty 兜底请先安装套件");
+                    ["russh（内置，默认）".to_string(), "putty（⚠ 未检测到套件）".to_string()]
+                };
+                egui::ComboBox::from_id_salt("transport_combo")
+                    .selected_text(&labels[t_idx])
+                    .width(220.0)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut new_t, 0, &labels[0]);
+                        ui.add_enabled_ui(putty_found, |ui| {
+                            ui.selectable_value(&mut new_t, 1, &labels[1]);
+                        });
+                    });
+                if new_t != t_idx {
+                    main.target_editor.transport_idx = new_t;
+                    target.transport = Some(match new_t {
+                        0 => TransportKind::Russh,
+                        _ => TransportKind::Putty,
+                    });
+                    main.target_editor.transport_was_unset = false;
+                    main.target_editor.unsaved = true;
                 }
                 ui.end_row();
+                if !putty_found {
+                    ui.label("");
+                    ui.weak(
+                        "本机未检测到 PuTTY 套件：putty 选项不可选，执行一律按 russh；\
+                         需要兜底请先安装 PuTTY（⚙ 设置 → 🔌 PuTTY 可指定目录）",
+                    );
+                    ui.end_row();
+                }
                 if main.target_editor.transport_was_unset {
                     ui.label("");
-                    ui.weak(if putty_found {
-                        "旧配置未指定传输，按 putty 执行（行为与升级前一致）；\
-                         可切 russh 免装 PuTTY 套件"
-                    } else {
-                        "旧配置未指定传输，按 putty 执行——但本机未检测到 PuTTY 套件，\
-                         运行会失败；建议切 russh（内置）"
-                    });
+                    ui.weak(
+                        "旧配置未指定传输，此前按 putty 执行（行为与升级前一致）；\
+                         建议切 russh（内置）免装 PuTTY 套件",
+                    );
                     ui.end_row();
                 }
 
@@ -812,7 +865,9 @@ fn local_machine_panel(ui: &mut egui::Ui, main: &mut MainState) {
     ui.heading("🧰 工具链（tools.yaml）");
     ui.weak(
         "步骤里选择了工具时：该工具的 env 注入该步骤，其所在目录前置到 PATH，\n\
-         命令里的裸名（java / mvn / node…）就会解析到这个工具的版本——选哪个用哪个。",
+         命令里的裸名（java / mvn / node…）就会解析到这个工具的版本——选哪个用哪个。\n\
+         下表版本是探测快照；每次运行引擎会对用到的工具自动自检并以现算值为准。\n\
+         工具只影响发版机本机执行的步骤，SSH 远端步骤在远端 shell 执行。",
     );
     ui.add_space(4.0);
 
@@ -955,23 +1010,37 @@ fn load_buffers(main: &mut MainState, name: &str) {
         TargetType::Ssh { auth, .. } => {
             main.target_editor.kind_idx = 0;
             main.target_editor.auth_idx = auth_index(auth);
-            main.target_editor.transport_was_unset = false;
+            main.target_editor.transport_was_unset = t.transport.is_none();
             main.target_editor.transport_idx = match t.transport {
                 Some(TransportKind::Russh) => 0,
                 Some(TransportKind::Putty) => 1,
                 // 旧配置缺省：兼容按 putty，表单提示可切换
-                None => {
-                    main.target_editor.transport_was_unset = true;
-                    1
-                }
+                None => 1,
             };
+            // 同步修复（putty 被移除的场景）：配置指向 putty（或缺省兼容 putty）
+            // 而套件已不在 → 运行必失败。此处把内存副本改成 russh 并标未保存，
+            // 配一条明确的状态栏提示——宁可显式提示，也不静默换实现埋排查地雷
+            let putty_found = crate::transport::putty::detect_putty_tools().found;
+            if !putty_found && t.transport != Some(TransportKind::Russh) {
+                if let Some(target) = scope_map_mut(main).and_then(|m| m.get_mut(name)) {
+                    target.transport = Some(TransportKind::Russh);
+                }
+                main.target_editor.transport_idx = 0;
+                main.target_editor.transport_was_unset = false;
+                main.target_editor.unsaved = true;
+                main.status_msg = Some(format!(
+                    "⚠ 目标「{name}」此前走 putty 传输，但本机未检测到 PuTTY 套件，\
+                     已自动改用 russh（内置）——点「💾 保存」落盘确认"
+                ));
+            }
         }
         TargetType::Kubernetes { .. } => {
             main.target_editor.kind_idx = 1;
             main.target_editor.transport_was_unset = false;
         }
         TargetType::Local => {
-            main.target_editor.kind_idx = 2;
+            // local 不在类型下拉里（固定目标），idx 不会被用到；给 0 防越界
+            main.target_editor.kind_idx = 0;
             main.target_editor.transport_was_unset = false;
         }
     }

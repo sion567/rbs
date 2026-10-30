@@ -35,10 +35,14 @@ pub struct GroupSpec {
     pub cancel_tx: Option<broadcast::Sender<()>>,
     /// 从第几个流程开始（续跑：上次组运行失败处）
     pub from_job: usize,
+    /// 仅 sqlite 历史入库使用（no-default-features 构建下未读）
+    #[cfg_attr(not(feature = "sqlite"), allow(dead_code))]
     pub save_history: bool,
     /// GUI 落日志文件的目录（{run_id}.log）；None = 不落（CLI 现状）
     pub log_dir: Option<std::path::PathBuf>,
     /// 历史入库的触发来源（RunMeta.trigger：manual / watch / cli / group）
+    /// 仅 sqlite 历史入库使用（no-default-features 构建下未读）
+    #[cfg_attr(not(feature = "sqlite"), allow(dead_code))]
     pub trigger: &'static str,
 }
 
@@ -110,6 +114,7 @@ pub async fn run_group_serial(spec: GroupSpec, sink: &dyn GroupSink) -> GroupOut
         }
 
         let run_id = format!("{}-{:02}", spec.group_id, i + 1);
+        #[cfg(feature = "sqlite")]
         let snapshot = yaml_serde::to_string(&gj.job).unwrap_or_default();
         #[cfg(feature = "sqlite")]
         let meta = crate::storage::sqlite::RunMeta {

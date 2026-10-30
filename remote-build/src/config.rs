@@ -240,7 +240,7 @@ pub fn create_project_entry(name: &str, local_path: &Path) -> Result<PathBuf> {
     let job = Job {
         name: "build".to_string(),
         project: name.to_string(),
-        description: Some("起始作业，可在编辑器中修改".to_string()),
+        description: Some("起始流程，可在编辑器中修改".to_string()),
         target: Some("local".to_string()),
         environment: None,
         timeout: Some(60),

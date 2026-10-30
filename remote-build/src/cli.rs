@@ -192,10 +192,13 @@ fn run(args: &[String]) {
 
     let rt = tokio::runtime::Runtime::new().expect("创建 tokio runtime 失败");
     let (tx, mut rx) = mpsc::channel(8192);
+    #[cfg(feature = "sqlite")]
     let save_history = config::load_global()
         .map(|g| g.save_history)
         .unwrap_or(true);
+    #[cfg(feature = "sqlite")]
     let steps_len = je.job.steps.len();
+    #[cfg(feature = "sqlite")]
     let snapshot = yaml_serde::to_string(&je.job).unwrap_or_default();
     // run_id 只取一次：历史入库与引擎 ${{ run.id }} 必须一致（分两次取时间跨秒会错开）；
     // 精确到毫秒，避免同秒重跑与 GUI/CLI 并发时日志同名、SQLite UNIQUE 冲突
@@ -527,7 +530,8 @@ fn preview(args: &[String]) {
             match crate::version::version_matches(req, &detected) {
                 Ok(true) => println!("工具版本: {name} {detected} 满足 {req} ✓"),
                 Ok(false) => println!(
-                    "⚠ 工具版本偏差: {name} 需要 {req}，探测到 {detected}（运行将被拦截）"
+                    "⚠ 工具版本偏差: {name} 需要 {req}，探测快照 {detected}\
+                     （预览不发进程；运行时以自动自检现算值为准并拦截）"
                 ),
                 Err(e) => println!("⚠ {name}: {e}"),
             }

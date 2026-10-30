@@ -5,7 +5,9 @@
 //!   造成各机器行为不一致；PuttyConfig.use_builtin 字段随之移除。
 //! - 与 tools.yaml 的关系（§3.4 v0.4 澄清）：tools.yaml 的 putty 条目由探测结果
 //!   自动生成、仅供 UI 展示；本模块路径一律以 detect_putty_tools() 为准，不回读 tools.yaml
-//! - 安全红线（§5.7）：禁止 -pw 明文传密码
+//! - 密码传递（§5.7 / §14）：password 认证经 plink `-pw` 传递——密码本体只存
+//!   Windows Credential Manager 不落 YAML，但 -pw 在本机进程列表存在短暂暴露窗口
+//!   （内网工具可接受；高安全场景请用 key / agent 认证规避）
 
 use super::local::{pipe_child_output, wait_with_cancel};
 use super::{ExitStatus, LogHandle, RemoteTransport};

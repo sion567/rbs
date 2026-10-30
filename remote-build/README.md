@@ -2,7 +2,7 @@
 
 Windows 桌面构建部署工具，覆盖"下载 → 编译 → 打包 → 上传 → 部署"链路。
 架构设计见 `../docs/RemoteBuildSystem架构设计文档_v0.4.md`；变量语法速查见 `../docs/变量速查.md`
-（GUI 作业编辑器里也有「？ 变量语法」窗口）；功能路线与完成情况见 `../docs/TODO.md`。
+（GUI 流程编辑器里也有「？ 变量语法」窗口）；功能路线与完成情况见 `../docs/TODO.md`。
 
 ## 构建与运行
 
@@ -33,7 +33,7 @@ remote-build preview <项目名> <流程名>           # 干跑预览：解析�
 | `upload` | 上传（多行映射 `本地 -> 远端`；sha256 校验；内容未变自动跳过传输） |
 | `download` | 下载（`远端 -> 本地`；sha256 校验；父目录自动创建） |
 | `pack` | 本地 zip 打包（`目录 -> x.zip [--exclude node_modules --exclude *.map]`） |
-| `k8s-apply` | 本地 kubectl（KUBECONFIG 自动注入；k8s_watch 为 P1.5） |
+| `k8s-apply` | kubectl 在发版本机执行（KUBECONFIG 自动注入），经 kubeconfig 连接远端集群；k8s_watch 为 P1.5 |
 
 ## 流程级能力（build.yaml）
 
@@ -45,16 +45,17 @@ remote-build preview <项目名> <流程名>           # 干跑预览：解析�
   不烧超时（配方见 `../docs/长任务配方.md`）
 - **前置检查**：`preconditions:` 本地断言，失败零秒退出（人话报错）
 - **确认门**：`confirm: prod` —— 运行前要求输入确认词，防手滑上生产
-- **超时**：`timeout:`（作业级总超时）+ 步骤级 `timeout`（config.yaml `default_timeout` 兜底）
+- **超时**：`timeout:`（流程级总超时）+ 步骤级 `timeout`（config.yaml `default_timeout` 兜底）
 - **失败策略**：`on_failure: stop / continue / retry`（retry = 整个流程从头重跑 N 次）
-- **工具版本要求**：project.yaml `tools_require: { java: ">=21" }`，偏差零步失败
+- **工具自动自检**：运行启动时引擎对本次用到的工具（步骤 tool ∪ tools_require）逐个
+  现跑 version_check（未配置的降级为检查 command 存在），失败零步失败 + 人话报错；
+  tools_require 用自检现算的版本做门禁（tools.yaml 的 version 只是探测快照）
 - **同项目运行互斥**：新运行自动取消旧运行（GUI / CLI 跨进程生效，GHA concurrency 语义）
 
 ## 组运行（金丝雀分批语义）
 
-分组从「项目树展示单位」升级为**执行单位**：工具栏「▶ 运行组」（选中流程所属组）或
-右键分组头「▶ 运行组」——组内流程按项目树顺序**串行**执行，**任一失败即停**
-（后续流程不启动 = 金丝雀"任一批失败不碰剩余机器"）。
+分组从「项目树展示单位」升级为**执行单位**：右键分组头「▶ 运行组」——组内流程按项目树
+顺序**串行**执行，**任一失败即停**（后续流程不启动 = 金丝雀"任一批失败不碰剩余机器"）。
 
 - **确认门统一收口**：组级预览（各流程干跑连展）→ 一次输入**全部**确认词
   （组内任一流程配了 `confirm:` 就要输入，连跑不降级防线）；`preconditions` 照常逐流程把关
@@ -72,8 +73,8 @@ remote-build preview <项目名> <流程名>           # 干跑预览：解析�
   设置页「🕘 运行历史」查看最近运行；保留期随 `log_retention_days` 清理）
 - **👀 监听模式**：工作目录文件变化自动重跑当前流程（3s mtime 轮询，排除构建产物目录）
 - **状态可视化**：步骤光圈（运行蓝/等待黄/成功绿/失败红）+ 耗时条 + 重试标注
-- **桌面通知**：作业结束弹 Windows toast（`desktop_notify` 可关）
-- **控制台**：实时流式输出、「只看错误」过滤器、复制 / 导出 .log
+- **桌面通知**：流程结束弹 Windows toast（`desktop_notify` 可关）
+- **控制台**：实时流式输出、「只看错误」过滤器、可折叠（编辑步骤时收起）、复制 / 导出 .log
 - **危险命令提醒**：`rm -rf /`、`chmod -R 777` 等模式预览 ⚠ + 执行前告警（不拦截）
 
 ## SSH 传输（v0.5 换防）

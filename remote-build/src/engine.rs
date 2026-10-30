@@ -199,8 +199,115 @@ impl Engine {
         };
         let corepack_ok = pinned_frontend && corepack_available();
 
+        // ── 工具自检（运行期自动验证，见 TODO「工具系统重设计」）─────────
+        // 原则：步骤只声明「用哪个工具」，验证是引擎的职责，不是用户的配置项
+        //（此前 version_check 只有设置页按钮在手动跑，运行期从不验证）。
+        // 集合 = 步骤 tool（含 handlers）∪ tools_require 键；每 run 每工具只验一次。
+        // 有 version_check → 现跑（复用设置页同一套 cmd/bat 正确解析 + 3s 超时），
+        //   结果刷新内存 version——下面的 tools_require 门禁用现算值，
+        //   不再依赖 tools.yaml 里可能过期的探测快照。
+        // 无 version_check → 降级为 command 可解析检查（空 command 视为仅 env 注入，跳过）。
+        // 自检失败 = 零步失败 + 人话；控制台逐条 [自检] 行，工具可用性进入运行记录。
+        {
+            let mut used: std::collections::BTreeSet<String> =
+                input.project.tools_require.keys().cloned().collect();
+            for s in input.job.steps.iter().chain(input.job.handlers.iter()) {
+                let t = s.tool.trim();
+                if !t.is_empty() {
+                    used.insert(t.to_string());
+                }
+            }
+            for name in &used {
+                // 工具之间响应取消：工具多 / 验证慢（每个 ≤3s）时 ⏹ 不至于失灵
+                if matches!(
+                    cancel_rx.try_recv(),
+                    Ok(()) | Err(broadcast::error::TryRecvError::Closed)
+                ) {
+                    return JobStatus::Cancelled;
+                }
+                // 验证是同步子进程等待：丢进阻塞线程池执行，不占 async worker、
+                // 不阻塞事件转发任务与运行锁 watcher
+                let Some(tool) = merged_tools.get(name).cloned() else {
+                    let reason = format!(
+                        "工具「{name}」未定义（tools.yaml / 项目级 tools，或 ⚙ 设置 → 🧰 工具管理 添加）"
+                    );
+                    let _ = log_tx.send(LogEvent::Error { message: reason.clone() }).await;
+                    return JobStatus::Failed {
+                        step_index: JobStatus::PRECONDITION_STEP,
+                        reason,
+                    };
+                };
+                let name_for_check = name.clone();
+                let outcome: Result<(String, Option<String>), String> =
+                    tokio::task::spawn_blocking(move || {
+                        match tool.version_check.as_deref().map(str::trim).filter(|s| !s.is_empty())
+                        {
+                            Some(check) => {
+                                match crate::env_detect::run_version_check_for_tool(&check, &tool) {
+                                    Some(line) => Ok((
+                                        format!("[自检] {name_for_check} {line} ✓（version_check）"),
+                                        Some(line),
+                                    )),
+                                    None => Err(format!(
+                                        "工具自检失败: {name_for_check} 的验证命令「{check}」无输出\n\
+                                         （超时 3s / 命令不存在 / 启动失败）。\n\
+                                         请检查本机安装，或在 ⚙ 设置 → 🧰 工具管理 选中后点「验证 version_check」排查"
+                                    )),
+                                }
+                            }
+                            None if tool.command.trim().is_empty() => Ok((
+                                format!(
+                                    "[自检] {name_for_check} ✓（未配置 command / version_check，仅 env 注入）"
+                                ),
+                                None,
+                            )),
+                            None => {
+                                if crate::env_detect::probe_command_exists(&tool.command) {
+                                    Ok((
+                                        format!(
+                                            "[自检] {name_for_check} ✓（未配 version_check，已确认可执行存在）"
+                                        ),
+                                        None,
+                                    ))
+                                } else {
+                                    Err(format!(
+                                        "工具自检失败: {name_for_check} 的 command「{}」解析不到可执行文件\n\
+                                         （路径不存在 / PATH 找不到）。\n\
+                                         请在 ⚙ 设置 → 🧰 工具管理 修正 command 或重新探测",
+                                        tool.command
+                                    ))
+                                }
+                            }
+                        }
+                    })
+                    .await
+                    .unwrap_or_else(|e| Err(format!("工具自检任务异常终止: {e}")));
+                match outcome {
+                    Ok((line, fresh)) => {
+                        // 现算版本并回内存：tools_require 门禁拿到的是本次运行的事实
+                        if let (Some(tool), Some(v)) = (merged_tools.get_mut(name.as_str()), fresh) {
+                            tool.version = Some(v);
+                        }
+                        let _ = log_tx
+                            .send(LogEvent::Stdout {
+                                step_index: JobStatus::PRECONDITION_STEP,
+                                line,
+                            })
+                            .await;
+                    }
+                    Err(reason) => {
+                        let _ = log_tx.send(LogEvent::Error { message: reason.clone() }).await;
+                        return JobStatus::Failed {
+                            step_index: JobStatus::PRECONDITION_STEP,
+                            reason,
+                        };
+                    }
+                }
+            }
+        }
+
         // ── 工具版本要求（mise 风格）：偏差零步失败 ────────────────────
-        // 无进程开销（对比 tools.yaml 探测结果），放在前置检查之前先拦配置级问题
+        // 对比的是上面自检现算的 version（探测快照过期问题消除），前置检查之前先拦配置级问题
         {
             let mut reqs: Vec<(&String, &String)> = input.project.tools_require.iter().collect();
             reqs.sort();
@@ -208,17 +315,17 @@ impl Engine {
                 let outcome: Result<String, String> = (|| {
                     let Some(tool) = merged_tools.get(name) else {
                         return Err(format!(
-                            "工具「{name}」未定义（tools.yaml / 项目级 tools 或 ⚙ 设置里添加）"
+                            "工具「{name}」未定义（tools.yaml / 项目级 tools，或 ⚙ 设置 → 🧰 工具管理 添加）"
                         ));
                     };
                     let detected = tool.version.as_deref().unwrap_or("");
                     match crate::version::version_matches(req, detected) {
                         Ok(true) => {
-                            Ok(format!("[tools] {name} {detected} 满足 {req} ✓"))
+                            Ok(format!("[自检] {name} {detected} 满足 {req} ✓"))
                         }
                         Ok(false) => Err(format!(
-                            "工具版本偏差: {name} 需要 {req}，探测到 {detected}\n\
-                             （在 ⚙ 设置里重新探测；版本确实太旧请升级工具）"
+                            "工具版本偏差: {name} 需要 {req}，自检现算 {detected}
+                             （以本次运行现算为准；版本确实太旧请升级工具）"
                         )),
                         Err(e) => Err(format!("工具版本要求无法校验: {name} {req}: {e}")),
                     }
@@ -1409,6 +1516,166 @@ mod tests {
         assert!(events.iter().any(|e| matches!(
             e,
             LogEvent::Stdout { line, .. } if line.contains("VAR_IS_hi")
+        )));
+    }
+
+    // ── 工具自检（运行期自动验证）回归 ─────────────────────────────
+
+    fn tool_input(steps: Vec<Step>, tools: Vec<Tool>, reqs: Vec<(&str, &str)>) -> RunInput {
+        let mut input = simple_job(steps);
+        for t in tools {
+            input.tools.insert(t.name.clone(), t);
+        }
+        input.project.tools_require = reqs
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        input
+    }
+
+    #[test]
+    fn tool_selfcheck_fails_fast_on_broken_version_check() {
+        // version_check 指向不存在的命令 → 零步失败 + 人话（此前要到步骤报错才发现）
+        let rt = runtime();
+        let (tx, mut rx) = mpsc::channel(1024);
+        let (_cancel_tx, cancel_rx) = broadcast::channel(4);
+
+        let step = Step {
+            tool: "broken".to_string(),
+            command: "echo hi".to_string(),
+            step_type: StepType::Exec,
+            enabled: true,
+            ..Default::default()
+        };
+        let input = tool_input(
+            vec![step],
+            vec![Tool {
+                name: "broken".to_string(),
+                command: "no_such_tool_xyz".to_string(),
+                version_check: Some("no_such_tool_xyz --version".to_string()),
+                ..Default::default()
+            }],
+            vec![],
+        );
+        let status = rt.block_on(Engine.run_job(input, cancel_rx, tx));
+        assert!(
+            matches!(status, JobStatus::Failed { step_index: JobStatus::PRECONDITION_STEP, .. }),
+            "{status:?}"
+        );
+        let mut events = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            events.push(ev);
+        }
+        assert!(events.iter().any(|e| matches!(
+            e,
+            LogEvent::Error { message } if message.contains("工具自检失败")
+        )));
+    }
+
+    #[test]
+    fn tool_selfcheck_feeds_fresh_version_to_requirement_gate() {
+        // 快照 version=1.0.0 满足不了 >=9，自检现算出 9.9.9 → 门禁放行
+        //（旧逻辑拿快照对比会误拦——自检结果刷新内存 version 的回归证明）
+        let rt = runtime();
+        let (tx, mut rx) = mpsc::channel(1024);
+        let (_cancel_tx, cancel_rx) = broadcast::channel(4);
+
+        let step = Step {
+            tool: "mytool".to_string(),
+            command: "echo hi".to_string(),
+            step_type: StepType::Exec,
+            enabled: true,
+            ..Default::default()
+        };
+        let input = tool_input(
+            vec![step],
+            vec![Tool {
+                name: "mytool".to_string(),
+                command: "cmd".to_string(),
+                version: Some("1.0.0".to_string()),
+                version_check: Some("cmd /C echo 9.9.9".to_string()),
+                ..Default::default()
+            }],
+            vec![("mytool", ">=9")],
+        );
+        let status = rt.block_on(Engine.run_job(input, cancel_rx, tx));
+        let events = collect(status, &mut rx);
+        assert!(events.iter().any(|e| matches!(
+            e,
+            LogEvent::Stdout { line, .. } if line.contains("[自检] mytool 9.9.9")
+        )));
+        assert!(events.iter().any(|e| matches!(
+            e,
+            LogEvent::Stdout { line, .. } if line.contains("满足 >=9")
+        )));
+    }
+
+    #[test]
+    fn tool_selfcheck_flags_undefined_tool() {
+        // 步骤引用了未定义的工具 → 自检阶段人话报错（不再等到步骤执行）
+        let rt = runtime();
+        let (tx, _rx) = mpsc::channel(1024);
+        let (_cancel_tx, cancel_rx) = broadcast::channel(4);
+
+        let step = Step {
+            tool: "ghost".to_string(),
+            command: "echo hi".to_string(),
+            step_type: StepType::Exec,
+            enabled: true,
+            ..Default::default()
+        };
+        let input = tool_input(vec![step], vec![], vec![]);
+        let status = rt.block_on(Engine.run_job(input, cancel_rx, tx));
+        assert!(matches!(status, JobStatus::Failed { step_index: JobStatus::PRECONDITION_STEP, .. }));
+    }
+
+    #[test]
+    fn tool_selfcheck_downgrades_to_command_existence() {
+        // 无 version_check：command 解析不到 → 失败；command 存在（cmd）→ 通过
+        let rt = runtime();
+
+        let missing = tool_input(
+            vec![Step {
+                tool: "m".to_string(),
+                command: "echo hi".to_string(),
+                step_type: StepType::Exec,
+                enabled: true,
+                ..Default::default()
+            }],
+            vec![Tool {
+                name: "m".to_string(),
+                command: "no_such_exe_xyz".to_string(),
+                ..Default::default()
+            }],
+            vec![],
+        );
+        let (_tx, _rx) = mpsc::channel(1024);
+        let (_cancel_tx, cancel_rx) = broadcast::channel(4);
+        let status = rt.block_on(Engine.run_job(missing, cancel_rx, _tx));
+        assert!(matches!(status, JobStatus::Failed { step_index: JobStatus::PRECONDITION_STEP, .. }));
+
+        let exists = tool_input(
+            vec![Step {
+                tool: "m".to_string(),
+                command: "echo hi".to_string(),
+                step_type: StepType::Exec,
+                enabled: true,
+                ..Default::default()
+            }],
+            vec![Tool {
+                name: "m".to_string(),
+                command: "cmd".to_string(),
+                ..Default::default()
+            }],
+            vec![],
+        );
+        let (tx, mut rx) = mpsc::channel(1024);
+        let (_cancel_tx, cancel_rx) = broadcast::channel(4);
+        let status = rt.block_on(Engine.run_job(exists, cancel_rx, tx));
+        let events = collect(status, &mut rx);
+        assert!(events.iter().any(|e| matches!(
+            e,
+            LogEvent::Stdout { line, .. } if line.contains("已确认可执行存在")
         )));
     }
 

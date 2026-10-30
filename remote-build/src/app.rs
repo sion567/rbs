@@ -74,6 +74,40 @@ impl eframe::App for RemoteBuildApp {
     }
 }
 
+/// 启动期字形预热字符集（build.rs 从 UI / 引擎源码收集的全部 CJK 字符）。
+/// egui 按需栅格化字形——首次显示某段中文（打开新窗口 / 控制台出现新错误文案）
+/// 会现场栅格化几百个字，表现为可感知的顿挫；首帧屏幕外画一遍后全部命中缓存
+const PREWARM_CHARS: &str = include_str!(concat!(env!("OUT_DIR"), "/ui_prewarm_chars.txt"));
+
+/// 首帧调用：把预热字符集按各字号排布并画一遍。
+/// 位置必须在可视区内（裁剪框外的文本行会被 tessellator 整行剔除、字形不进图集），
+/// 用全透明色让顶点生成但像素不可见——字形栅格化进图集，用户看不到任何变化
+fn prewarm_glyphs(ui: &mut egui::Ui) {
+    if PREWARM_CHARS.is_empty() {
+        return;
+    }
+    let styles = [
+        egui::TextStyle::Small,
+        egui::TextStyle::Body,
+        egui::TextStyle::Button,
+        egui::TextStyle::Heading,
+        egui::TextStyle::Monospace,
+    ];
+    for style in styles {
+        let font_id = style.resolve(ui.style());
+        let galley = ui.ctx().fonts_mut(|f| {
+            f.layout(
+                PREWARM_CHARS.to_owned(),
+                font_id,
+                egui::Color32::PLACEHOLDER,
+                f32::INFINITY,
+            )
+        });
+        ui.painter()
+            .galley(egui::Pos2::ZERO, galley, egui::Color32::TRANSPARENT);
+    }
+}
+
 /// 中文字体：egui 默认字体无 CJK 字形，加载微软雅黑（缺失时回退默认）
 fn load_cjk_font(ctx: &egui::Context) {
     // 非 TTC 的 .ttf 优先：egui 0.37 新字体引擎解析 msyh.ttc 等 TrueType Collection
@@ -116,10 +150,18 @@ pub struct MainState {
     pub global: crate::models::GlobalConfig,
     pub tools: std::collections::HashMap<String, crate::models::Tool>,
     pub projects: Vec<ProjectEntry>,
+    /// 项目校验结果缓存（reload 时算一次）：validate_project 每次要 stat
+    /// 本地目录 + .git，每帧逐项目 stat 在网络盘 / 死路径上可阻塞数秒——
+    /// 这正是「程序卡卡的」的经典根源。项目列表只在 reload 变化，缓存同步刷新
+    pub validation: std::collections::HashMap<String, Vec<crate::models::ValidationIssue>>,
     pub selected_project: Option<usize>,
     pub selected_job: Option<usize>,
     pub console: ui::console::ConsoleState,
     pub run: Option<RunHandle>,
+    /// 停止已请求（两段式停止的第一段）：记录点击 ⏹ 的时刻，用于把按钮切换到
+    /// 「停止中…」并在超过 FORCE_FINISH_AFTER 秒后升级为「⛔ 强制结束」兜底。
+    /// 运行自然结束（JobEnd）/ 再次启动 / 强制结束时清零
+    pub stop_requested: Option<Instant>,
     pub show_settings: bool,
     pub tool_editor: ui::settings::ToolEditorState,
     pub new_project: ui::new_project::NewProjectState,
@@ -221,11 +263,19 @@ pub struct GroupResume {
 pub struct RunHandle {
     /// UI Stop 按钮向它发送取消信号（§12.2 broadcast 模型）
     pub cancel_tx: broadcast::Sender<()>,
+    /// 引擎任务的 abort 句柄（强制结束兜底用）。单流程运行 = Some；
+    /// 组运行 = None（组循环内的引擎任务无法单独定位，强制结束走
+    /// abort 组包装任务 + cancel 传播：当前流程的引擎收到取消自行收尾）
+    pub engine_abort: Option<tokio::task::AbortHandle>,
     /// 引擎事件（转发任务从 tokio mpsc 搬运而来）
     pub events: std_mpsc::Receiver<LogEvent>,
     pub join: tokio::task::JoinHandle<()>,
     pub finished: Option<JobStatus>,
 }
+
+/// ⏹ 停止后引擎仍未收尾（卡在不可取消的 spawn_blocking 段：打大包 / 大文件
+/// sha256）时，等待这么久就把按钮升级为「⛔ 强制结束」
+const FORCE_FINISH_AFTER: Duration = Duration::from_secs(10);
 
 /// 组运行事件出口：runner（tokio 任务）→ std mpsc → UI drain_events。
 /// 历史入库与日志落盘在 runner 内完成（与单流程转发任务同一路径）。
@@ -251,7 +301,9 @@ impl MainState {
             selected_project: None,
             selected_job: None,
             console: Default::default(),
+            validation: Default::default(),
             run: None,
+            stop_requested: None,
             show_settings: false,
             tool_editor: Default::default(),
             new_project: Default::default(),
@@ -306,6 +358,7 @@ impl MainState {
         if !self.run_active() {
             self.run = None;
             self.run_job = None;
+            self.stop_requested = None;
             self.run_steps.clear();
             self.run_step_wait.clear();
         }
@@ -327,6 +380,12 @@ impl MainState {
             }
         };
         self.projects = files::discover_projects(&self.workspace_root);
+        // 校验结果随 reload 刷新（目录存在性 / .git 只在项目列表变化时才可能变）
+        self.validation = self
+            .projects
+            .iter()
+            .map(|e| (e.project.name.clone(), crate::config::validate_project(&e.project)))
+            .collect();
 
         // 收缩选择到有效范围
         if self.projects.is_empty() {
@@ -374,6 +433,8 @@ impl MainState {
         // 主题首帧应用（此后设置页切换时即时应用）
         if !self.theme_applied {
             apply_theme(&ctx, &self.global.theme);
+            // 字形预热与主题同帧做一次：消除「首次打开窗口 / 首条中文日志」的栅格化顿挫
+            prewarm_glyphs(ui);
             self.theme_applied = true;
         }
         self.drain_events();
@@ -386,44 +447,84 @@ impl MainState {
             ui.horizontal(|ui| {
                 let running = self.run_active();
                 let has_selection = self.selected_project.is_some() && self.selected_job.is_some();
-                if ui
-                    .add_enabled(has_selection, egui::Button::new("▶ 运行全部"))
+                // 运行 / 停止做成同一个按钮（收音机式互斥）：空闲亮「▶ 运行」，
+                // 运行中按钮翻转成「⏹ 停止」，永不置灰。停止分两段：
+                //   第一段：发送取消信号 → 引擎终止正在执行的步骤（整棵进程树，
+                //           Windows Job Object）并收尾，组运行同时停掉后续流程；
+                //   第二段（兜底）：引擎卡在不可取消的阻塞段（打大包 / 大文件 sha256）
+                //           超过 FORCE_FINISH_AFTER 还没收尾 → 按钮升级为
+                //           「⛔ 强制结束」，直接中止引擎任务并复位界面。
+                if running {
+                    match self.stop_requested {
+                        None => {
+                            if ui
+                                .add_enabled(
+                                    true,
+                                    egui::Button::new("⏹ 停止")
+                                        .fill(egui::Color32::from_rgb(150, 60, 50)),
+                                )
+                                .on_hover_text(
+                                    "停止本次任务：终止正在执行的步骤（整棵进程树），\n\
+                                     组运行同时停掉未开始的后续流程",
+                                )
+                                .clicked()
+                            {
+                                if let Some(run) = &self.run {
+                                    let _ = run.cancel_tx.send(());
+                                }
+                                self.stop_requested = Some(Instant::now());
+                                self.status_msg =
+                                    Some("已发送停止信号，正在终止进程树…".to_string());
+                                self.console.push_line(
+                                    "==== ⏹ 收到停止请求：正在终止当前步骤（整棵进程树）===="
+                                        .to_string(),
+                                    crate::ui::console::Role::Info,
+                                );
+                            }
+                        }
+                        Some(t) if t.elapsed() < FORCE_FINISH_AFTER => {
+                            // 停止中：按钮禁用 + 转圈，让"引擎正在收尾"可见
+                            ui.add_enabled(false, egui::Button::new("⏹ 停止中…"))
+                                .on_hover_text(
+                                    "停止信号已发出，引擎正在终止步骤并收尾；\n\
+                                     若长时间未结束（如卡在打大包），稍后会变为「强制结束」",
+                                );
+                            ui.add(egui::Spinner::new().size(14.0));
+                        }
+                        Some(_) => {
+                            if ui
+                                .add_enabled(
+                                    true,
+                                    egui::Button::new("⛔ 强制结束")
+                                        .fill(egui::Color32::from_rgb(170, 40, 40)),
+                                )
+                                .on_hover_text(
+                                    "停止请求发出后引擎长时间未收尾（可能卡在不可中断的\
+                                     打包 / 哈希计算）。点击强制结束：中止引擎任务并复位界面；\n\
+                                     本机子进程随 Job Object 释放终止，SSH 连接随任务中止断开",
+                                )
+                                .clicked()
+                            {
+                                self.force_finish_run();
+                            }
+                        }
+                    }
+                } else if self.pull_done.is_some() {
+                    // 更新代码（git pull）进行中：暂无取消通道，状态亮出来避免误以为可以点
+                    ui.add_enabled(false, egui::Button::new("⏳ 更新代码中"))
+                        .on_hover_text("正在执行 git pull（暂不支持中途停止），完成后自动恢复");
+                } else if ui
+                    .add_enabled(has_selection, egui::Button::new("▶ 运行"))
                     .on_hover_text(
-                        "按顺序执行所有启用的步骤。\n\
-                         运行中再次点击 = 取消当前运行并重新开始（仅同项目，GHA concurrency 语义）",
+                        "按顺序执行当前流程所有启用的步骤。\n\
+                         运行中此按钮变为「⏹ 停止」；同项目重复运行 = 取消旧的重新开始（GHA concurrency 语义）",
                     )
                     .clicked()
                 {
                     self.start_run(0, None);
                 }
-                // 组运行（第五批）：当前选中流程所属的分组，组内串行·失败即停
-                {
-                    let group_of_selection = match (self.selected_project, self.selected_job) {
-                        (Some(pi), Some(ji)) => self
-                            .projects
-                            .get(pi)
-                            .and_then(|p| p.jobs.get(ji))
-                            .and_then(|je| je.job.group.clone()),
-                        _ => None,
-                    };
-                    if ui
-                        .add_enabled(
-                            group_of_selection.is_some(),
-                            egui::Button::new("▶ 运行组"),
-                        )
-                        .on_hover_text(
-                            "组内流程按项目树顺序串行执行，任一失败即停（金丝雀分批语义）；\n\
-                             确认词取组内最严（一次输入全部确认词）。\n\
-                             右键分组 → 「↪ 从失败处继续」可续跑",
-                        )
-                        .clicked()
-                    {
-                        if let Some(g) = group_of_selection {
-                            let pi = self.selected_project.unwrap_or_default();
-                            self.start_group_run(pi, &g, None);
-                        }
-                    }
-                }
+                // 组运行入口收敛到项目树右键菜单（分组头 → ▶ 运行组）：
+                // 工具栏的「运行组」依赖当前选中流程恰好属于某分组，语义绕、多数时候是灰的
                 if ui
                     .add_enabled(has_selection && !running, egui::Button::new("👁 预览"))
                     .on_hover_text(
@@ -470,12 +571,6 @@ impl MainState {
                         }
                     }
                 }
-                if ui.add_enabled(running, egui::Button::new("⏹ Stop")).clicked() {
-                    if let Some(run) = &self.run {
-                        let _ = run.cancel_tx.send(());
-                    }
-                    self.status_msg = Some("已发送取消信号…".to_string());
-                }
                 // 运行中禁用一切会改盘/改配置的入口（引擎正按路径读写、状态可视化依赖步骤索引稳定）
                 if ui.add_enabled(!running, egui::Button::new("💾 Save")).clicked() {
                     self.save_selected();
@@ -521,9 +616,12 @@ impl MainState {
         ui::console::show(&mut self.console, ui, running, console_dark);
 
         // ── 左侧项目树 ──────────────────────────────────────────────
+        // 限宽 160~360：树内长名已截断，这里再兜底防止拖拽/长名把右栏挤没
         egui::Panel::left("project_tree")
             .resizable(true)
             .default_size(220.0)
+            .min_size(160.0)
+            .max_size(360.0)
             .show(ui, |ui| {
                 ui.add_space(8.0);
                 ui::project_tree::show(self, ui);
@@ -699,7 +797,7 @@ impl MainState {
             return;
         }
         if self.run_active() {
-            self.status_msg = Some("⚠ 有作业运行中，先 ⏹ Stop 再更新代码".to_string());
+            self.status_msg = Some("⚠ 有流程运行中，先停止再更新代码".to_string());
             return;
         }
         let Some(entry) = self.projects.get(pi) else { return };
@@ -864,6 +962,8 @@ impl MainState {
                 }
                 LogEvent::JobEnd { status, .. } => {
                     run.finished = Some(status.clone());
+                    // 引擎正常收尾（含响应 ⏹ 停止后的取消终态）：退出"停止中"状态
+                    self.stop_requested = None;
                     // 监听模式下本次运行已收尾（含 ⏹ Stop / 超时）：把基线拨到现在。
                     // 运行自己往监听目录写的产物（克隆 / .env / 构建输出）mtime 全晚于
                     // 旧基线，不重置的话运行一结束下次轮询立刻再次触发重跑
@@ -880,7 +980,7 @@ impl MainState {
                     // 状态栏同步落终态：否则单流程结束后右上角一直残留「运行中: xxx」
                     // （组运行随后由 GroupJobBegin/GroupJobEnd 覆盖，监听模式见下方分支）
                     self.status_msg =
-                        Some(format!("作业结束: {}", crate::ui::console::job_label_public(status)));
+                        Some(format!("流程结束: {}", crate::ui::console::job_label_public(status)));
                     // 取消/超时：被中断的步骤等不到 StepEnd，兜底落终态，避免永远闪蓝
                     if matches!(status, JobStatus::Cancelled | JobStatus::Timeout) {
                         mark_interrupted_cancelled(&mut self.run_steps);
@@ -1040,7 +1140,9 @@ impl MainState {
                         Role::Info,
                     ),
                     Ok(false) => self.console.push_line(
-                        format!("⚠ 工具版本偏差: {name} 需要 {req}，探测到 {detected}（运行将被拦截）"),
+                        format!(
+                            "⚠ 工具版本偏差: {name} 需要 {req}，探测快照 {detected}                             （预览不发进程；运行时以自动自检现算值为准并拦截）"
+                        ),
                         Role::Fail,
                     ),
                     Err(e) => self.console.push_line(format!("⚠ {name}: {e}"), Role::Fail),
@@ -1273,7 +1375,7 @@ impl MainState {
                 .unwrap_or(false);
             if !same_project {
                 self.status_msg =
-                    Some("⚠ 有其他项目的作业运行中；同项目重跑会自动取消旧的".to_string());
+                    Some("⚠ 有其他项目的流程运行中；同项目重跑会自动取消旧的".to_string());
                 return;
             }
             if let Some(run) = &self.run {
@@ -1318,13 +1420,22 @@ impl MainState {
         // SQLite runs.run_id UNIQUE 冲突导致历史不入库
         let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S%3f");
         let run_id = format!("{}-{}", project.name, stamp);
+        // 以下变量仅 sqlite 历史入库使用（no-default-features 构建下不产生未使用告警）
+        #[cfg(feature = "sqlite")]
         let steps_len = job.steps.len();
+        #[cfg(feature = "sqlite")]
         let job_snapshot = yaml_serde::to_string(&job).unwrap_or_default();
+        #[cfg(feature = "sqlite")]
         let project_job_name = job.name.clone();
+        #[cfg(feature = "sqlite")]
         let project_target_name = job.target.clone();
         let run_id_for_end = run_id.clone();
+        #[cfg(feature = "sqlite")]
         let save_history = self.global.save_history;
         let trigger: &'static str = if self.run_trigger_watch { "watch" } else { "manual" };
+        #[cfg(not(feature = "sqlite"))]
+        let _ = trigger;
+        // 监听标记复位与 feature 无关，必须无条件执行
         self.run_trigger_watch = false;
         let input = crate::engine::RunInput {
             project: project.clone(),
@@ -1348,6 +1459,8 @@ impl MainState {
             let tok_tx = tok_tx.clone();
             self.runtime.spawn(async move { engine.run_job(input, cancel_rx, tok_tx).await })
         };
+        // 强制结束兜底：先取 abort 句柄再把它移进包装任务（JoinHandle 不可克隆）
+        let engine_abort = inner.abort_handle();
         let join = self.runtime.spawn(async move {
             let status = inner
                 .await
@@ -1431,11 +1544,51 @@ impl MainState {
         }
 
         self.console.push_line(
-            format!("==== 启动作业 {label} ===="),
+            format!("==== 启动流程 {label} ===="),
             crate::ui::console::Role::Info,
         );
         self.status_msg = Some(format!("运行中: {label}"));
-        self.run = Some(RunHandle { cancel_tx, events: std_rx, join, finished: None });
+        self.stop_requested = None;
+        self.run = Some(RunHandle {
+            cancel_tx,
+            engine_abort: Some(engine_abort),
+            events: std_rx,
+            join,
+            finished: None,
+        });
+    }
+
+    /// ⛔ 强制结束（两段式停止的兜底段）：⏹ 停止发出后引擎超过 FORCE_FINISH_AFTER
+    /// 仍未收尾（典型：卡在不可取消的 spawn_blocking——打大包 / 大文件 sha256）时，
+    /// 直接中止引擎与包装任务并复位界面。当前步骤的子进程随 Job Object 句柄关闭
+    /// 整树终止；SSH 连接随 future 丢弃断开；组运行未开始的流程不再启动。
+    /// 卡在阻塞段里的任务本身无法被杀（Rust 限制），会在后台做完后被丢弃。
+    fn force_finish_run(&mut self) {
+        let had_group = self
+            .run_group_label
+            .is_some();
+        if let Some(run) = &self.run {
+            let _ = run.cancel_tx.send(());
+            if let Some(abort) = &run.engine_abort {
+                abort.abort();
+            }
+            run.join.abort();
+        }
+        self.run = None;
+        self.run_job = None;
+        self.run_group_label = None;
+        self.stop_requested = None;
+        mark_interrupted_cancelled(&mut self.run_steps);
+        self.console.push_line(
+            "==== ⛔ 已强制结束本次任务（引擎任务被中止；未开始的组流程不再执行）===="
+                .to_string(),
+            crate::ui::console::Role::Error,
+        );
+        self.status_msg = Some(if had_group {
+            "已强制结束组运行 ⛔".to_string()
+        } else {
+            "已强制结束本次任务 ⛔".to_string()
+        });
     }
 
     /// 组运行主体（start_group_run 的确认门通过后到这里）：
@@ -1469,7 +1622,7 @@ impl MainState {
                 .unwrap_or(false);
             if !same_project {
                 self.status_msg =
-                    Some("⚠ 有其他项目的作业运行中；同项目重跑会自动取消旧的".to_string());
+                    Some("⚠ 有其他项目的流程运行中；同项目重跑会自动取消旧的".to_string());
                 return;
             }
             if let Some(run) = &self.run {
@@ -1567,7 +1720,14 @@ impl MainState {
                     .await;
             })
         };
-        self.run = Some(RunHandle { cancel_tx, events: std_rx, join, finished: None });
+        self.stop_requested = None;
+        self.run = Some(RunHandle {
+            cancel_tx,
+            engine_abort: None,
+            events: std_rx,
+            join,
+            finished: None,
+        });
         self.status_msg =
             Some(format!("组运行中: {}/{}（{} 个流程）", project.name, group_label, run_count));
     }
@@ -1624,11 +1784,16 @@ fn show_confirm_gate_window(ctx: &egui::Context, main: &mut MainState) {
             // 组级预览：各流程干跑连展（最终命令 / 上传清单 / 将跳过的步骤）
             if !gate.plan_lines.is_empty() {
                 ui.add_space(4.0);
-                egui::ScrollArea::vertical().max_height(280.0).show(ui, |ui| {
-                    for line in &gate.plan_lines {
-                        ui.monospace(line);
-                    }
-                });
+                // 双向滚动：预览行是完整命令，长度不定——只做纵向滚动时
+                // 长命令会把确认窗口横向撑到屏幕外
+                egui::ScrollArea::both()
+                    .max_height(280.0)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        for line in &gate.plan_lines {
+                            ui.monospace(line);
+                        }
+                    });
                 ui.add_space(4.0);
             }
             ui.add_space(4.0);

@@ -73,6 +73,9 @@ pub struct ConsoleState {
     /// 只留失败步骤的骨架（Step 头 + stderr + ❌）与 ⚠ 错误、取消收尾。
     /// 全程无错误的运行在此模式下不显示任何行——本身就是"没有错误"的信号
     pub errors_only: bool,
+    /// 折叠输出区：只留「控制台输出 / 自动滚动 / 只看错误」标题行，
+    /// 编辑步骤时不再被控制台占掉半屏（再次点开展开）
+    pub collapsed: bool,
     /// 退出码非 0 的步骤集合：只看错误模式下保留这些步骤的骨架头
     failed_steps: std::collections::HashSet<usize>,
     // ── 虚拟化渲染缓存 ──────────────────────────────────────────────
@@ -90,6 +93,7 @@ impl Default for ConsoleState {
             lines: Vec::new(),
             auto_scroll: true,
             errors_only: false,
+            collapsed: false,
             failed_steps: Default::default(),
             heights: Vec::new(),
             measured_width: 0.0,
@@ -229,7 +233,7 @@ pub fn job_label_public(status: &JobStatus) -> String {
     }
 }
 
-/// dark = 当前主题是否为暗色（由调用方按全局主题传入）
+/// 控制台主渲染。dark = 当前主题是否为暗色（由调用方按全局主题传入）
 pub fn show(console: &mut ConsoleState, ui: &mut egui::Ui, running: bool, dark: bool) {
     // 控制台背景跟随主题，但两种主题下都保持"终端感"：
     // 深色主题深底、明亮主题浅底，日志配色各自调校
@@ -238,68 +242,89 @@ pub fn show(console: &mut ConsoleState, ui: &mut egui::Ui, running: bool, dark: 
     } else {
         Color32::from_rgb(250, 250, 250)
     };
-    egui::Panel::bottom("console_panel")
+    // 折叠时把面板钉在标题行高度（resizable 关掉，min/max 同高 = 固定）；
+    // 展开后恢复默认 280 可拖拽
+    let mut panel = egui::Panel::bottom("console_panel")
         .frame(
             egui::Frame::default()
                 .fill(bg)
                 .inner_margin(egui::Margin::same(6)),
         )
-        .resizable(true)
-        .default_size(280.0)
-        .min_size(120.0)
-        .show(ui, |ui| {
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                ui.strong("控制台输出");
-                ui.checkbox(&mut console.auto_scroll, "自动滚动");
-                if ui
-                    .checkbox(&mut console.errors_only, "只看错误")
-                    .on_hover_text(
-                        "只留失败步骤的骨架（Step 头 + stderr + ❌）与 ⚠ 错误、取消收尾；\n\
-                         成功步骤整体隐藏——全程无错误时此视图为空，即「没有错误」",
-                    )
-                    .changed()
-                {
-                    console.auto_scroll = true;
+        .resizable(!console.collapsed)
+        .default_size(280.0);
+    if console.collapsed {
+        panel = panel.min_size(46.0).max_size(46.0);
+    } else {
+        panel = panel.min_size(120.0);
+    }
+    panel.show(ui, |ui| {
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.strong("控制台输出");
+            if ui
+                .small_button(if console.collapsed { "⌄ 展开" } else { "⌃ 收起" })
+                .on_hover_text(if console.collapsed {
+                    "展开输出区域"
+                } else {
+                    "折叠输出区域，只留标题行（编辑步骤时不再被控制台占掉半屏）"
+                })
+                .clicked()
+            {
+                console.collapsed = !console.collapsed;
+            }
+            ui.checkbox(&mut console.auto_scroll, "自动滚动");
+            if ui
+                .checkbox(&mut console.errors_only, "只看错误")
+                .on_hover_text(
+                    "只留失败步骤的骨架（Step 头 + stderr + ❌）与 ⚠ 错误、取消收尾；\n\
+                     成功步骤整体隐藏——全程无错误时此视图为空，即「没有错误」",
+                )
+                .changed()
+            {
+                console.auto_scroll = true;
+            }
+            if running {
+                ui.add(egui::Spinner::new().size(14.0));
+                ui.weak("运行中…");
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("清空").clicked() {
+                    console.clear();
                 }
-                if running {
-                    ui.add(egui::Spinner::new().size(14.0));
-                    ui.weak("运行中…");
+                if ui.button("📋 复制").clicked() {
+                    let text = console.all_text();
+                    ui.ctx().copy_text(text);
                 }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("清空").clicked() {
-                        console.clear();
-                    }
-                    if ui.button("📋 复制").clicked() {
-                        let text = console.all_text();
-                        ui.ctx().copy_text(text);
-                    }
-                    if ui.button("💾 导出").clicked() {
-                        // 导出为 .log 文件（§9.3 导出按钮；默认名带时间戳）
-                        let name = format!(
-                            "remote-build-{}.log",
-                            chrono::Local::now().format("%Y%m%d-%H%M%S")
-                        );
-                        if let Some(path) = rfd::FileDialog::new()
-                            .set_file_name(&name)
-                            .set_title("导出控制台输出")
-                            .save_file()
-                        {
-                            match std::fs::write(&path, console.all_text()) {
-                                Ok(()) => console.push_line(
-                                    format!("已导出: {}", path.display()),
-                                    Role::Info,
-                                ),
-                                Err(e) => console.push_line(
-                                    format!("导出失败: {e}"),
-                                    Role::Error,
-                                ),
-                            }
+                if ui.button("💾 导出").clicked() {
+                    // 导出为 .log 文件（§9.3 导出按钮；默认名带时间戳）
+                    let name = format!(
+                        "remote-build-{}.log",
+                        chrono::Local::now().format("%Y%m%d-%H%M%S")
+                    );
+                    if let Some(path) = rfd::FileDialog::new()
+                        .set_file_name(&name)
+                        .set_title("导出控制台输出")
+                        .save_file()
+                    {
+                        match std::fs::write(&path, console.all_text()) {
+                            Ok(()) => console.push_line(
+                                format!("已导出: {}", path.display()),
+                                Role::Info,
+                            ),
+                            Err(e) => console.push_line(
+                                format!("导出失败: {e}"),
+                                Role::Error,
+                            ),
                         }
                     }
-                });
+                }
             });
-            ui.separator();
+        });
+        // 折叠 = 隐藏输出内容区，只留上面那行标题/开关
+        if console.collapsed {
+            return;
+        }
+        ui.separator();
 
             // 虚拟化渲染：每行为一个可换行 galley，高度按宽度缓存；逐帧只排版/绘制
             // 可视区内的行（此前 5000 行 × 每帧全量 Label 布局是控制台卡顿的主因）。

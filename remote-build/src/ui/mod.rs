@@ -43,6 +43,32 @@ pub mod input {
     pub const LONG: f32 = 440.0;
 }
 
+/// 超长名字按字符截断（中文按字符而非字节），超出部分以 … 结尾。
+/// 树 / 列表用截断名防撑宽布局，调用方对被截断的名字补 on_hover_text 显示全名
+pub(crate) fn truncate_label(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let cut: String = s.chars().take(max.saturating_sub(1)).collect();
+    format!("{cut}…")
+}
+
+/// 打开目录选择对话框，起点 = 输入框当前路径（约定：所有「浏览」按钮都从
+/// 输入框已有的地址出发，而不是每次都弹到系统默认位置）。
+/// 输入框是文件路径或不存在时，回退到其父目录；再不行才用系统默认。
+pub(crate) fn pick_folder(starting: &str, title: &str) -> Option<std::path::PathBuf> {
+    let mut dlg = rfd::FileDialog::new().set_title(title);
+    let p = std::path::PathBuf::from(starting.trim());
+    if p.is_dir() {
+        dlg = dlg.set_directory(&p);
+    } else if let Some(parent) = p.parent() {
+        if parent.is_dir() {
+            dlg = dlg.set_directory(parent);
+        }
+    }
+    dlg.pick_folder()
+}
+
 /// 弹窗首次出现时屏幕居中（之后仍可拖动）：pivot 让 default_pos 按窗口中心
 /// 对齐屏幕中心，default_pos 只在首次出现生效
 pub(crate) fn centered_window<'a>(

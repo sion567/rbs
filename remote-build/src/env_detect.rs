@@ -236,8 +236,8 @@ fn probe(exe: &str, args: &[&str]) -> Option<String> {
 fn probe_with(exe: &str, args: &[&str], env: &std::collections::HashMap<String, String>) -> Option<String> {
     const TIMEOUT: Duration = Duration::from_secs(3);
 
-    let mut cmd = Command::new(exe);
-    cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut cmd = build_probe_command(exe, args, env);
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     cmd.envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
     #[cfg(windows)]
     {
@@ -274,11 +274,117 @@ fn probe_with(exe: &str, args: &[&str], env: &std::collections::HashMap<String, 
     }
     let out = crate::transport::decode_console_bytes(&out);
     let err = crate::transport::decode_console_bytes(&err);
+    // 跳过纯分隔线（gradle -v 首行是一串 "----"，拿它当版本结果没有信息量）：
+    // 取第一条含字母/数字的非空行
     out.lines()
         .chain(err.lines())
         .map(str::trim)
-        .find(|l| !l.is_empty())
+        .find(|l| !l.is_empty() && l.chars().any(|c| c.is_alphanumeric()))
         .map(str::to_string)
+}
+
+// ---------------------------------------------------------------------------
+// 版本命令解析（Windows 修复 mvn / gradle 一类 .cmd/.bat 工具的调用）
+// ---------------------------------------------------------------------------
+
+/// 工具 command 是否能解析到可执行文件（引擎自检的降级路径：未配 version_check 时用）。
+/// 完整路径 = 文件存在；裸名 = 按 PATH 解析（Windows 依次找 .exe → .cmd / .bat）
+pub(crate) fn probe_command_exists(command: &str) -> bool {
+    let cmd = command.trim();
+    if cmd.is_empty() {
+        return false;
+    }
+    if cmd.contains('\\') || cmd.contains('/') {
+        return std::path::Path::new(cmd).is_file();
+    }
+    resolve_probe_exe(cmd, &Default::default()).is_some()
+}
+
+/// 解析版本命令的真实落点：
+/// - **批处理脚本**（.cmd/.bat，含 `mvn` / `gradle` 这种裸名——它们在 Windows 上
+///   实际是 mvn.cmd / gradle.bat）：CreateProcess 的裸名解析只补 `.exe`，永远找不到
+///   批处理；Rust 对 .bat/.cmd 的直接 spawn 也受限。解析到批处理统一经 `cmd /C` 执行。
+/// - **裸名**：按 env 里的 PATH 依次搜 `.exe` → `.cmd` / `.bat`。必须显式搜索——
+///   子进程 env 中前置的工具目录（with_path_prepended）对父进程的 exe 解析不可见，
+///   不搜的话「工具绑定 java-25」实际验的还是系统 PATH 上的 jdk-17。
+/// - 搜不到再原样 spawn 裸名，让系统报错（probe 返回 None → ❌）。
+pub(crate) fn build_probe_command(
+    exe: &str,
+    args: &[&str],
+    env: &std::collections::HashMap<String, String>,
+) -> Command {
+    let resolved = resolve_probe_exe(exe, env);
+    let is_batch = |p: &str| {
+        matches!(
+            std::path::Path::new(p)
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_ascii_lowercase())
+                .as_deref(),
+            Some("cmd" | "bat")
+        )
+    };
+    let (program, via_cmd) = match resolved {
+        Some(found) => {
+            let batch = is_batch(&found);
+            (found, batch)
+        }
+        None => (exe.to_string(), cfg!(windows) && is_batch(exe)),
+    };
+    let mut cmd = if via_cmd {
+        let mut c = Command::new("cmd");
+        // arg 让 Rust 自行给含空格的路径加引号：cmd /C 的双引号规则
+        // （两个引号 + 中间含空白 + 是可执行名）会保留引号原样执行
+        c.arg("/C").arg(&program);
+        c
+    } else {
+        Command::new(&program)
+    };
+    cmd.args(args);
+    cmd
+}
+
+/// 按 env PATH（缺失回退进程 PATH）解析裸名 / 校验路径，返回可执行文件落点。
+/// 路径形态原样返回（存在性不在此校验，spawn 失败由 probe 统一返回 None）。
+pub(crate) fn resolve_probe_exe(
+    exe: &str,
+    env: &std::collections::HashMap<String, String>,
+) -> Option<String> {
+    let looks_like_path = exe.contains('\\') || exe.contains('/');
+    if looks_like_path {
+        return Some(exe.to_string());
+    }
+    let path_var = env
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("PATH"))
+        .map(|(_, v)| v.clone())
+        .or_else(|| std::env::var("PATH").ok())?;
+    let dirs: Vec<PathBuf> = std::env::split_paths(&path_var)
+        .filter(|d| !d.as_os_str().is_empty())
+        .collect();
+    let find = |name: &str| {
+        dirs.iter()
+            .map(|d| d.join(name))
+            .find(|p| p.is_file())
+            .map(|p| p.to_string_lossy().to_string())
+    };
+    if cfg!(windows) {
+        // Windows 只认 .exe / .cmd / .bat：不能回退到裸名匹配——maven 的 bin 目录里
+        // 同时躺着无扩展名的 mvn（sh 脚本）与 mvn.cmd，裸名匹配会解析到 sh 脚本，
+        // CreateProcess 启动不了它
+        if let Some(hit) = find(&format!("{exe}.exe")) {
+            return Some(hit);
+        }
+        for ext in ["cmd", "bat"] {
+            if let Some(hit) = find(&format!("{exe}.{ext}")) {
+                return Some(hit);
+            }
+        }
+        None
+    } else {
+        // Unix：裸名即可执行
+        find(exe)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -335,4 +441,80 @@ pub fn local_system_info() -> LocalSystemInfo {
             .unwrap_or(0);
     }
     info
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn probe_command_resolves_and_wraps_batch_scripts() {
+        // mvn / gradle 在 Windows 上是 mvn.cmd / gradle.bat 批处理：裸名 CreateProcess
+        // 只补 .exe 找不到，必须解析到真实落点并经 cmd /C 执行（回归 #4）
+        let tmp = std::env::temp_dir().join(format!("rbs_probe_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("fakebatch.cmd"), "@echo off\r\necho hi\r\n").unwrap();
+        std::fs::write(tmp.join("plain.exe"), b"MZ").unwrap(); // 只测解析，不真跑
+
+        let mut env = std::collections::HashMap::new();
+        env.insert("PATH".to_string(), tmp.to_string_lossy().to_string());
+
+        if cfg!(windows) {
+            // 裸名批处理 → 解析到 .cmd 且经 cmd /C
+            let c = build_probe_command("fakebatch", &[], &env);
+            assert_eq!(c.get_program(), "cmd");
+            assert_eq!(
+                c.get_args().nth(1).map(|s| s.to_string_lossy().to_string()),
+                Some(tmp.join("fakebatch.cmd").to_string_lossy().to_string())
+            );
+
+            // 裸名 exe → 解析到完整路径直接 spawn
+            let c = build_probe_command("plain", &["-v"], &env);
+            assert!(
+                c.get_program().to_string_lossy().ends_with("plain.exe"),
+                "{:?}",
+                c.get_program()
+            );
+            assert_eq!(c.get_args().len(), 1);
+
+            // 完整路径批处理 → cmd /C
+            let full = tmp.join("fakebatch.cmd").to_string_lossy().to_string();
+            let c = build_probe_command(&full, &[], &env);
+            assert_eq!(c.get_program(), "cmd");
+
+            // 解析不到 → 原样保留（spawn 失败由 probe 返回 None → ❌）
+            let c = build_probe_command("no_such_tool_xyz", &[], &env);
+            assert_eq!(c.get_program(), "no_such_tool_xyz");
+        } else {
+            let c = build_probe_command("plain", &["-v"], &env);
+            assert!(c.get_program().to_string_lossy().ends_with("plain"));
+        }
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// 真机回归：本机装了 maven / gradle 时，「验证 version_check」必须能验出来
+    /// （此前 Command::new("mvn") 裸名只补 .exe，永远找不到 mvn.cmd → 恒 ❌）
+    #[test]
+    fn version_check_works_for_batch_based_tools() {
+        if !cfg!(windows) {
+            return;
+        }
+        // mvn / gradle 不在本机 → 跳过（CI / 干净机器）
+        if resolve_probe_exe("mvn", &Default::default()).is_none()
+            && resolve_probe_exe("gradle", &Default::default()).is_none()
+        {
+            return;
+        }
+        if let Some(line) = run_version_check("mvn -v") {
+            assert!(line.contains("Maven"), "mvn -v 应输出 Maven 版本: {line}");
+        }
+        if let Some(line) = run_version_check("gradle -v") {
+            assert!(
+                line.contains("Gradle"),
+                "gradle -v 应输出 Gradle 版本: {line}"
+            );
+        }
+    }
 }
