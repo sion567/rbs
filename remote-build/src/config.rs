@@ -51,7 +51,7 @@ pub fn is_first_run() -> bool {
 
 pub fn default_global() -> GlobalConfig {
     let mut g = GlobalConfig::default();
-    g.workspace_root = projects_dir().to_string_lossy().to_string();
+    g.projects_root = projects_dir().to_string_lossy().to_string();
     g
 }
 

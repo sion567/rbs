@@ -61,7 +61,7 @@ pub fn show(main: &mut MainState, ui: &mut egui::Ui) {
             Color32::GRAY,
             format!(
                 "未发现项目。\n点「＋ 新建项目」从 Git 克隆或选择本地目录；\n或在 {} 放置 <项目>/project.yaml 后点 ⟳",
-                main.workspace_root.display()
+                main.projects_root.display()
             ),
         );
         return;
@@ -1096,7 +1096,7 @@ fn rename_project(main: &mut MainState, pi: usize, new_name: &str) {
     if new_name == old_name {
         return;
     }
-    let new_dir = main.workspace_root.join(&new_name);
+    let new_dir = main.projects_root.join(&new_name);
     if new_dir.exists() {
         main.status_msg = Some(format!("⚠ 目标目录已存在: {}", new_dir.display()));
         return;

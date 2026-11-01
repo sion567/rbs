@@ -623,7 +623,11 @@ pub struct GlobalConfig {
     pub save_history: bool,
     /// 作业结束时弹 Windows 桌面通知（toast，最小化时也能看到结果）
     pub desktop_notify: bool,
-    pub workspace_root: String,
+    /// 项目配置扫描根（discover 只认 <root>/<项目>/project.yaml）。
+    /// 旧名 workspace_root 与代码工作区 workspace/（git 克隆落点）撞名易误解，
+    /// 改名 projects_root；alias 兼容读旧 config.yaml
+    #[serde(alias = "workspace_root")]
+    pub projects_root: String,
     pub theme: Theme,
     /// PuTTY 配置
     pub putty: PuttyConfig,
@@ -636,7 +640,7 @@ impl Default for GlobalConfig {
             log_retention_days: 30,
             save_history: true,
             desktop_notify: true,
-            workspace_root: String::new(), // 由 config::default_global() 填充实际路径
+            projects_root: String::new(), // 由 config::default_global() 填充实际路径
             theme: Theme::Dark,
             putty: PuttyConfig {
                 custom_path: None,

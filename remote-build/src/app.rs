@@ -147,7 +147,7 @@ pub(crate) fn load_cjk_font(ctx: &egui::Context) {
 
 pub struct MainState {
     pub runtime: Arc<tokio::runtime::Runtime>,
-    pub workspace_root: std::path::PathBuf,
+    pub projects_root: std::path::PathBuf,
     pub global: crate::models::GlobalConfig,
     pub tools: std::collections::HashMap<String, crate::models::Tool>,
     pub projects: Vec<ProjectEntry>,
@@ -298,7 +298,7 @@ impl MainState {
     pub fn new(runtime: Arc<tokio::runtime::Runtime>) -> Self {
         let mut s = Self {
             runtime,
-            workspace_root: crate::config::projects_dir(),
+            projects_root: crate::config::projects_dir(),
             global: Default::default(),
             tools: Default::default(),
             projects: Vec::new(),
@@ -370,12 +370,12 @@ impl MainState {
         }
 
         self.global = crate::config::load_global().unwrap_or_default();
-        let root = if self.global.workspace_root.is_empty() {
+        let root = if self.global.projects_root.is_empty() {
             crate::config::projects_dir()
         } else {
-            std::path::PathBuf::from(&self.global.workspace_root)
+            std::path::PathBuf::from(&self.global.projects_root)
         };
-        self.workspace_root = root;
+        self.projects_root = root;
         // 配置解析失败不再静默：直接提示，避免"工具莫名消失"
         let mut warnings = Vec::new();
         self.tools = match crate::config::load_tools() {
@@ -385,7 +385,7 @@ impl MainState {
                 Default::default()
             }
         };
-        self.projects = files::discover_projects(&self.workspace_root);
+        self.projects = files::discover_projects(&self.projects_root);
         // 校验结果随 reload 刷新（目录存在性 / .git 只在项目列表变化时才可能变）
         self.validation = self
             .projects

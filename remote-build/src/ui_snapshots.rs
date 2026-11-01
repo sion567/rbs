@@ -182,7 +182,7 @@ fn test_main_state() -> MainState {
     );
     let mut s = MainState {
         runtime,
-        workspace_root: std::env::temp_dir().join("rbs-ui-snapshots"),
+        projects_root: std::env::temp_dir().join("rbs-ui-snapshots"),
         global: Default::default(),
         // 预置两个工具：工具管理列表 / 本机工具链面板按"非空列表"这一常态渲染
         // （putty = 探测自动生成的条目：套件目录配置在其专用表单里）

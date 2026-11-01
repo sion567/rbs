@@ -881,8 +881,8 @@ fn global_section(
             ui.label("配置目录:");
             ui.monospace(crate::config::app_root().to_string_lossy().to_string());
             ui.end_row();
-            ui.label("项目目录 (workspace_root):");
-            ui.monospace(&global.workspace_root);
+            ui.label("项目目录 (projects_root):");
+            ui.monospace(&global.projects_root);
             ui.end_row();
             ui.label("默认超时:");
             ui.label(format!("{}s", global.default_timeout));

@@ -39,7 +39,7 @@ pub struct ProjectEntry {
     pub jobs: Vec<JobEntry>,
 }
 
-/// 扫描 workspace_root 下所有 <dir>/project.yaml（无法解析的作业/项目文件记入错误列表）
+/// 扫描 projects_root 下所有 <dir>/project.yaml（无法解析的作业/项目文件记入错误列表）
 pub fn discover_projects(root: &Path) -> Vec<ProjectEntry> {
     discover_with_errors(root).0
 }
