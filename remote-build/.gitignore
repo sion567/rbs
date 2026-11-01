@@ -1,1 +1,5 @@
 /target
+
+# UI 快照比对的临时产物：基线 {name}.png 入库，比对失败生成的两张不入库
+/tests/snapshots/**/*.diff.png
+/tests/snapshots/**/*.new.png

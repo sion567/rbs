@@ -10,7 +10,8 @@
 #   - 每库默认保留最近 KEEP_BACKUPS=10 个，超出自动清理最老的
 #   - 完整性校验：gzip -t + mysqldump 结尾标志（Dump completed），
 #     不完整立即删除并报错（sh 无 pipefail，靠标志兜底）
-#   - dump 带 --databases（含建库语句），导入时无需先手工建库
+#   - dump 带 --databases --add-drop-database（含删库/建库语句）：导入时整库
+#     一键重建，不用先手工删库；备份之后新建的表/过程也会被清掉（完全回到备份时刻）
 # 集成：
 #   - 复制本文件为 deploy 根目录的 backup-db.sh，release.sh --backup 会自动执行它
 #   - 也可单独 cron 定时：10 3 * * * cd /deploy && sh backup-db.sh backup
@@ -62,9 +63,16 @@ do_backup() {
   for db in $DBS; do
     bk_f="$BACKUP_DIR/$db.$(date +%Y%m%d-%H%M%S).sql.gz"
     echo "== 备份 $db -> $bk_f =="
+    # --single-transaction 一致性快照不锁表；--routines/--events 默认关，必须显式带上
+    # --add-drop-database 导入时先 DROP 再 CREATE 整库（一键还原，残留对象也清掉）
+    # --default-character-set=utf8mb4 显式字符集，避免宿主机/容器默认值不一致
+    # --set-gtid-purged=OFF 不带 GTID 信息，导入到别的实例不报错（MariaDB 镜像无此参数，需删）
+    # --hex-blob           BLOB 列按十六进制导出，任何字符集/管道下都不会损坏
+    # --no-tablespaces     低权限账号（MySQL 8 缺 PROCESS 权限）也能备份
     docker exec -e MYSQL_PWD="$MYSQL_PASS" "$MYSQL_CONTAINER" \
-      mysqldump -u"$MYSQL_USER" --single-transaction --routines --triggers --events --databases "$db" \
-      | gzip > "$bk_f"
+      mysqldump -u"$MYSQL_USER" --single-transaction --routines --triggers --events \
+      --add-drop-database --default-character-set=utf8mb4 --set-gtid-purged=OFF \
+      --hex-blob --no-tablespaces --databases "$db" | gzip > "$bk_f"
     if verify_dump "$bk_f"; then
       echo "完成（$(du -h "$bk_f" | cut -f1)）"
       echo "BACKED_UP: $bk_f"

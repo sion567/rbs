@@ -185,6 +185,12 @@ pub struct Step {
     pub working_dir: Option<String>,
     /// 步骤级额外环境变量
     pub env: HashMap<String, String>,
+    /// 凭据注入（TODO「第三方工具管理 · 方案 B」）：环境变量名 → Credential Manager 键。
+    /// 运行时从凭据管理器取密码注入子进程 env——密码不进命令行、不落 YAML。
+    /// 例：MYSQL_PWD → db/prod-mysql（先 `remote-build set-password db/prod-mysql <密码>` 保存）。
+    /// 凭据键支持 ${{ }} 变量替换；键未存储 → 本步失败并给保存指引。
+    #[serde(default)]
+    pub secret_env: HashMap<String, String>,
     /// 条件执行（Ansible when 语义；YAML 可写 when: 或 condition:，二者等价）。
     /// 例：${{ variables.ENV }} == prod / ${{ env.VERSION != '' }}
     #[serde(alias = "when")]

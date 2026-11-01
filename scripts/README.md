@@ -131,8 +131,34 @@ release.sh 对 restart.sh 只有三条约定，满足即可对接任何部署方
 | `restart-docker.sh` | jar + docker 挂载式 | 删旧容器 → `docker run -v` 挂 jar（不构建镜像）；可选 HEALTH_URL 探测 |
 | `restart-java.sh`   | jar + 裸进程 nohup | 停旧进程（PID 文件 + pgrep 兜底）→ `nohup java -jar`；可选 HEALTH_URL 探测 |
 | `restart-static.sh` | dist.tar.gz 静态前端 | 解压到 WEB_ROOT 并检查 index.html；解压前自动备份现有站点 |
-| `backup-mysql.sh`   | docker MySQL 备份/导入 | 复制为根目录 backup-db.sh；--backup 自动带上；也可单独 cron |
-| `backup-pgsql.sh`   | docker PostgreSQL 备份/导入 | 同上，pg_dump 自定义格式 + pg_restore --list 校验 |
+| `backup-mysql.sh`   | docker MySQL 备份/导入 | mysqldump --single-transaction --add-drop-database（导入整库一键重建）；Dump completed 标志校验 |
+| `backup-pgsql.sh`   | docker PostgreSQL | pg_dump -Fc --no-owner；pg_restore --list 校验；--clean --if-exists 导入（PGS_RESTORE_JOBS 并行） |
+| `backup-mongo.sh`   | docker MongoDB | mongodump --archive --gzip；mongorestore --dryRun 校验；--drop 导入；MONGO_OPLOG=1 副本集一致性备份 |
+| `backup-redis.sh`   | docker Redis | SAVE + 拷 RDB；文件头 "REDIS" 校验；导入=cp 回数据目录+重启 |
+| `backup-mssql.sh`   | docker SQL Server | BACKUP DATABASE（COMPRESSION+CHECKSUM）；processed 回执校验；WITH REPLACE 恢复 |
+| `backup-dm.sh`      | docker 达梦 DM8 | dexp/dimp 按模式导出导入（TABLE_EXISTS_ACTION=REPLACE 覆盖）；DM_EXP_ARGS/DM_IMP_ARGS 按版本追加；信创常用 |
+| `backup-kingbase.sh`| docker 人大金仓 | sys_dump -Fc --no-owner / sys_restore --list；KBS_RESTORE_JOBS 并行导入（PG 同源，信创常用） |
+| `backup-sqlite.sh`  | SQLite（容器或宿主机） | 优先 sqlite3 .backup 热备；文件头校验；导入建议先停应用 |
+| `backup-docker-image.sh` | docker 镜像导出/导入 | docker save/load；manifest.json 校验；导入无破坏不需确认 |
+| `backup-docker-volume.sh`| docker 数据卷备份/恢复 | 临时容器挂载打包；导入=清空卷再解包（破坏性，需确认） |
+
+## 多个数据库 / 多种备份对象
+
+`backup-db.sh` 钩子只有一个，但它可以是串联壳——把各模板以原名放进
+`deploy-root/bin/`，`backup-db.sh` 写成：
+
+```sh
+#!/bin/sh
+DIR="$(cd "$(dirname "$0")" && pwd)"
+sh "$DIR/bin/backup-mongo.sh" backup || exit 1
+sh "$DIR/bin/backup-redis.sh" backup || exit 1
+sh "$DIR/bin/backup-docker-image.sh" backup || exit 1
+```
+
+只要 backup-db.sh 成功退出并输出各模板的 `BACKED_UP: <文件>` 行，
+`deploy.sh` 的发布前快照提示和 `backup.sh` 就都正常工作。
+目录约定：数据库模板默认存 `db-backups/`，docker 镜像/卷模板默认存
+`docker-backups/`（均可用 BACKUP_DIR 环境变量改，比如挂一块备份盘）。
 
 - 三个模板顶部都有【按项目改】参数块，**均可被环境变量覆盖**（不改脚本临时调参），
   如 `WEB_ROOT=/data/site sh restart.sh dist.tar.gz`

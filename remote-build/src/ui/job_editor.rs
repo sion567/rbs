@@ -303,7 +303,6 @@ pub fn show(main: &mut MainState, ui: &mut egui::Ui) {
     let mut open_tool_overrides = false;
     let mut create_job_requested = false;
     let mut delete_job_confirmed = false;
-    let mut open_var_help = false;
     ui.add_space(4.0);
     ui.add_enabled_ui(!running, |ui| {
         ui.horizontal(|ui| {
@@ -319,7 +318,7 @@ pub fn show(main: &mut MainState, ui: &mut egui::Ui) {
                             .desired_width(70.0)
                             .hint_text("prod"),
                     );
-                    if ui.small_button("×").clicked() {
+                    if ui.small_button("🗑").clicked() {
                         job.confirm = None;
                     }
                     ui.separator();
@@ -337,17 +336,16 @@ pub fn show(main: &mut MainState, ui: &mut egui::Ui) {
                     ui.separator();
                 }
             }
-            // 与 ⚙ 设置窗口的「🧰 工具管理」页同名：这里是一键直达本项目的工具覆盖页
+            // 与 ⚙ 设置窗口的「🔧 工具管理」页同名：这里是一键直达本项目的工具覆盖页
             if ui
-                .button("🧰 工具管理")
-                .on_hover_text("管理本项目的工具覆盖（写入 project.yaml 的 tools 段）；\n机器级工具在 ⚙ 设置 → 🧰 工具管理 → 🌐 全局")
+                .button("🔧 工具管理")
+                .on_hover_text("管理本项目的工具覆盖（写入 project.yaml 的 tools 段）；\n机器级工具在 ⚙ 设置 → 🔧 工具管理 → 🌐 全局")
                 .clicked()
             {
                 open_tool_overrides = true;
             }
-            if ui.button("？ 变量语法").clicked() {
-                open_var_help = true;
-            }
+            // 「变量语法」入口已上移到主工具栏（❓，⚙ 设置 / 🎯 目标旁）：
+            // 语法速查是全局参考，不该只挂在流程编辑器里
             ui.separator();
             if ui.button("＋ 新建流程").clicked() {
                 create_job_requested = true;
@@ -406,6 +404,7 @@ pub fn show(main: &mut MainState, ui: &mut egui::Ui) {
             "⚖ 前置检查（{} 条，任一失败整个流程不执行）",
             job.preconditions.len()
         )))
+        .icon(crate::ui::chevron_icon)
         .id_salt("job_editor_preconditions")
         .default_open(true)
         .show(ui, |ui| {
@@ -414,7 +413,7 @@ pub fn show(main: &mut MainState, ui: &mut egui::Ui) {
                     // 检查命令与人话说明上下两行：并排两个 LONG 定宽输入框在窄窗口
                     // 会把右半截推出可视区（横向溢出，× 都看不到）
                     ui.horizontal(|ui| {
-                        if ui.small_button("−").clicked() {
+                        if ui.small_button("🗑").clicked() {
                             pre_del = Some(i);
                         }
                         ui.monospace(format!("{}", i + 1));
@@ -548,9 +547,6 @@ pub fn show(main: &mut MainState, ui: &mut egui::Ui) {
     if open_tool_overrides {
         crate::ui::settings::open_project_scope(main);
     }
-    if open_var_help {
-        main.show_var_help = true;
-    }
     if create_job_requested {
         main.new_job.open = true;
         main.new_job.preset_group = None; // 编辑器入口默认不分组（分组入口会带预选）
@@ -583,6 +579,7 @@ pub fn show_new_job_window(ctx: &egui::Context, main: &mut MainState) {
         crate::ui::modal_backdrop(ctx, "mask_new_job");
     }
     crate::ui::centered_window(egui::Window::new("＋ 新建流程"), ctx)
+    .collapsible(false)
         .open(&mut open)
         .order(egui::Order::Foreground)
         .default_width(520.0)
@@ -753,6 +750,7 @@ pub fn show_var_help_window(ctx: &egui::Context, main: &mut MainState) {
         crate::ui::modal_backdrop(ctx, "mask_var_help");
     }
     crate::ui::centered_window(egui::Window::new("？ 变量语法速查"), ctx)
+    .collapsible(false)
         .open(&mut open)
         .order(egui::Order::Foreground)
         .default_width(720.0)
@@ -760,7 +758,7 @@ pub fn show_var_help_window(ctx: &egui::Context, main: &mut MainState) {
         // 内容超过屏幕高度时滚动可达：此前底部几节（wait / 长任务配方）不可见也不可滚
         .vscroll(true)
         .show(ctx, |ui| {
-            ui.weak("可用于步骤命令、步骤 env、工作目录、条件字段。执行前一次性替换；未解析的占位符原样保留。");
+            ui.weak("可用于步骤命令、步骤 env、工作目录、条件字段、wait 探测目标。执行前一次性替换；未解析的占位符原样保留。");
             ui.add_space(6.0);
 
             ui.strong("一、取值形态");
@@ -774,9 +772,10 @@ pub fn show_var_help_window(ctx: &egui::Context, main: &mut MainState) {
                     "选 prod 组时 ${{ variables.DEPLOY_DIR }} → /opt/yudao/prod",
                 ),
                 (
-                    "${{ variables.X || 默认值 }}".into(),
-                    "X 未定义时取默认值（Jinja2 default 语义；默认值可带引号；已定义但为空串仍用空串）",
-                    "${{ variables.PORT || 8080 }} → 未定义时展开为 8080",
+                    "${{ 取值表达式 || 默认值 }}".into(),
+                    "左侧未定义时取默认值——|| 适用于所有取值形态（variables / env / targets.* / now* / run.id）；\
+                     默认值可带引号；左侧已定义但为空串仍算已定义（用空串，不取默认）",
+                    "${{ variables.PORT || 8080 }} / ${{ run.id || manual-run }}",
                 ),
                 (
                     "${{ env.X }}".into(),
@@ -825,13 +824,18 @@ pub fn show_var_help_window(ctx: &egui::Context, main: &mut MainState) {
             ui.add_space(8.0);
             ui.separator();
             ui.add_space(4.0);
-            ui.strong("二、条件与状态守卫（步骤的「＋条件」/「＋creates」字段）");
-            ui.monospace("${{ env.VERSION != '' }}        # 非空才执行本步；为空/未产出 → 跳过");
-            ui.monospace("${{ variables.ENV }} == prod  # 等值比较（YAML 里可写 when: 等价别名）");
-            ui.monospace("${{ variables.ENV }} != prod  # 不等比较；未定义变量按空串参与比较");
-            ui.monospace("variables.A == variables.B    # 两侧都可为取值表达式（支持 || 默认值）");
+            ui.strong("二、条件与状态守卫（步骤的「＋条件」/「＋creates」字段；YAML 里 when: 与 condition: 等价）");
+            ui.monospace("${{ env.VERSION != '' }}        # 非空才执行本步；为空/未产出/拼错 → 跳过");
+            ui.monospace("${{ env.VERSION == '' }}         # 为空才执行（首次构建场景：还没版本号时）");
+            ui.monospace("${{ variables.ENV }} == prod    # 与字面量等值比较");
+            ui.monospace("${{ variables.ENV }} == 'prod'  # 字面量可带引号（单/双引号成对去除）");
+            ui.monospace("${{ variables.ENV }} != prod    # 不等比较；左侧未定义按空串参与");
+            ui.monospace("variables.A == variables.B     # 两侧都可为取值表达式（支持 || 默认值）");
+            ui.monospace("${{ targets.prod.port }} == 2222 # 数字按文本精确匹配（== 只做字符串比较）");
             ui.monospace("creates: node_modules         # 产物路径已存在 → 跳过本步（重跑秒过）");
-            ui.weak("条件两侧支持 env. / variables. / targets.名.字段 / now / run.id；解析失败按真值执行并警告。");
+            ui.weak("条件两侧支持 env. / variables. / targets.名.字段 / now / run.id；解析失败按真值执行并警告（fail-open）。");
+            ui.weak("⚠ 仅支持 == / !=，不支持 > < >= <= 数值比较——需要时在命令里用 shell 判断（如 [ \"$N\" -gt 3 ] && exit 1）。");
+            ui.weak("比较右侧的取值表达式未定义时，会按字面量文本参与比较（通常判不等）——两侧都可能未定义时，改用 != '' 判空。");
             ui.weak("creates 路径：本地步骤相对项目目录（支持 * ? 通配）；SSH 步骤为远端路径（相对 = work_root），远端用 test -e 判定。");
 
             ui.add_space(8.0);
@@ -875,6 +879,9 @@ pub fn show_var_help_window(ctx: &egui::Context, main: &mut MainState) {
             ui.monospace("  - name: 重启服务");
             ui.monospace("    command: systemctl restart app");
             ui.weak("creates / when 跳过、上传 hash 未变更 → 不算变更，handler 不执行（Ansible handlers 语义）。");
+            ui.monospace("secret_env:               # 凭据注入：环境变量名 → 凭据管理器键");
+            ui.monospace("  MYSQL_PWD: db/prod-mysql # 运行时取密码注入子进程 env；先 set-password 存密码");
+            ui.weak("数据库备份（mysqldump / pg_dump）配合 tool 绑定使用——密码不进命令行、不落 YAML。");
             ui.monospace("wait: { mode: tcp, target: 1.2.3.4:8080 }");
             ui.weak("wait 探测三模式：命令 / tcp 可连 / http 2xx（部署后验证可达，从发版机直连）；interval_seconds 缺省 5。");
             ui.monospace("wait: { mode: command, target: 探测命令, fail_exit_code: 2 }");
@@ -884,7 +891,8 @@ pub fn show_var_help_window(ctx: &egui::Context, main: &mut MainState) {
             );
 
             ui.add_space(8.0);
-            ui.strong("七、组合示例（微服务发布的最小骨架）");
+            ui.strong("七、实战示例");
+            ui.strong("① 微服务发布最小骨架");
             ui.monospace("# 1. 本地构建（creates 守卫：产物在就跳过）");
             ui.monospace("mvn -B clean package -DskipTests     creates: target/*.jar");
             ui.monospace("# 2. 上传（多 jar 多行映射；内容未变更自动跳过）");
@@ -895,8 +903,51 @@ pub fn show_var_help_window(ctx: &egui::Context, main: &mut MainState) {
             ui.monospace("# 4. 等健康（wait tcp 从发版机探测，2 分钟总限）");
             ui.monospace("wait: { mode: tcp, target: ${{ targets.prod.host }}:8080 }   timeout: 120");
 
+            ui.add_space(6.0);
+            ui.strong("② 条件实战（when / condition）");
+            ui.monospace("command: systemctl restart app    condition: ${{ variables.ENV }} == prod");
+            ui.monospace("#  ↑ 生产才重启；测试环境跑同一流程时本步自动跳过");
+            ui.monospace("command: curl -s .../debug/stats  condition: ${{ variables.ENV }} != prod");
+            ui.monospace("#  ↑ 非生产才采集调试信息");
+            ui.monospace("command: mvn deploy               condition: ${{ env.VERSION != '' }}");
+            ui.monospace("#  ↑ 上一步没产出版本号（构建失败/被跳过）→ 部署步也跳过");
+
+            ui.add_space(6.0);
+            ui.strong("③ 默认值实战（|| 适用于所有取值形态）");
+            ui.monospace("docker push ${{ variables.REGISTRY || registry.local:5000 }}/app:${{ env.TAG }}");
+            ui.monospace("#  ↑ 变量组没配 REGISTRY 时兜底本地仓库");
+            ui.monospace("echo 手动触发（run_id=${{ run.id || manual }}）>> /opt/audit.log");
+            ui.monospace("#  ↑ run.id 缺省（占位）时兜底固定标记");
+
+            ui.add_space(6.0);
+            ui.strong("④ outputs 捕获 → 后续步骤引用（运行时变量）");
+            ui.monospace("# 步骤 A：捕获版本号（正则取 stdout，有捕获组取组 1）");
+            ui.monospace("command: mvn help:evaluate -Dexpression=project.version -q -DforceStdout");
+            ui.monospace("outputs: { VER: '(\\S+)$' }");
+            ui.monospace("# 步骤 B：直接引用（构建镜像并推送）");
+            ui.monospace("command: docker build -t registry/app:${{ env.VER }} .");
+            ui.monospace("command: docker push registry/app:${{ env.VER }}");
+
+            ui.add_space(6.0);
+            ui.strong("⑤ targets 字段拼装（连接信息不写死在命令里）");
+            ui.monospace("echo ssh -p ${{ targets.prod.port }} ${{ targets.prod.user }}@${{ targets.prod.host }}");
+            ui.monospace("rsync -av release/ ${{ targets.prod.user }}@${{ targets.prod.host }}:${{ targets.prod.work_root }}/");
+
+            ui.add_space(6.0);
+            ui.strong("⑥ ${VAR} 系统变量兜底 + run.id 台账");
+            ui.monospace("echo JAVA_HOME=${JAVA_HOME}     # 步骤产出 env → 变量表 → 系统环境变量");
+            ui.monospace("echo ${{ now.iso }} run=${{ run.id }} >> ${{ targets.prod.work_root }}/release.log");
+
             ui.add_space(8.0);
-            ui.weak("完整说明见 docs/变量速查.md（设计文档 §6）。");
+            ui.separator();
+            ui.add_space(4.0);
+            ui.strong("八、pack 打包格式与排除（映射行的目标扩展名决定格式）");
+            ui.monospace("target/ -> dist/app.tar.gz --exclude node_modules --exclude *.map");
+            ui.weak(".zip → zip；.tar.gz / .tgz → tar+gzip（tar 保留 +x 权限，Windows 打 zip 到 Linux 解压会丢）；\n\
+                     排除 = rsync --exclude 语义：字面量按目录/文件名分量整棵排除，* ? 通配相对路径与文件名。");
+            ui.monospace("dist -> app.tar.gz        # 目录源带目录名根（里面是 dist/...，同 tar -czf / zip -r 习惯）");
+            ui.monospace("dist/. -> app.tar.gz      # 源以 /. 结尾 = tar -C dist . 语义：条目不带目录根，解包直接铺文件");
+            ui.weak("单文件 / 通配源条目为裸文件名。");
         });
     main.show_var_help = open;
 }
@@ -997,14 +1048,25 @@ fn edit_step(
             {
                 action = StepAction::RunOnly;
             }
-            if ui.small_button("↑").on_hover_text("上移一位").clicked() && si > 0 {
+            // 上/下移在首尾自动禁用：第一步不能再上、最后一步不能再下——
+            // 禁用态悬停说明原因（比"点了没反应"直观）
+            let can_up = si > 0;
+            let up_hover = if can_up { "上移一位" } else { "已是第一步" };
+            if ui
+                .add_enabled(can_up, egui::Button::new("↑").small())
+                .on_hover_text(up_hover)
+                .on_disabled_hover_text(up_hover)
+                .clicked()
+            {
                 action = StepAction::MoveUp;
             }
+            let can_down = si + 1 < steps_len;
+            let down_hover = if can_down { "下移一位" } else { "已是最后一步" };
             if ui
-                .small_button("↓")
-                .on_hover_text("下移一位")
+                .add_enabled(can_down, egui::Button::new("↓").small())
+                .on_hover_text(down_hover)
+                .on_disabled_hover_text(down_hover)
                 .clicked()
-                && si + 1 < steps_len
             {
                 action = StepAction::MoveDown;
             }
@@ -1069,7 +1131,7 @@ fn edit_step(
                         }
                         None => hover.push_str(
                             "\n\n⚠ 未映射：工具清单里没有这个名字（运行自检会失败）；\
-                             可在 ⚙ 设置 → 🧰 工具管理 添加",
+                             可在 ⚙ 设置 → 🔧 工具管理 添加",
                         ),
                     }
                 }
@@ -1078,7 +1140,7 @@ fn edit_step(
             // 未映射保留行内红标：需要用户处理的异常，不能只藏在悬停里
             if !step.tool.is_empty() && !tool_menu.merged.contains_key(&step.tool) {
                 ui.colored_label(Color32::from_rgb(220, 120, 90), "⚠未映射")
-                    .on_hover_text("工具清单里没有这个名字（运行自检会失败）；可在 ⚙ 设置 → 🧰 工具管理 添加");
+                    .on_hover_text("工具清单里没有这个名字（运行自检会失败）；可在 ⚙ 设置 → 🔧 工具管理 添加");
             }
 
             ui.separator();
@@ -1094,7 +1156,7 @@ fn edit_step(
                             .clip_text(true)
                             .min_size(egui::vec2(64.0, 0.0)),
                     );
-                    if ui.small_button("×").clicked() {
+                    if ui.small_button("🗑").clicked() {
                         step.timeout = None;
                     }
                 }
@@ -1104,6 +1166,24 @@ fn edit_step(
                         step.timeout = Some(300);
                     }
                 }
+            }
+
+            ui.separator();
+            // 凭据注入入口与工具选择相邻（数据库类工具 mysqldump / pg_dump 需要密码）：
+            // 仅是入口，编辑行在卡片底部、仅有条目时渲染——不放这里免得每张卡片都多一行
+            if step.secret_env.is_empty()
+                && ui
+                    .small_button("＋凭据注入")
+                    .on_hover_text(
+                        "从 Windows Credential Manager 取密码注入本步骤环境变量（如 MYSQL_PWD / PGPASSWORD）。\n\
+                         配合工具绑定使用：工具选 mysqldump / pg_dump，密码经凭据注入。\n\
+                         密码不进命令行（进程列表暴露）、不落 YAML。\n\
+                         先保存密码：remote-build set-password db/prod-mysql <密码>"
+                    )
+                    .clicked()
+            {
+                step.secret_env
+                    .insert("MYSQL_PWD".to_string(), "db/mysql".to_string());
             }
         });
 
@@ -1193,7 +1273,7 @@ fn edit_step(
                             );
                             p.fail_exit_code = (fatal != 0).then_some(fatal);
                         }
-                        if ui.small_button("×").clicked() {
+                        if ui.small_button("🗑").clicked() {
                             step.wait = None;
                         }
                     }
@@ -1281,7 +1361,7 @@ fn edit_step(
                             .min_size(egui::vec2(56.0, 0.0))
                             .range(0..=300),
                     );
-                    if ui.small_button("×").clicked() {
+                    if ui.small_button("🗑").clicked() {
                         step.retry = None;
                     }
                 }
@@ -1301,19 +1381,25 @@ fn edit_step(
             }
         });
         ui.horizontal(|ui| {
-            // creates 状态守卫（Ansible creates）：产物已存在 → 跳过本步
+            // creates 状态守卫（Ansible creates）：产物已存在 → 跳过本步。
+            // 回答「creates 是干嘛的」：给本步声明一个"做完了长这样"的标记路径——
+            // 重跑流程时它已存在 = 这步以前做过 → 秒过不重复（增量重跑的地基）
             match &mut step.creates {
                 Some(c) => {
                     ui.label("creates:").on_hover_text(
-                        "产物路径已存在则整个步骤跳过（重跑秒过已完成步骤）。\n\
-                         本地相对项目目录，支持 * 通配；SSH 目标为远端路径（相对 = work_root）",
+                        "状态守卫（Ansible creates）：声明的产物路径已存在 → 整个步骤跳过。\n\
+                         用途：重跑流程时「拉依赖 / 编译」这类已完成步骤秒过，不重复构建。\n\
+                         路径：本地相对项目目录，支持 * 通配（如 target/*.jar）；\n\
+                         SSH 目标为远端路径（相对 = work_root）",
                     );
+                    // 独占一行：输入框吃掉剩余宽度（给 × 留位），长路径不憋在定宽里
+                    let creates_w = (ui.available_width() - 40.0).max(120.0);
                     ui.add(
                         egui::TextEdit::singleline(c)
-                            .desired_width(140.0)
-                            .hint_text("node_modules / target/*.jar"),
+                            .desired_width(creates_w)
+                            .hint_text("产物路径，已存在则跳过本步：node_modules / target/*.jar"),
                     );
-                    if ui.small_button("×").clicked() {
+                    if ui.small_button("🗑").clicked() {
                         step.creates = None;
                     }
                 }
@@ -1321,7 +1407,7 @@ fn edit_step(
                     if ui
                         .small_button("＋creates")
                         .on_hover_text(
-                            "状态守卫：声明本步的产物路径，已存在则跳过。\n\
+                            "状态守卫：声明本步的产物路径，已存在则跳过（重跑秒过已完成步骤）。\n\
                              例：「拉依赖」creates node_modules、「编译」creates target/*.jar",
                         )
                         .clicked()
@@ -1360,7 +1446,7 @@ fn edit_step(
                 if resp.lost_focus() {
                     step.notify.retain(|s| !s.is_empty());
                 }
-                if ui.small_button("×").clicked() {
+                if ui.small_button("🗑").clicked() {
                     step.notify.clear();
                 }
             }
@@ -1370,9 +1456,9 @@ fn edit_step(
                      例：${{ variables.ENV }} == prod、${{ env.VERSION != '' }}",
                 );
                 // 吃掉行内剩余宽度（给 × 留位）：定宽 220 在窄窗口下会把 × 挤出卡片右缘
-                let cond_w = (ui.available_width() - 34.0).max(80.0);
+                let cond_w = (ui.available_width() - 40.0).max(80.0);
                 ui.add(egui::TextEdit::singleline(cond).desired_width(cond_w));
-                if ui.small_button("×").clicked() {
+                if ui.small_button("🗑").clicked() {
                     step.condition = None;
                 }
             } else if ui
@@ -1386,6 +1472,53 @@ fn edit_step(
                 step.condition = Some("${{ env.VERSION != '' }}".to_string());
             }
         });
+
+        // 🔒 凭据注入编辑行（TODO「第三方工具管理 · 方案 B」）：环境变量名 → 凭据键。
+        // 运行时从凭据管理器取密码注入子进程 env——密码不进命令行、不落 YAML。
+        // 仅在已有条目时渲染（入口「＋凭据注入」在执行参数行，与工具选择相邻——
+        // 独立成行是每张卡片的噪音，多数步骤用不到凭据）。
+        // 编辑走「快照编辑」：HashMap 收集为排序 Vec → 编辑 → 写回（上传映射同款）
+        if !step.secret_env.is_empty() {
+            let mut rows: Vec<(String, String)> =
+                step.secret_env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            rows.sort();
+            let mut removed: Option<String> = None;
+            for (env_name, cred_key) in &mut rows {
+                ui.horizontal(|ui| {
+                    ui.label("🔒凭据:").on_hover_text(
+                        "运行时从 Windows Credential Manager 取密码注入子进程环境变量。\n\
+                         左 = 环境变量名（如 MYSQL_PWD / PGPASSWORD），右 = 凭据键。\n\
+                         保存密码：remote-build set-password <凭据键> <密码>"
+                    );
+                    ui.add(
+                        egui::TextEdit::singleline(env_name)
+                            .desired_width(110.0)
+                            .hint_text("环境变量名"),
+                    );
+                    ui.label("←");
+                    let key_w = (ui.available_width() - 40.0).max(120.0);
+                    ui.add(
+                        egui::TextEdit::singleline(cred_key)
+                            .desired_width(key_w)
+                            .hint_text("凭据键，如 db/prod-mysql"),
+                    );
+                    if ui.small_button("🗑").on_hover_text("删除此凭据注入").clicked() {
+                        removed = Some(env_name.clone());
+                    }
+                });
+            }
+            ui.horizontal(|ui| {
+                if ui.small_button("＋凭据注入").clicked() {
+                    step.secret_env
+                        .insert(format!("ENV_{}", step.secret_env.len() + 1), "db/mysql".to_string());
+                }
+            });
+            if let Some(rm) = &removed {
+                rows.retain(|(k, _)| k != rm);
+            }
+            // 编辑写回（键改名 = 重建映射；删除在写回前生效）
+            step.secret_env = rows.into_iter().collect();
+        }
         }); // add_enabled_ui（运行中禁用整张卡片）
     });
 
@@ -1443,7 +1576,7 @@ fn edit_mappings(
     for (ri, (l, r)) in rows.iter_mut().enumerate() {
         ui.horizontal(|ui| {
             if ui
-                .small_button("−")
+                .small_button("🗑")
                 .on_hover_text("删除此映射")
                 .clicked()
             {
@@ -1569,7 +1702,9 @@ mod tests {
             "prod".to_string(),
             "很长的目标名称用来测试下拉框文本截断".to_string(),
         ];
-        let panel_w = 720.0;
+        // 面板预算 = 最窄可用编辑区（1080p + 左树 220 时中央 ~840，留余量）。
+        // 723.4 的实测宽度含 🗑 按钮（比 × 宽 ~4px，统一删除图标后持平）
+        let panel_w = 724.0;
         let mut width = 0.0f32;
         let ctx = egui::Context::default();
         ctx.set_pixels_per_point(1.0);
@@ -1651,8 +1786,8 @@ mod tests {
         let w_patho = card_width(&mut patho, 0);
 
         assert!(
-            w_def <= 722.0,
-            "默认布局已超出 720 面板（有行溢出，需收紧定宽或拆行）: {w_def}"
+            w_def <= 726.0,
+            "默认布局已超出 724 面板（有行溢出，需收紧定宽或拆行）: {w_def}"
         );
         assert!(
             w_patho <= w_def + 2.0,
@@ -1683,7 +1818,7 @@ mod tests {
         patho.steps[0].target = Some("很长的目标名称用来测试下拉框文本截断".into());
         let w_patho = card_width(&mut patho, 0);
 
-        assert!(w_def <= 722.0, "默认 wait 布局超出 720 面板: {w_def}");
+        assert!(w_def <= 726.0, "默认 wait 布局超出 724 面板: {w_def}");
         assert!(
             w_patho <= w_def + 2.0,
             "病态输入使 wait 行变宽: {w_def} -> {w_patho}"

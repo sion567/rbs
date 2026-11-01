@@ -108,8 +108,9 @@ fn prewarm_glyphs(ui: &mut egui::Ui) {
     }
 }
 
-/// 中文字体：egui 默认字体无 CJK 字形，加载微软雅黑（缺失时回退默认）
-fn load_cjk_font(ctx: &egui::Context) {
+/// 中文字体：egui 默认字体无 CJK 字形，加载微软雅黑（缺失时回退默认）。
+/// pub(crate)：UI 快照测试（ui_snapshots）的无头 Context 也要装同一套字体
+pub(crate) fn load_cjk_font(ctx: &egui::Context) {
     // 非 TTC 的 .ttf 优先：egui 0.37 新字体引擎解析 msyh.ttc 等 TrueType Collection
     // 会直接段错误（升级实测），TTC 仅作最后兜底
     const CANDIDATES: &[&str] = &[
@@ -210,6 +211,9 @@ pub struct MainState {
     pub last_group_failure: Option<GroupResume>,
     /// 组运行的通知标签（JobEnd toast 显示「项目/组·名」而非最后一个流程名）
     pub run_group_label: Option<String>,
+    /// 组运行实时进度（树上分组头显示 ▶ N/总数）：(组名, 当前第几个 1 起, 总数)。
+    /// GroupJobBegin 推进 / 流程级 JobEnd 清除；单流程运行不设置
+    pub group_run_progress: Option<(String, usize, usize)>,
 }
 
 /// 👀 监听模式状态：盯住项目代码目录，变化后自动重跑指定流程
@@ -331,6 +335,7 @@ impl MainState {
             run_step_retries: Vec::new(),
             last_group_failure: None,
             run_group_label: None,
+            group_run_progress: None,
         };
         s.reload();
         // 历史保留期清理（后台，log_retention_days 天前的 runs 删除；失败只提示不阻塞启动）
@@ -359,6 +364,7 @@ impl MainState {
             self.run = None;
             self.run_job = None;
             self.stop_requested = None;
+            self.group_run_progress = None;
             self.run_steps.clear();
             self.run_step_wait.clear();
         }
@@ -585,6 +591,15 @@ impl MainState {
                     }
                     if ui.add_enabled(!running, egui::Button::new("🎯 目标")).clicked() {
                         self.target_editor.open = !self.target_editor.open;
+                    }
+                    // 变量语法速查的全局入口（原先只在流程编辑器工具栏）：编辑步骤 /
+                    // 配目标 / 看历史时都可能要查，放常驻工具栏不挑场景
+                    if ui
+                        .button("❓ 变量语法")
+                        .on_hover_text("变量 / 条件 / outputs / wait 等写法速查\n（与 docs/变量速查.md 同源）")
+                        .clicked()
+                    {
+                        self.show_var_help = true;
                     }
                     // 状态消息截断：right_to_left 布局里文字从右往左长，
                     // 长作业名 / 监听路径 / ⚠ 长提示会无边界延伸，压到 ⟳ Reload
@@ -1003,6 +1018,9 @@ impl MainState {
                     if status.ok() {
                         self.last_group_failure = None;
                     }
+                    // 树上分组头的运行进度随任何流程级 JobEnd 清除
+                    //（组运行自己的聚合 JobEnd 也走这里；单流程运行本就不设它）
+                    self.group_run_progress = None;
                     // 监听模式：结束即进入等待文件变化的待命态
                     if let Some(w) = &self.watch {
                         if self
@@ -1019,6 +1037,9 @@ impl MainState {
                 LogEvent::GroupJobBegin { project, job, index, total, group, .. } => {
                     // 组运行逐流程推进：自动切到正在运行的流程并复位步骤可视化，
                     // 步骤光圈 / 耗时条 / 重试标注全部对准当前流程
+                    // 树上分组头的实时进度（index 0 起，展示 +1）
+                    self.group_run_progress =
+                        Some((group.clone(), index + 1, *total));
                     if let Some(pi) = self.projects.iter().position(|p| p.project.name == *project) {
                         if let Some(ji) =
                             self.projects[pi].jobs.iter().position(|j| j.job.name == *job)
@@ -1037,7 +1058,8 @@ impl MainState {
                     }
                     self.run_job = Some((project.clone(), job.clone()));
                     self.status_msg = Some(format!(
-                        "组运行[{group}] {index}/{total}: {project}/{job}"
+                        "组运行[{group}] {}/{total}: {project}/{job}",
+                        index + 1
                     ));
                 }
                 LogEvent::GroupJobEnd { project, group, job, status, index, total, .. } => {
@@ -1050,7 +1072,8 @@ impl MainState {
                         });
                     }
                     self.status_msg = Some(format!(
-                        "组运行[{group}] {index}/{total} {}: {}",
+                        "组运行[{group}] {}/{total} {}: {}",
+                        index + 1,
                         job,
                         status.short()
                     ));
@@ -1199,6 +1222,12 @@ impl MainState {
                 if !p.notify.is_empty() {
                     self.console
                         .push_line(format!("    ⇮ notify: {}", p.notify.join(",")), Role::Stdout);
+                }
+                for (env_name, cred_key) in &p.secret_env {
+                    self.console.push_line(
+                        format!("    🔒 {env_name} ← 凭据 {cred_key}（运行时取自凭据管理器）"),
+                        Role::Stdout,
+                    );
                 }
                 if let Some(w) = &p.wait_note {
                     self.console
@@ -1549,6 +1578,7 @@ impl MainState {
         );
         self.status_msg = Some(format!("运行中: {label}"));
         self.stop_requested = None;
+        self.group_run_progress = None;
         self.run = Some(RunHandle {
             cancel_tx,
             engine_abort: Some(engine_abort),
@@ -1577,6 +1607,7 @@ impl MainState {
         self.run = None;
         self.run_job = None;
         self.run_group_label = None;
+        self.group_run_progress = None;
         self.stop_requested = None;
         mark_interrupted_cancelled(&mut self.run_steps);
         self.console.push_line(
@@ -1692,6 +1723,7 @@ impl MainState {
         self.run_step_retries = Vec::new();
         self.run_job = Some((project.name.clone(), group_label.clone()));
         self.run_group_label = Some(format!("{}/{}", project.name, group_label));
+        self.group_run_progress = None; // 首个 GroupJobBegin 会设置实时进度
         self.last_group_failure = None; // 新组运行重置续跑指针（失败会重新登记）
         self.console.push_line(
             format!(

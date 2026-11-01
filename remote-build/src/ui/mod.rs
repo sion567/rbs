@@ -79,3 +79,26 @@ pub(crate) fn centered_window<'a>(
     win.pivot(egui::Align2::CENTER_CENTER)
         .default_pos(center)
 }
+
+/// 折叠头箭头：两条 2px 线段，收起 = ▸ 指右、展开 = ▾ 指下，随 openness 旋转。
+///
+/// 为什么是线段而不是文本字形（⌃/⌄ 或 ▸/▾）：
+/// - 字形可用性随字体链变化——UI 快照 `emoji_glyph_gallery` 实测 ⌃(U+2303) 在
+///   msyh 字体链下是豆腐块（控制台按钮曾因此只剩文字），▸/▾ 依赖 fallback；
+/// - 线段是 Path 形状，与字体完全无关，且在折叠头 icon 闭包内实测可靠渲染。
+///
+/// 用法：`CollapsingHeader::new(..).icon(crate::ui::chevron_icon)`
+pub(crate) fn chevron_icon(ui: &mut egui::Ui, openness: f32, response: &egui::Response) {
+    let rect = response.rect;
+    let c = rect.center();
+    let h = rect.height() * 0.26;
+    let openness = openness.clamp(0.0, 1.0);
+    let lerp = |a: f32, b: f32| a + (b - a) * openness;
+    // 收起态 ">"：尖端朝右、两臂在左；展开态 "v"：尖端朝下、两臂在上
+    let tip = egui::pos2(c.x + lerp(h * 0.45, 0.0), c.y + lerp(0.0, h * 0.6));
+    let arm1_end = egui::pos2(c.x + lerp(-h * 0.3, -h), c.y + lerp(-h, -h * 0.35));
+    let arm2_end = egui::pos2(c.x + lerp(-h * 0.3, h), c.y + lerp(h, -h * 0.35));
+    let stroke = egui::Stroke::new(2.0, ui.style().interact(response).fg_stroke.color);
+    ui.painter().line_segment([arm1_end, tip], stroke);
+    ui.painter().line_segment([tip, arm2_end], stroke);
+}

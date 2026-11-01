@@ -68,3 +68,10 @@ codegen-units = 1
 
 [build-dependencies]
 winresource = "0.1.34"
+
+[dev-dependencies]
+# UI 快照测试（页面比对）：无头渲染 egui 界面 → tests/snapshots/*.png，
+# UPDATE_SNAPSHOTS=true cargo test 重新录制基线；UI 改动跑一次即可出 diff 图
+egui_kittest = { version = "0.37", features = ["wgpu", "snapshot"] }
+# 查询 TextInput 角色（密码框等无标签控件）需要与 egui 同源的 accesskit 类型
+accesskit = "0.25"

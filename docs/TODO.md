@@ -862,3 +862,105 @@
 
 六轮自查全部源码模块审读完毕 + 三重动态验证（冒烟 / 端到端 / 双 feature 构建）。
 静态审查可发现的问题已清零；此后的质量提升应来自真实使用反馈而非继续读代码。
+
+## 第三方 CLI 工具管理（mysql / pgsql / 7z 等，2026-10-31）
+
+> 需求：管理 mysql / pgsql 命令地址（用 mysqldump / pg_dump 做备份），以及 7z 压缩。
+
+### ✅ 已落地（本轮）：现有工具系统直接承接，零新概念
+
+工具系统骨架原本就覆盖这个场景：步骤 `tool:` 选择后，命令里的裸名（mysqldump / 7z）
+经 PATH 前置解析到登记的完整路径；version_check + 运行自检验证可用性；项目级 tools
+可按项目覆盖。本轮补齐：
+
+1. **探测**（env_detect.rs `detect_third_party`）：
+   - MySQL 套件：`C:/Program Files/MySQL/MySQL Server *in`（版本号目录取最新，
+     数字感知排序）+ PATH；一次登记 mysql + mysqldump（同 bin 目录）
+   - PostgreSQL 套件：`C:/Program Files/PostgreSQL/*in` + PATH；登记 psql +
+     pg_dump + pg_restore
+   - 7-Zip：`C:/Program Files/7-Zip`、`(x86)`、PATH；version_check 用 `7z i`
+   - 版本行按关键字校验（mysql / PostgreSQL / 7-Zip），防未知命令输出被当版本
+2. **设置页预设**：mysql / mysqldump / psql / pg_dump / pg_restore / 7z / sqlite3 /
+   redis-cli 一键添加（预设只给裸名 + version_check，路径由探测或 📂 补全）
+3. **示范工程 ⑤ 数据库与压缩合集**：mysqldump / pg_dump / 7z 三个工具绑定步骤，
+   连接信息走变量组（DB_HOST / DB_PORT / DB_PG_PORT / DB_USER / DB_NAME），
+   密码刻意缺席（见下方设计）
+
+### 💡 待设计：数据库密码的安全传递（核心决策点）
+
+mysqldump / pg_dump 的密码**不能进命令行**（进程列表暴露）也**不能进 project.yaml**
+（明文落盘）。三个方案：
+
+- **方案 A（零开发，已文档化）**：用户在系统里配 `MYSQL_PWD` / `PGPASSWORD`
+  环境变量，子进程天然继承。缺点：整机共享一个密码、换机要重配、无法按项目隔离。
+  示范工程 ⑤ 目前按此文档化。
+- **方案 B（推荐，中等工作量）：凭据管理器扩展**。步骤或工具新增
+  `secret_env: { MYSQL_PWD: "db/{项目}/mysql" }`——运行时从 Windows Credential
+  Manager 取值注入子进程 env（复用 secrets.rs；env 不进进程列表，比 -pw 安全）。
+  UI 在工具管理加「保存密码」。键规则与 SSH 凭据一致（{项目}/{目标}）。
+- **方案 C（mysqldump 专用）**：运行时生成 `--defaults-extra-file` 临时 my.cnf
+  （凭据管理器取密码，600 权限用完即删）。最贴合 mysql 生态，但 pg 不通用。
+
+**推荐路线**：先 A（已做）→ B 通用化惠及所有工具 → C 视需求。
+
+### ✅ 方案 B 已落地（2026-10-31）
+
+- `Step.secret_env: HashMap<环境变量名, 凭据键>`（YAML map 形态；键支持 ${{ }} 替换）：
+  `secret_env: { MYSQL_PWD: db/prod-mysql }`
+- 引擎（engine.rs run_single_step）：运行时从 Credential Manager 取密码注入子进程
+  env——env 不进 Windows 进程列表（对比 plink -pw），不落 YAML、不进日志；
+  凭据未存储 → 本步失败 + 保存指引（备份步没密码只会卡交互或报隐晦错，快速失败）
+- 预览（GUI / CLI）：`🔒 MYSQL_PWD ← 凭据 db/prod-mysql`（只显示键，永不显示密码）
+- 步骤卡片：「＋凭据注入」按钮 + 条目编辑行（上传映射同款的快照编辑模式）
+- 保存密码：`remote-build set-password db/prod-mysql <密码>`（帮助文案已更新，
+  键 = SSH 目标名或 secret_env 凭据键）；示范工程 ⑤ 已接入
+
+### ✅ 方案 C 已评估：不做（被 B 取代），机制与实施草图存档
+
+两个库的"密码进临时文件"机制并不对称：
+
+- **MySQL**：option file（`[client]` 段 `password=...`）+ 命令行第一个参数
+  `--defaults-extra-file=<路径>`（硬规则：必须是第一个参数）。客户端族通用。
+- **PostgreSQL**：`PGPASSWORD` 是**官方正式推荐**（非弃用）——pg 用 B 就是最佳实践，
+  没有动力走文件。真要文件也有对应物：pgpass 文件（`host:port:db:user:pass` 五元组、
+  `*` 通配、Windows 不检查权限位）+ `PGPASSFILE` 指向它，libpq 系工具自动读取。
+
+应用外的一次性持久方案（零代码，文档化即可）：MySQL `mysql_config_editor set
+--login-path=prod ...` → `mysqldump --login-path=prod`；pg `.pg_service.conf` 的
+`[prod]` 段 → `pg_dump service=prod`。密码混淆/集中存储，命令行干净。
+
+**若未来要实现 C**，通用设计 = `secret_files`（不是 mysqldump 专用）：
+
+```yaml
+secret_files:
+  - format: mysql-client   # [client] password=...；命令里 --defaults-extra-file=%VAR%
+    key: db/demo-mysql     # 凭据管理器键
+    var: RBS_MYSQL_CNF     # 注入该环境变量 = 临时文件路径
+  - format: pgpass         # host:port:db:user:pass；PGPASSFILE 指向即生效，命令零改动
+    key: db/demo-pg
+    var: PGPASSFILE
+```
+
+实现的主要成本不在写文件，在**临时文件生命周期**：成功 / 失败 / 超时 / 强制结束
+四条路径都要保证删除（否则密码落盘 %TEMP%）——这是当初搁置的真实原因。
+当前结论：B 已覆盖两库，C 等真实需求（如 MYSQL_PWD 被移除）再做。
+
+### 💡 待设计（次要）
+
+- **工具管理分组 UI**：条目多了以后（预设 20+）列表可按「探测 / 预设 / 手动」或
+  类别分组展示；当前排序即可用，优先级低
+- **7z 与内置 pack 的定位**：pack 保持 Rust 内置（zip / tar.gz 零依赖）；7z 走
+  exec 步骤 + tool 绑定，用于 .7z 格式 / 加密压缩 / 更高压缩率，不做进 pack
+- **mysqldump 远程备份**：mysqldump 从发版机连远程 DB——与 SSH 目标无关
+  （DB 不是执行目标），连接信息应放 variables（示范 ⑤ 即此模式），不要新增
+  "数据库目标"类型
+
+## 2026-10-31 UI 反馈：删除图标统一
+
+- **反馈**：删除类图标混用 − / ×，不好判断。
+- **修复**：全部 13 处（映射行 / 前置检查 / secret_env / 超时 / 重试 / creates /
+  notify / 条件 / wait / 确认门 / targets 与 settings 的可选字段清除）统一为 🗑
+  ——与既有的删除流程 / 删除工具按钮同一视觉语言。
+- **连带发现**：🗑 比宽 ~4px，三个「填充宽度输入 + 尾随 🗑」的行预留 34px
+  不够 → 行溢出 3.375px（布局回归测试当场抓住）。预留改 40，测试面板预算
+  同步 724 并注明构成。

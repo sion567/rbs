@@ -229,7 +229,7 @@ impl Engine {
                 // 不阻塞事件转发任务与运行锁 watcher
                 let Some(tool) = merged_tools.get(name).cloned() else {
                     let reason = format!(
-                        "工具「{name}」未定义（tools.yaml / 项目级 tools，或 ⚙ 设置 → 🧰 工具管理 添加）"
+                        "工具「{name}」未定义（tools.yaml / 项目级 tools，或 ⚙ 设置 → 🔧 工具管理 添加）"
                     );
                     let _ = log_tx.send(LogEvent::Error { message: reason.clone() }).await;
                     return JobStatus::Failed {
@@ -251,7 +251,7 @@ impl Engine {
                                     None => Err(format!(
                                         "工具自检失败: {name_for_check} 的验证命令「{check}」无输出\n\
                                          （超时 3s / 命令不存在 / 启动失败）。\n\
-                                         请检查本机安装，或在 ⚙ 设置 → 🧰 工具管理 选中后点「验证 version_check」排查"
+                                         请检查本机安装，或在 ⚙ 设置 → 🔧 工具管理 选中后点「验证 version_check」排查"
                                     )),
                                 }
                             }
@@ -273,7 +273,7 @@ impl Engine {
                                     Err(format!(
                                         "工具自检失败: {name_for_check} 的 command「{}」解析不到可执行文件\n\
                                          （路径不存在 / PATH 找不到）。\n\
-                                         请在 ⚙ 设置 → 🧰 工具管理 修正 command 或重新探测",
+                                         请在 ⚙ 设置 → 🔧 工具管理 修正 command 或重新探测",
                                         tool.command
                                     ))
                                 }
@@ -315,7 +315,7 @@ impl Engine {
                 let outcome: Result<String, String> = (|| {
                     let Some(tool) = merged_tools.get(name) else {
                         return Err(format!(
-                            "工具「{name}」未定义（tools.yaml / 项目级 tools，或 ⚙ 设置 → 🧰 工具管理 添加）"
+                            "工具「{name}」未定义（tools.yaml / 项目级 tools，或 ⚙ 设置 → 🔧 工具管理 添加）"
                         ));
                     };
                     let detected = tool.version.as_deref().unwrap_or("");
@@ -793,6 +793,44 @@ async fn run_single_step(
             }
             for (k, v) in &step.env {
                 env_map.insert(k.clone(), resolve(v, ctx));
+            }
+            // 凭据注入（TODO「第三方工具管理 · 方案 B」）：从 Credential Manager 取密码
+            // 注入子进程 env——密码不进命令行（进程列表暴露）、不落 YAML。
+            // 键支持 ${{ }} 替换；未存储 → 本步失败 + 保存指引（备份步没密码只会
+            // 卡在交互输入或报隐晦错误，快速失败才是对的）
+            for (env_name, cred_key) in &step.secret_env {
+                let key = resolve(cred_key, ctx);
+                match crate::secrets::get_password(&key) {
+                    Ok(Some(pwd)) => {
+                        env_map.insert(env_name.clone(), pwd);
+                    }
+                    Ok(None) => {
+                        let reason = format!(
+                            "凭据「{key}」未存储（{env_name} 注入需要它）。\
+                             先执行 remote-build set-password \"{key}\" <密码>，\
+                             或在凭据管理器手工创建（服务 remote-build）"
+                        );
+                        let _ = log_tx
+                            .send(LogEvent::Error { message: reason.clone() })
+                            .await;
+                        return StepResult::Failed {
+                            exit_code: -1,
+                            duration_ms: 0,
+                            reason,
+                        };
+                    }
+                    Err(e) => {
+                        let reason = format!("读取凭据「{key}」失败: {e:#}");
+                        let _ = log_tx
+                            .send(LogEvent::Error { message: reason.clone() })
+                            .await;
+                        return StepResult::Failed {
+                            exit_code: -1,
+                            duration_ms: 0,
+                            reason,
+                        };
+                    }
+                }
             }
 
             // 工具地址落地：tools.yaml / 项目级 tools 的 command 若是完整路径，
@@ -1531,6 +1569,76 @@ mod tests {
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
         input
+    }
+
+    // ── 凭据注入（secret_env，方案 B）回归 ─────────────────────────
+
+    const SECRET_TEST_KEY: &str = "db/rbs-engine-test";
+
+    #[test]
+    fn secret_env_injects_password_from_credential_manager() {
+        // 凭据已存 → 注入子进程 env；命令读出来验证（方案 B 全链路）
+        crate::secrets::set_password(SECRET_TEST_KEY, "s3cret-pw").unwrap();
+        let rt = runtime();
+        let (tx, mut rx) = mpsc::channel(1024);
+        let (_cancel_tx, cancel_rx) = broadcast::channel(4);
+
+        let step = Step {
+            command: "echo PW_IS_%MYSQL_PWD%".to_string(),
+            step_type: StepType::Exec,
+            enabled: true,
+            secret_env: [("MYSQL_PWD".to_string(), SECRET_TEST_KEY.to_string())]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        let input = simple_job(vec![step]);
+        let status = rt.block_on(Engine.run_job(input, cancel_rx, tx));
+        let mut events = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            events.push(ev);
+        }
+        assert!(status.ok(), "{status:?}");
+        assert!(events.iter().any(|e| matches!(
+            e,
+            LogEvent::Stdout { line, .. } if line.contains("PW_IS_s3cret-pw")
+        )));
+        crate::secrets::delete_password(SECRET_TEST_KEY);
+    }
+
+    #[test]
+    fn secret_env_fails_fast_when_credential_missing() {
+        // 凭据未存 → 本步失败 + 保存指引（备份步没密码只会卡交互或报隐晦错）
+        let rt = runtime();
+        let (tx, mut rx) = mpsc::channel(1024);
+        let (_cancel_tx, cancel_rx) = broadcast::channel(4);
+        let missing_key = "db/rbs-engine-test-missing";
+
+        let step = Step {
+            command: "echo should_not_run".to_string(),
+            step_type: StepType::Exec,
+            enabled: true,
+            secret_env: [("MYSQL_PWD".to_string(), missing_key.to_string())]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        let input = simple_job(vec![step]);
+        crate::secrets::delete_password(missing_key); // 确保不存在
+        let status = rt.block_on(Engine.run_job(input, cancel_rx, tx));
+        assert!(matches!(status, JobStatus::Failed { .. }), "{status:?}");
+        let mut events = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            events.push(ev);
+        }
+        assert!(events.iter().any(|e| matches!(
+            e,
+            LogEvent::Error { message } if message.contains("未存储") && message.contains("set-password")
+        )));
+        assert!(!events.iter().any(|e| matches!(
+            e,
+            LogEvent::Stdout { line, .. } if line.contains("should_not_run")
+        )));
     }
 
     #[test]

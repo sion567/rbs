@@ -429,6 +429,111 @@ done
 chk_rc0 "31. 三连发成功"
 [[ "$(ls "$S/logs"/*.log 2>/dev/null | wc -l)" -le 2 ]] && good "31. 日志只保留 2 个" || bad "31. 日志未清理：$(ls "$S/logs" | wc -l) 个"
 
+# ---------- 32. Mongo 模板（假 docker：dump/restore 干跑校验） ----------
+fresh
+mkdir -p "$S/bin"
+cat > "$S/bin/docker" <<'EOF'
+#!/bin/sh
+[ "$1" = "exec" ] || exit 0
+shift
+while [ $# -gt 0 ]; do case "$1" in -e|-i) shift ;; *) break ;; esac; done
+shift   # 容器名
+case "$1" in
+  mongodump) printf 'fake-bson-archive' ;;
+  mongorestore) exit 0 ;;
+esac
+exit 0
+EOF
+chmod +x "$S/bin/docker"
+cp "$HERE/templates/backup-mongo.sh" "$S/backup-db.sh"
+run "$S" env PATH="$S/bin:$PATH" sh backup-db.sh backup
+chk_rc0 "32. mongo 备份成功（假 docker）"
+chk_glob "db-backups/appdb.*.archive.gz" "32. 归档文件生成"
+_f="$(ls "$S"/db-backups/appdb.*.archive.gz 2>/dev/null | head -1)"
+run "$S" env PATH="$S/bin:$PATH" FORCE=1 sh backup-db.sh import "$_f"
+chk_rc0 "32. mongo 导入成功"
+
+# ---------- 33. docker 镜像导出/导入（假 docker，真 tar.gz 校验） ----------
+fresh
+mkdir -p "$S/bin"
+cat > "$S/bin/docker" <<'EOF'
+#!/bin/sh
+case "$1" in
+  save) d="$(mktemp -d)"; echo '{}' > "$d/manifest.json"; tar -C "$d" -cf - manifest.json; rm -rf "$d"; exit 0 ;;
+  load) exit 0 ;;
+esac
+exit 0
+EOF
+chmod +x "$S/bin/docker"
+cp "$HERE/templates/backup-docker-image.sh" "$S/backup-db.sh"
+run "$S" env PATH="$S/bin:$PATH" IMAGES=myapp:1.0 sh backup-db.sh backup
+chk_rc0 "33. 镜像导出成功（模板层 gzip）"
+chk_glob "docker-backups/image_myapp_1.0.*.tar.gz" "33. 镜像归档生成（名字净化）"
+_f="$(ls "$S"/docker-backups/*.tar.gz 2>/dev/null | head -1)"
+run "$S" env PATH="$S/bin:$PATH" sh backup-db.sh import "$_f"
+chk_rc0 "33. 镜像导入成功"
+
+# ---------- 34. docker 卷备份/恢复（假 docker，真 tar.gz 校验） ----------
+fresh
+mkdir -p "$S/bin"
+cat > "$S/bin/docker" <<'EOF'
+#!/bin/sh
+[ "$1" = "run" ] || exit 0
+# 从 -v 参数里解析 /dst 的宿主机目录，把容器内 czf/xzf 路径映射回宿主机
+hostdir=""; prev=""
+for a in "$@"; do
+  [ "$prev" = "-v" ] && case "$a" in *:/dst|*:/dst/*) hostdir="${a%%:*}" ;; esac
+  prev="$a"
+done
+case "$*" in
+  *czf*)
+    dst=""; prev=""
+    for a in "$@"; do [ "$prev" = "czf" ] && dst="$a"; prev="$a"; done
+    case "$dst" in /dst/*) dst="$hostdir/${dst#/dst/}" ;; esac
+    d="$(mktemp -d)"; echo hello > "$d/data.txt"; tar -C "$d" -czf "$dst" data.txt; rm -rf "$d"; exit 0 ;;
+  *xzf*) echo restored >> "$FAKE_LOG"; exit 0 ;;
+esac
+exit 0
+EOF
+chmod +x "$S/bin/docker"
+cp "$HERE/templates/backup-docker-volume.sh" "$S/backup-db.sh"
+run "$S" env PATH="$S/bin:$PATH" FAKE_LOG="$S/fake.log" VOLUMES=appdata sh backup-db.sh backup
+chk_rc0 "34. 卷备份成功"
+chk_glob "docker-backups/vol_appdata.*.tar.gz" "34. 卷归档生成"
+_f="$(ls "$S"/docker-backups/vol_appdata.*.tar.gz 2>/dev/null | head -1)"
+run "$S" env PATH="$S/bin:$PATH" FAKE_LOG="$S/fake.log" FORCE=1 sh backup-db.sh import "$_f"
+chk_rc0 "34. 卷恢复成功"
+grep -q restored "$S/fake.log" 2>/dev/null && good "34. 恢复动作被调用" || bad "34. 恢复动作未调用"
+
+# ---------- 35. Redis 模板（假 docker：SAVE/cp/restart） ----------
+fresh
+mkdir -p "$S/bin"
+cat > "$S/bin/docker" <<'EOF'
+#!/bin/sh
+case "$1" in
+  exec) shift; while [ $# -gt 0 ]; do case "$1" in -e|-i) shift ;; *) break ;; esac; done; shift; exit 0 ;;
+  cp)   case "$3" in *:*) echo copied >> "$FAKE_LOG" ;; *) printf 'REDIS0000' > "$3" ;; esac; exit 0 ;;
+  restart) echo restarted >> "$FAKE_LOG"; exit 0 ;;
+esac
+exit 0
+EOF
+chmod +x "$S/bin/docker"
+cp "$HERE/templates/backup-redis.sh" "$S/backup-db.sh"
+run "$S" env PATH="$S/bin:$PATH" FAKE_LOG="$S/fake.log" sh backup-db.sh backup
+chk_rc0 "35. redis 备份成功"
+chk_glob "db-backups/redis.*.rdb" "35. RDB 文件生成"
+_f="$(ls "$S"/db-backups/redis.*.rdb 2>/dev/null | head -1)"
+run "$S" env PATH="$S/bin:$PATH" FAKE_LOG="$S/fake.log" FORCE=1 sh backup-db.sh import "$_f"
+chk_rc0 "35. redis 导入成功"
+grep -q restarted "$S/fake.log" 2>/dev/null && good "35. 容器重启被调用" || bad "35. 容器重启未调用"
+
+# ---------- 36. 全部模板 POSIX 语法 ----------
+synfail=0
+for tf in "$HERE"/templates/*.sh; do
+  sh -n "$tf" 2>/dev/null || { synfail=1; echo "  语法错误：$tf"; }
+done
+[[ $synfail -eq 0 ]] && good "36. templates/*.sh 全部通过 sh -n" || bad "36. 有模板语法错误"
+
 echo
 echo "== 结果：PASS=$PASS FAIL=$FAIL =="
 [[ $FAIL -eq 0 ]] || { echo "存在失败项"; exit 1; }

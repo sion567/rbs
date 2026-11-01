@@ -39,6 +39,9 @@ pub struct StepPreview {
     pub outputs: Vec<(String, String)>,
     /// notify 的 handler 名
     pub notify: Vec<String>,
+    /// 凭据注入预览：(环境变量名, 凭据键)；密码本体运行时取自凭据管理器，
+    /// 预览与日志永不出现
+    pub secret_env: Vec<(String, String)>,
     /// wait 探测描述（模式 目标 间隔）
     pub wait_note: Option<String>,
 }
@@ -106,6 +109,17 @@ pub fn preview_job(input: &RunInput) -> Vec<StepPreview> {
             pack: None,
             outputs: step.outputs.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
             notify: step.notify.clone(),
+            // 凭据注入预览：只展示 env 名与凭据键（密码本体运行时取自凭据管理器，
+            // 预览与日志永不出现）。排序保证 HashMap 遍历的输出稳定
+            secret_env: {
+                let mut pairs: Vec<(String, String)> = step
+                    .secret_env
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                pairs.sort();
+                pairs
+            },
             wait_note: wait_resolved.as_ref().map(|(s, _)| s.clone()),
         };
         if let Some((_, unresolved)) = &wait_resolved {
@@ -155,7 +169,10 @@ pub fn preview_job(input: &RunInput) -> Vec<StepPreview> {
         // 引用了不存在的工具：引擎会静默跳过注入，预览里说破
         if !step.tool.is_empty() && p.tool.is_none() {
             p.warnings
-                .push(format!("工具「{}」未定义（tools.yaml / 项目级 tools / ⚙ 设置）", step.tool));
+                .push(format!(
+                    "工具「{}」未定义（tools.yaml / 项目级 tools；⚙ 设置 → 🔧 工具管理 配置）",
+                    step.tool
+                ));
         }
         let remote = is_remote(eff_target.as_ref());
         let remote_base = eff_target

@@ -111,6 +111,7 @@ pub fn show(main: &mut MainState, ui: &mut egui::Ui) {
                 )
             };
             let body = egui::CollapsingHeader::new(header)
+                .icon(crate::ui::chevron_icon)
                 .default_open(true)
                 .show(ui, |ui| {
                     // 分组清单 = project.groups 列表 ∪ 流程实际引用的组名
@@ -136,14 +137,27 @@ pub fn show(main: &mut MainState, ui: &mut egui::Ui) {
                                 .filter(|(_, je)| je.job.group.as_deref() == Some(gname.as_str()))
                                 .map(|(i, _)| i)
                                 .collect();
+                            // 组运行实时进度（GroupJobBegin 推进 / JobEnd 清除）：
+                            // 运行中的分组头显示 ▶ N/总数（1 起），一眼看到跑到第几个
+                            let run_prog = main
+                                .group_run_progress
+                                .as_ref()
+                                .filter(|(g, _, _)| g == gname)
+                                .map(|(_, i, t)| format!(" ▶ {i}/{t}"));
                             // 长分组名截断显示（悬停看全名）：名字太长会把折叠头撑宽、
-                            // 左栏随之变宽，右侧编辑器的可视宽度被挤坏
-                            let shown_gname = crate::ui::truncate_label(gname, 14);
+                            // 左栏随之变宽，右侧编辑器的可视宽度被挤坏；
+                            // 运行中要给进度 ▶ N/t 腾位，截断预算收紧
+                            let shown_gname = crate::ui::truncate_label(
+                                gname,
+                                if run_prog.is_some() { 10 } else { 14 },
+                            );
                             let group_body = egui::CollapsingHeader::new(format!(
-                                "📂 {}{}",
+                                "📂 {}{}{}",
                                 shown_gname,
-                                if member_idx.is_empty() { String::new() } else { format!("（{}）", member_idx.len()) }
+                                if member_idx.is_empty() { String::new() } else { format!("（{}）", member_idx.len()) },
+                                run_prog.unwrap_or_default(),
                             ))
+                            .icon(crate::ui::chevron_icon)
                             .default_open(true)
                             .show(ui, |ui| {
                                 for &ji in &member_idx {

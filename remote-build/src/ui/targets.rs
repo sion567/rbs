@@ -146,6 +146,7 @@ pub fn show(ctx: &egui::Context, main: &mut MainState) {
         crate::ui::modal_backdrop(ctx, "mask_targets");
     }
     crate::ui::centered_window(egui::Window::new("🎯 目标管理"), ctx)
+    .collapsible(false)
         .open(&mut open)
         .order(egui::Order::Foreground)
         .default_width(720.0)
@@ -210,45 +211,59 @@ fn target_list_and_form(ui: &mut egui::Ui, main: &mut MainState) {
     // local（本机）固定排第一，其余按名称排
     names.sort_by_key(|n| (n != "local", n.clone()));
 
-    // 2:8 布局：左边只是目标名清单，1:1 均分浪费一半宽度、右边表单内容挤不下；
-    // ui.columns 只会均分，这里手动分配（左侧 20%，最窄 150px 保证列表可读）
+    // 2:8 布局：左边只是目标名清单，1:1 均分浪费一半宽度、右边表单内容挤不下。
+    // 必须用 allocate_ui_with_layout 显式传 top_down 布局：allocate_ui 会继承
+    // 外层 ui.horizontal 的横向布局（egui 0.37），列表被横排成一行、还因垂直
+    // 居中悬在半空——「目标管理整个乱掉」的主因之一
     let total = ui.available_width();
     let spacing = ui.spacing().item_spacing.x;
-    let left_w = ((total - spacing) * 0.2).clamp(150.0, 220.0);
-    let right_w = (total - spacing - left_w).max(200.0);
+    let left_w = 200.0_f32.min((total - spacing) * 0.35).max(140.0);
+    let right_w = (total - spacing - left_w).max(240.0);
+    let col_h = 280.0;
     ui.horizontal(|ui| {
-        ui.allocate_ui(egui::vec2(left_w, 280.0), |ui| {
-            egui::ScrollArea::vertical()
-                .id_salt("target_list")
-                .max_height(280.0)
-                .show(ui, |ui| {
-                    for name in &names {
-                        let sel = main.target_editor.selected.as_deref() == Some(name.as_str());
-                        // 目标名截断 + 悬停看全：超长名字会把列表列撑宽、把右侧表单顶出窗口
-                        let shown = crate::ui::truncate_label(name, 14);
-                        let resp = ui.selectable_label(sel, shown.clone());
-                        if resp.clicked() {
-                            main.target_editor.selected = Some(name.clone());
-                            load_buffers(main, name);
-                            main.target_editor.test_result = None;
+        ui.allocate_ui_with_layout(
+            egui::vec2(left_w, col_h),
+            egui::Layout::top_down_justified(egui::Align::LEFT),
+            |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("target_list")
+                    .max_height(col_h)
+                    .show(ui, |ui| {
+                        for name in &names {
+                            let sel =
+                                main.target_editor.selected.as_deref() == Some(name.as_str());
+                            // 目标名截断 + 悬停看全：超长名字会把列表列撑宽、把右侧表单顶出窗口
+                            let shown = crate::ui::truncate_label(name, 14);
+                            // selectable_label 无截断能力（内容超宽会反过来撑大
+                            // allocate_ui 的分配），用 Button::selectable + truncate：
+                            // 超出列宽自动省略，列宽恒定
+                            let resp = ui
+                                .add(egui::Button::selectable(sel, shown.clone()).truncate())
+                                .on_hover_text(name);
+                            if resp.clicked() {
+                                main.target_editor.selected = Some(name.clone());
+                                load_buffers(main, name);
+                                main.target_editor.test_result = None;
+                            }
                         }
-                        if shown != *name {
-                            resp.on_hover_text(name);
+                        if names.is_empty() {
+                            ui.weak("（空，点下方「＋ 添加」）");
                         }
-                    }
-                    if names.is_empty() {
-                        ui.weak("（空，点下方「＋ 添加」）");
-                    }
-                });
-        });
-        ui.allocate_ui(egui::vec2(right_w, 280.0), |ui| {
-            egui::ScrollArea::vertical()
-                .id_salt("target_form")
-                .max_height(280.0)
-                .show(ui, |ui| {
-                    edit_form(ui, main);
-                });
-        });
+                    });
+            },
+        );
+        ui.allocate_ui_with_layout(
+            egui::vec2(right_w, col_h),
+            egui::Layout::top_down_justified(egui::Align::LEFT),
+            |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("target_form")
+                    .max_height(col_h)
+                    .show(ui, |ui| {
+                        edit_form(ui, main);
+                    });
+            },
+        );
     });
 
     ui.add_space(6.0);
@@ -556,14 +571,15 @@ fn edit_form(ui: &mut egui::Ui, main: &mut MainState) {
                         AuthMethod::Password { .. } => {
                             ui.label("密码:");
                             ui.horizontal(|ui| {
-                                // 给「保存密码」按钮留位，避免窄窗口下按钮被右缘裁掉
-                                let input_w = (ui.available_width() - 90.0).max(120.0);
+                                // 固定宽度：Grid 测量期单元格内 available_width 是
+                                // 未约束的（会取到父级剩余全宽），按它算宽会把窗口
+                                // 撑到比屏幕还宽——「整个乱掉」的另一主因
                                 let resp = ui.add(
                                     egui::TextEdit::singleline(
                                         &mut main.target_editor.password_buf,
                                     )
                                     .password(true)
-                                    .desired_width(input_w),
+                                    .desired_width(180.0),
                                 );
                                 if resp.changed() {
                                     main.target_editor.unsaved = true;
@@ -614,8 +630,8 @@ fn edit_form(ui: &mut egui::Ui, main: &mut MainState) {
                 }
                 TargetType::Kubernetes { kubeconfig, context, namespace, registry } => {
                     ui.label("kubeconfig:");
-                    // 占满单元格剩余宽度：固定 300 在窄窗口会被右缘裁掉
-                    if text_row(ui, kubeconfig, ui.available_width()) {
+                    // 固定宽度（同上：Grid 单元格里 available_width 未约束，会撑爆窗口）
+                    if text_row(ui, kubeconfig, 360.0) {
                         main.target_editor.unsaved = true;
                     }
                     ui.end_row();
@@ -680,7 +696,7 @@ fn edit_form(ui: &mut egui::Ui, main: &mut MainState) {
                     ui.label("");
                     ui.weak(
                         "本机未检测到 PuTTY 套件：putty 选项不可选，执行一律按 russh；\
-                         需要兜底请先安装 PuTTY（⚙ 设置 → 🔌 PuTTY 可指定目录）",
+                         需要兜底请先安装 PuTTY（⚙ 设置 → 🔧 工具管理 → putty 可指定目录）",
                     );
                     ui.end_row();
                 }
@@ -705,9 +721,10 @@ fn edit_form(ui: &mut egui::Ui, main: &mut MainState) {
 
                 ui.label("主机键指纹:");
                 if let TargetType::Ssh { host_key, .. } = &mut target.target_type {
+                    // 固定宽度（同上：Grid 单元格里 available_width 未约束）
                     let resp = ui.add(
                         egui::TextEdit::singleline(host_key.get_or_insert_default())
-                            .desired_width(ui.available_width())
+                            .desired_width(360.0)
                             .font(egui::TextStyle::Monospace)
                             .hint_text("SHA256:...（连接测试失败时输出会给出，复制填入）"),
                     );
@@ -862,7 +879,7 @@ fn local_machine_panel(ui: &mut egui::Ui, main: &mut MainState) {
 
     ui.add_space(8.0);
     ui.separator();
-    ui.heading("🧰 工具链（tools.yaml）");
+    ui.heading("🔧 工具链（tools.yaml）");
     ui.weak(
         "步骤里选择了工具时：该工具的 env 注入该步骤，其所在目录前置到 PATH，\n\
          命令里的裸名（java / mvn / node…）就会解析到这个工具的版本——选哪个用哪个。\n\
@@ -971,7 +988,7 @@ fn option_text_row(
                 changed |= ui
                     .add(egui::TextEdit::singleline(v).desired_width(width))
                     .changed();
-                if ui.small_button("×").clicked() {
+                if ui.small_button("🗑").clicked() {
                     clear = true;
                 }
             });

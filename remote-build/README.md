@@ -95,6 +95,10 @@ remote-build preview <项目名> <流程名>           # 干跑预览：解析�
   未登记指纹 russh 直接拒连并给出指纹（不自动信任）。
 - russh 私钥须为 OpenSSH 格式；PuTTY PPK 请先用 PuTTY 自带的 puttygen 转换
   （`puttygen key.ppk -O private-openssh -o key.pem`）。
+- **数据库密码**（mysqldump / pg_dump 备份）：步骤 `secret_env` 凭据注入——
+  `secret_env: { MYSQL_PWD: db/prod-mysql }` 运行时从凭据管理器取密码注入子进程 env，
+  不进命令行、不落 YAML；先 `remote-build set-password db/prod-mysql <密码>` 保存。
+  示范见 example「⑤ 数据库与压缩合集」。
 
 ## 示例工程（~/.remote-build/projects/）
 
@@ -113,7 +117,7 @@ prod-deploy（编译 → pack 打 zip → 多行映射 upload 到 prod 目标 �
 工程源码在 `E:\workspace\rbs\project-samples\`，配置与代码两层分离（§10.1）。
 
 > 前置：russh 目标**零依赖**开箱即用；仅 `transport: putty` 的目标需要本机已安装 PuTTY
-> （安装器默认进 Program Files 并加入 PATH；绿色版在 ⚙ 设置的「PuTTY 目录」指定位置，
+> （安装器默认进 Program Files 并加入 PATH；绿色版在 ⚙ 设置 → 🔧 工具管理选中 putty 指定套件目录，
 > 需含 plink.exe / pscp.exe）。探测顺序：自定义目录 → 系统 PATH → Program Files。
 
 ## 已知限制

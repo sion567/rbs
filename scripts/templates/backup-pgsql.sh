@@ -11,6 +11,7 @@
 #   - 每库默认保留最近 KEEP_BACKUPS=10 个，超出自动清理最老的
 #   - 完整性校验：pg_restore --list 能完整读取归档目录；不完整立即删除并报错
 #   - 导入用 pg_restore --clean --if-exists：先删旧对象再建，目标库需已存在
+#   - dump 带 --no-owner：恢复到别的实例不因缺角色报错（同实例恢复无副作用）
 # 集成：
 #   - 复制本文件为 deploy 根目录的 backup-db.sh，release.sh --backup 会自动执行它
 #   - 也可单独 cron 定时：10 3 * * * cd /deploy && sh backup-db.sh backup
@@ -27,6 +28,7 @@ DBS="${DBS:-appdb}"                           # 要备份的库，空格分隔�
 BACKUP_DIR="${BACKUP_DIR:-db-backups}"        # 备份目录（相对当前目录或绝对路径）
 KEEP_BACKUPS="${KEEP_BACKUPS:-10}"
 FORCE="${FORCE:-0}"                           # import 时跳过交互确认（非交互环境用）
+PGS_RESTORE_JOBS="${PGS_RESTORE_JOBS:-}"      # 并行导入线程数（如 4，空=串行；仅 -Fc 自定义格式支持）
 # ===========================================
 
 usage() {
@@ -59,7 +61,8 @@ do_backup() {
   for db in $DBS; do
     bk_f="$BACKUP_DIR/$db.$(date +%Y%m%d-%H%M%S).dump"
     echo "== 备份 $db -> $bk_f =="
-    if docker exec "$PGS_CONTAINER" pg_dump -U "$PGS_USER" -Fc -d "$db" > "$bk_f" \
+    # -Fc 自定义格式（压缩、可选择性恢复）；--no-owner 跨实例恢复不因缺角色报错
+    if docker exec "$PGS_CONTAINER" pg_dump -U "$PGS_USER" -Fc --no-owner -d "$db" > "$bk_f" \
        && verify_dump "$bk_f"; then
       echo "完成（$(du -h "$bk_f" | cut -f1)）"
       echo "BACKED_UP: $bk_f"
@@ -83,6 +86,8 @@ do_import() { # $1=备份文件
   case "$im_db" in
     ''|*.*) echo "backup-db.sh：无法从文件名解析库名（应为 <库名>.YYYYMMDD-HHMMSS.dump）：$im_f" >&2; exit 1 ;;
   esac
+  im_rjobs=""
+  if [ -n "$PGS_RESTORE_JOBS" ]; then im_rjobs="-j $PGS_RESTORE_JOBS"; fi
   if [ "$FORCE" != "1" ]; then
     if [ -t 0 ]; then
       printf '将把 %s 恢复到数据库 %s（--clean：先删现有对象！）。确认请输入 yes：' "$(basename "$im_f")" "$im_db"
@@ -94,7 +99,7 @@ do_import() { # $1=备份文件
     fi
   fi
   echo "== 导入 $(basename "$im_f") -> $im_db =="
-  docker exec -i "$PGS_CONTAINER" pg_restore -U "$PGS_USER" --clean --if-exists -d "$im_db" < "$im_f"
+  docker exec -i "$PGS_CONTAINER" pg_restore -U "$PGS_USER" --clean --if-exists $im_rjobs -d "$im_db" < "$im_f"
   echo "导入完成：$im_db"
 }
 

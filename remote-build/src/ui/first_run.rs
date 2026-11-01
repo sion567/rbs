@@ -21,6 +21,18 @@ impl FirstRunPage {
         }
     }
 
+    /// 测试专用：不起后台探测线程（report_rx = None → 恒走「探测中」分支），
+    /// 快照基线不受探测线程完成时序影响
+    #[cfg(test)]
+    pub fn new_without_detection() -> Self {
+        Self {
+            report_rx: None,
+            report: None,
+            error: None,
+            confirmed: false,
+        }
+    }
+
     pub fn confirmed(&self) -> bool {
         self.confirmed
     }
@@ -61,7 +73,7 @@ impl FirstRunPage {
                 None => {
                     ui.vertical_centered(|ui| {
                         ui.add(egui::Spinner::new().size(32.0));
-                        ui.label("正在探测开发环境（java / mvn / gradle / node / git / docker / kubectl / PuTTY）…");
+                        ui.label("正在探测开发环境（java / mvn / gradle / node / git / docker / kubectl / mysql / pgsql / 7z / PuTTY）…");
                     });
                     ctx.request_repaint_after(std::time::Duration::from_millis(120));
                     return;

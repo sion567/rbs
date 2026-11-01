@@ -155,7 +155,8 @@ impl ConsoleState {
             // 组运行边界（第五批）：单流程结束只发组事件，整个组结束才走 JobEnd 臂
             LogEvent::GroupJobBegin { job, index, total, .. } => {
                 self.push(
-                    format!("──── 组运行 {index}/{total} ── 启动流程 {job} ────"),
+                    // index 0 起：展示 +1（首个流程应显示 1/total 而非 0/total）
+                    format!("──── 组运行 {}/{total} ── 启动流程 {job} ────", index + 1),
                     Role::Info,
                 );
             }
@@ -260,18 +261,39 @@ pub fn show(console: &mut ConsoleState, ui: &mut egui::Ui, running: bool, dark: 
     panel.show(ui, |ui| {
         ui.add_space(4.0);
         ui.horizontal(|ui| {
-            ui.strong("控制台输出");
-            if ui
-                .small_button(if console.collapsed { "⌄ 展开" } else { "⌃ 收起" })
-                .on_hover_text(if console.collapsed {
-                    "展开输出区域"
-                } else {
-                    "折叠输出区域，只留标题行（编辑步骤时不再被控制台占掉半屏）"
-                })
-                .clicked()
-            {
+            // 折叠开关：标题左侧的 chevron 图标（与项目树折叠头同款线段绘制）。
+            // 不用文本字形按钮的原因：▴(U+25B4) 在 msyh 字体链下缺字形渲染成空白
+            // （此前展开态按钮"没有内容"的根因），几何小三角在雅黑里的覆盖残缺，
+            // 逐个试字形不可持续——线段 Path 与字体无关，实测可靠
+            let (icon_rect, icon_resp) =
+                ui.allocate_exact_size(egui::vec2(20.0, 18.0), egui::Sense::click());
+            let icon_visuals = ui.style().interact(&icon_resp);
+            if icon_resp.hovered() || icon_resp.has_focus() {
+                ui.painter().rect_filled(
+                    icon_rect.expand(2.0),
+                    3.0,
+                    icon_visuals.weak_bg_fill,
+                );
+            }
+            let openness = if console.collapsed { 0.0 } else { 1.0 };
+            crate::ui::chevron_icon(ui, openness, &icon_resp);
+            let toggle_label = if console.collapsed {
+                "展开控制台"
+            } else {
+                "折叠控制台"
+            };
+            let icon_resp = icon_resp.on_hover_text(if console.collapsed {
+                "展开输出区域"
+            } else {
+                "折叠输出区域，只留标题行（编辑步骤时不再被控制台占掉半屏）"
+            });
+            icon_resp.widget_info(|| {
+                egui::WidgetInfo::labeled(egui::Role::Button, true, toggle_label)
+            });
+            if icon_resp.clicked() {
                 console.collapsed = !console.collapsed;
             }
+            ui.strong("控制台输出");
             ui.checkbox(&mut console.auto_scroll, "自动滚动");
             if ui
                 .checkbox(&mut console.errors_only, "只看错误")

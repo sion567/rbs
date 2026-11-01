@@ -6,7 +6,7 @@
 
 use crate::transport::putty::{detect_putty_tools, PuttyDetection};
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -38,7 +38,7 @@ pub fn detect_async() -> std::sync::mpsc::Receiver<DetectionReport> {
 }
 
 pub fn detect_all() -> DetectionReport {
-    let tools = vec![
+    let mut tools = vec![
         detect_java(),
         detect_maven(),
         detect_gradle(),
@@ -48,8 +48,127 @@ pub fn detect_all() -> DetectionReport {
         detect_path_tool("kubectl", &["version", "--client"]),
         detect_path_tool("npm", &["-v"]),
     ];
+    // 第三方 CLI 工具（数据库客户端 / 压缩器）：常见安装目录 + PATH，
+    // 套件内多命令（mysql/mysqldump、psql/pg_dump）共用同一 bin 目录
+    tools.extend(detect_third_party());
     let putty = detect_putty_tools();
     DetectionReport { tools, putty }
+}
+
+// ---------------------------------------------------------------------------
+// 第三方 CLI 工具探测（mysql / pgsql / 7z，设计见 TODO「第三方工具管理」）
+// ---------------------------------------------------------------------------
+
+/// 从一组候选目录里找 exe（先到先得），探测版本并登记为工具。
+/// version_contains 非空时校验版本行确实属于该工具（防未知命令输出被当版本）。
+fn detect_from_dirs(
+    dirs: &[PathBuf],
+    name: &str,
+    exe: &str,
+    version_args: &[&str],
+    version_contains: &str,
+    source: &str,
+) -> Option<DetectedTool> {
+    for d in dirs {
+        let p = d.join(exe);
+        if !p.is_file() {
+            continue;
+        }
+        let command = p.to_string_lossy().to_string();
+        let version = probe(&command, version_args)
+            .filter(|line| version_contains.is_empty() || line.contains(version_contains));
+        return Some(DetectedTool {
+            name: name.to_string(),
+            ok: true,
+            version,
+            source: source.to_string(),
+            command,
+            version_check: Some(format!("{name} {}", version_args.join(" "))),
+        });
+    }
+    None
+}
+
+/// 版本号目录挑最新：先按解析出的数字排（10 > 9，避免字典序把 9.6 排在 16 后），
+/// 解析不出数字的退回字典序
+fn pick_newest_dir(mut dirs: Vec<PathBuf>) -> Option<PathBuf> {
+    dirs.sort_by_key(|d| {
+        let name = d.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        let numeric: Vec<u64> = name
+            .split(|c: char| !c.is_ascii_digit())
+            .filter(|s| !s.is_empty())
+            .filter_map(|s| s.parse().ok())
+            .collect();
+        (numeric, name)
+    });
+    dirs.pop()
+}
+
+fn detect_third_party() -> Vec<DetectedTool> {
+    let mut out = Vec::new();
+
+    // ── MySQL 套件：mysql + mysqldump 同 bin 目录 ──
+    let mut mysql_dirs: Vec<PathBuf> = glob::glob("C:/Program Files/MySQL/MySQL Server */bin")
+        .map(|it| it.flatten().filter(|p| p.is_dir()).collect())
+        .unwrap_or_default();
+    if let Some(d) = find_in_path("mysql.exe").and_then(|p| p.parent().map(Path::to_path_buf)) {
+        mysql_dirs.push(d);
+    }
+    if let Some(dir) = pick_newest_dir(mysql_dirs) {
+        let source = format!("MySQL 安装目录: {}", dir.display());
+        for (name, exe, args) in [
+            ("mysql", "mysql.exe", &["--version"][..]),
+            ("mysqldump", "mysqldump.exe", &["--version"][..]),
+        ] {
+            if let Some(t) = detect_from_dirs(&[dir.clone()], name, exe, args, "mysql", &source) {
+                out.push(t);
+            }
+        }
+    }
+
+    // ── PostgreSQL 套件：psql + pg_dump 同 bin 目录 ──
+    let mut pg_dirs: Vec<PathBuf> = glob::glob("C:/Program Files/PostgreSQL/*/bin")
+        .map(|it| it.flatten().filter(|p| p.is_dir()).collect())
+        .unwrap_or_default();
+    if let Some(d) = find_in_path("psql.exe").and_then(|p| p.parent().map(Path::to_path_buf)) {
+        pg_dirs.push(d);
+    }
+    if let Some(dir) = pick_newest_dir(pg_dirs) {
+        let source = format!("PostgreSQL 安装目录: {}", dir.display());
+        for (name, exe, args) in [
+            ("psql", "psql.exe", &["--version"][..]),
+            ("pg_dump", "pg_dump.exe", &["--version"][..]),
+            ("pg_restore", "pg_restore.exe", &["--version"][..]),
+        ] {
+            if let Some(t) = detect_from_dirs(&[dir.clone()], name, exe, args, "PostgreSQL", &source)
+            {
+                out.push(t);
+            }
+        }
+    }
+
+    // ── 7-Zip：默认安装目录（新老两个位置）+ PATH ──
+    let mut sevenz_dirs: Vec<PathBuf> = ["C:/Program Files/7-Zip", "C:/Program Files (x86)/7-Zip"]
+        .iter()
+        .map(PathBuf::from)
+        .collect();
+    if let Some(p) = find_in_path("7z.exe") {
+        if let Some(d) = p.parent() {
+            sevenz_dirs.insert(0, d.to_path_buf()); // PATH 优先（用户可能用绿色版/新版）
+        }
+    }
+    if let Some(t) = detect_from_dirs(
+        &sevenz_dirs,
+        "7z",
+        "7z.exe",
+        &["i"],
+        "7-Zip",
+        "7-Zip 安装目录 / PATH",
+    ) {
+        out.push(t);
+    }
+
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -229,7 +348,7 @@ pub fn run_version_check_for_tool(check: &str, tool: &crate::models::Tool) -> Op
 }
 
 /// 带超时地运行版本命令，取第一条非空输出行（java -version 输出在 stderr，一并考虑）
-fn probe(exe: &str, args: &[&str]) -> Option<String> {
+pub(crate) fn probe(exe: &str, args: &[&str]) -> Option<String> {
     probe_with(exe, args, &Default::default())
 }
 

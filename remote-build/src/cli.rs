@@ -52,13 +52,14 @@ fn print_help() {
     println!(
         "用法:\n  \
          remote-build                                  启动图形界面\n  \
-         remote-build set-password <目标名> <密码>     写入系统凭据管理器（不落盘）\n  \
+         remote-build set-password <凭据键> <密码>     写入系统凭据管理器（不落盘；\n  \
+                                                        键 = SSH 目标名或 secret_env 用的 db/prod-mysql）\n  \
          remote-build test-conn <目标名>               SSH 连接测试\n  \
          remote-build run <项目名> <流程名> [--yes]    无头执行一条流程（--yes 跳过确认门）\n  \
          remote-build run-group <项目名> <组名> [--yes] [--from <流程名>]\n  \
          [...]                                         组运行：组内流程串行·失败即停（--from 从指定流程续跑）\n  \
          remote-build preview <项目名> <流程名>        干跑预览（展示解析后的命令，不执行）\n  \
-         remote-build regen-example                   重新生成示范工程 example（覆盖四本合集 yaml）"
+         remote-build regen-example                   重新生成示范工程 example（覆盖五本合集 yaml）"
     );
 }
 
@@ -66,7 +67,7 @@ fn print_help() {
 fn regen_example() {
     match config::create_example_project() {
         Ok(()) => println!(
-            "✅ 已重新生成示范工程: {}（git / build / linux / deploy 四本合集）",
+            "✅ 已重新生成示范工程: {}（git / build / linux / deploy / db 五本合集）",
             config::projects_dir().join("example").display()
         ),
         Err(e) => {
@@ -78,7 +79,8 @@ fn regen_example() {
 
 fn set_password(args: &[String]) {
     if args.len() != 2 {
-        eprintln!("用法: remote-build set-password <目标名> <密码>");
+        eprintln!("用法: remote-build set-password <凭据键> <密码>");
+        eprintln!("     键 = SSH 目标名，或步骤 secret_env 用的凭据键（如 db/prod-mysql）");
         std::process::exit(2);
     }
     match crate::secrets::set_password(&args[0], &args[1]) {
@@ -288,7 +290,8 @@ fn print_cli_event(ev: &LogEvent) {
         LogEvent::JobEnd { .. } => {}
         // 组运行边界（run-group）
         LogEvent::GroupJobBegin { job, index, total, .. } => {
-            println!("──── 组运行 {index}/{total} ── 启动流程 {job} ────")
+            // index 0 起：展示 +1（与 GUI 状态栏/控制台同口径）
+            println!("──── 组运行 {}/{total} ── 启动流程 {job} ────", index + 1)
         }
         LogEvent::GroupJobEnd { job, status, duration_ms, .. } => {
             println!("──── 组流程 {job}: {}（{duration_ms}ms）────", status.short())
@@ -563,6 +566,9 @@ fn preview(args: &[String]) {
             }
             if !p.notify.is_empty() {
                 println!("    ⇮ notify: {}", p.notify.join(","));
+            }
+            for (env_name, cred_key) in &p.secret_env {
+                println!("    🔒 {env_name} ← 凭据 {cred_key}（运行时取自凭据管理器）");
             }
             if let Some(w) = &p.wait_note {
                 println!("    ⏲ 探测: {w}");

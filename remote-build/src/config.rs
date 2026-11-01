@@ -100,7 +100,7 @@ pub fn first_run_generate(report: &DetectionReport) -> Result<()> {
         save_global(&default_global())?;
     }
 
-    // 示范项目：四本合集演示各类步骤用法
+    // 示范项目：五本合集演示各类步骤用法
     create_example_project()?;
     Ok(())
 }
@@ -148,6 +148,9 @@ pub fn merge_detection(report: &DetectionReport) -> Result<usize> {
             });
         entry.command = report.putty.pscp.to_string_lossy().to_string();
         entry.version = report.putty.version.clone();
+        // 套件版本验证 = plink -V（putty.exe 是 GUI 程序打不了 stdout；
+        // plink 完整路径经 command 所在目录解析，安装器默认不进 PATH 也能验）
+        entry.version_check = Some("plink -V".to_string());
         entry.detected_from = Some(report.putty.source.clone());
         count += 1;
     } else {
@@ -323,7 +326,7 @@ fn demo_step(name: &str, command: &str) -> Step {
     }
 }
 
-/// 生成示范工程 example：四本合集（Git / 构建 / Linux 远端 / 发布），
+/// 生成示范工程 example：五本合集（Git / 构建 / Linux 远端 / 发布 / 数据库），
 /// 覆盖几乎全部步骤特性——目的不是执行，是当活文档：每本都能直接点
 /// 「👁 预览」看变量解析 / 条件 / 守卫 / 上传清单的全貌。
 /// 远端合集使用占位目标 demo-server（192.0.2.10 是文档保留地址，永不连通），
@@ -369,6 +372,12 @@ pub fn create_example_project() -> Result<()> {
                         ("REGISTRY".to_string(), "registry-staging.internal:5000".to_string()),
                         ("NAMESPACE".to_string(), "demo-staging".to_string()),
                         ("APP_NAME".to_string(), "demo-app".to_string()),
+                        // 数据库连接信息（⑤ 数据库与压缩合集用；密码勿入变量——见该合集描述）
+                        ("DB_HOST".to_string(), "127.0.0.1".to_string()),
+                        ("DB_PORT".to_string(), "3306".to_string()),
+                        ("DB_PG_PORT".to_string(), "5432".to_string()),
+                        ("DB_USER".to_string(), "root".to_string()),
+                        ("DB_NAME".to_string(), "demo-app".to_string()),
                     ]
                     .into_iter()
                     .collect(),
@@ -381,6 +390,11 @@ pub fn create_example_project() -> Result<()> {
                         ("REGISTRY".to_string(), "registry.internal:5000".to_string()),
                         ("NAMESPACE".to_string(), "demo-prod".to_string()),
                         ("APP_NAME".to_string(), "demo-app".to_string()),
+                        ("DB_HOST".to_string(), "127.0.0.1".to_string()),
+                        ("DB_PORT".to_string(), "3306".to_string()),
+                        ("DB_PG_PORT".to_string(), "5432".to_string()),
+                        ("DB_USER".to_string(), "root".to_string()),
+                        ("DB_NAME".to_string(), "demo-app".to_string()),
                     ]
                     .into_iter()
                     .collect(),
@@ -397,9 +411,14 @@ pub fn create_example_project() -> Result<()> {
             "② 构建合集".to_string(),
             "③ Linux 远端合集".to_string(),
             "④ 发布合集".to_string(),
+            "⑤ 数据库与压缩合集".to_string(),
         ],
-        // 分组演示：本地构建 / 远端发布 各放两本
-        groups: vec!["本地构建".to_string(), "远端发布".to_string()],
+        // 分组演示：本地构建 / 远端发布 各放两本；数据库运维独立成组
+        groups: vec![
+            "本地构建".to_string(),
+            "远端发布".to_string(),
+            "数据库运维".to_string(),
+        ],
         targets,
     };
     crate::storage::files::save_yaml(&dir.join("project.yaml"), &project)?;
@@ -456,6 +475,13 @@ pub fn create_example_project() -> Result<()> {
                 ..demo_step("生成版本号（outputs：正则捕获 stdout）", "cmd /C echo TAG=v1.0.1")
             },
             demo_step("引用上一步捕获的变量", "echo 本次版本 = ${{ env.TAG }}"),
+            Step {
+                condition: Some("${{ env.TAG == '' }}".to_string()),
+                ..demo_step(
+                    "空判断示例（== ''：TAG 为空才执行；本流程 TAG 已产出 → 演示跳过）",
+                    "echo TAG 尚未产出，使用默认版本 v0.0.0",
+                )
+            },
             demo_step(
                 "产出变量写法二：workspace/.env 约定（KEY=VALUE 行，步骤成功后引擎自动捕获）",
                 "cmd /C echo CHANNEL=nightly 1> .env",
@@ -822,11 +848,71 @@ pub fn create_example_project() -> Result<()> {
         ..Default::default()
     };
 
+    // ── ⑤ 数据库与压缩合集：第三方 CLI 工具（mysqldump / pg_dump / 7z）的活文档 ──
+    // 连接信息走变量组（不写死在命令里）；密码走 secret_env 凭据注入——运行时从
+    // Windows Credential Manager 取值，不进命令行、不落 YAML。
+    // 先存密码：remote-build set-password db/demo-mysql <密码>（pg 同理 db/demo-pg）。
+    // 工具未安装时运行自检零步失败 + 人话（在 ⚙ 设置 → 🔧 工具管理 配路径或重新探测）
+    let db_job = Job {
+        name: "⑤ 数据库与压缩合集".to_string(),
+        project: "example".to_string(),
+        description: Some(
+            "演示：第三方 CLI 工具绑定（mysqldump / pg_dump / 7z）、连接信息走变量组、\n\
+             secret_env 凭据注入（密码不进命令行 / 不落 YAML）、now 时间戳备份文件名。\n\
+             先存密码：remote-build set-password db/demo-mysql <密码>（pg 同理 db/demo-pg）。\n\
+             工具未装时运行自检会零步失败并给出配置指引"
+                .to_string(),
+        ),
+        target: Some("local".to_string()),
+        environment: Some("staging".to_string()),
+        steps: vec![
+            demo_step(
+                "准备备份目录",
+                "cmd /C if not exist backup mkdir backup",
+            ),
+            Step {
+                tool: "mysqldump".to_string(),
+                secret_env: [("MYSQL_PWD".to_string(), "db/demo-mysql".to_string())]
+                    .into_iter()
+                    .collect(),
+                retry: Some(RetryConfig { max_attempts: 2, backoff_seconds: 5 }),
+                ..demo_step(
+                    "MySQL 全量备份（--single-transaction 不锁表；密码经凭据注入 MYSQL_PWD）",
+                    "mysqldump -h ${{ variables.DB_HOST }} -P ${{ variables.DB_PORT }} \
+                     -u ${{ variables.DB_USER }} --single-transaction ${{ variables.DB_NAME }} \
+                     > backup/mysql-${{ now.date }}.sql",
+                )
+            },
+            Step {
+                tool: "pg_dump".to_string(),
+                secret_env: [("PGPASSWORD".to_string(), "db/demo-pg".to_string())]
+                    .into_iter()
+                    .collect(),
+                retry: Some(RetryConfig { max_attempts: 2, backoff_seconds: 5 }),
+                ..demo_step(
+                    "PostgreSQL 备份（密码经凭据注入 PGPASSWORD）",
+                    "pg_dump -h ${{ variables.DB_HOST }} -p ${{ variables.DB_PG_PORT }} \
+                     -U ${{ variables.DB_USER }} -f backup/pg-${{ now.date }}.sql ${{ variables.DB_NAME }}",
+                )
+            },
+            Step {
+                tool: "7z".to_string(),
+                ..demo_step(
+                    "7z 压缩备份（更高压缩率 / 加密 -p；内置 pack 已覆盖 zip / tar.gz 零依赖场景）",
+                    "7z a -t7z backup/db-${{ now.date }}.7z backup/*.sql",
+                )
+            },
+        ],
+        group: Some("数据库运维".to_string()),
+        ..Default::default()
+    };
+
     for (file, job) in [
         ("git.yaml", git_job),
         ("build.yaml", build_job),
         ("linux.yaml", linux_job),
         ("deploy.yaml", deploy_job),
+        ("db.yaml", db_job),
     ] {
         crate::storage::files::save_yaml(&dir.join("jobs").join(file), &job)?;
     }
@@ -912,7 +998,7 @@ mod tests {
             .expect("应能按原名发现流程");
         assert_eq!(je.path.file_name().unwrap(), "deploy-dev_h5.yaml");
 
-        // ── 示范工程：四本合集生成、可解析、能被发现 ──
+        // ── 示范工程：五本合集生成、可解析、能被发现 ──
         create_example_project().unwrap();
         let ex_dir = projects_dir().join("example");
         let p: Project =
@@ -920,18 +1006,28 @@ mod tests {
         assert!(p.targets.contains_key("local"));
         assert!(p.targets.contains_key("demo-server"), "远端合集占位目标");
         let mut names = Vec::new();
-        for f in ["git.yaml", "build.yaml", "linux.yaml", "deploy.yaml"] {
+        for f in ["git.yaml", "build.yaml", "linux.yaml", "deploy.yaml", "db.yaml"] {
             let j: Job = crate::storage::files::load_yaml(&ex_dir.join("jobs").join(f)).unwrap();
             assert!(!j.steps.is_empty(), "{f} 应有示范步骤");
             names.push(j.name);
         }
         assert_eq!(p.jobs, names, "project.yaml 的 jobs 列表与合集文件一致");
-        // 分组演示：git/build → 本地构建；linux/deploy → 远端发布（YAML 往返保真）
-        assert_eq!(p.groups, vec!["本地构建".to_string(), "远端发布".to_string()]);
+        // 分组演示：git/build → 本地构建；linux/deploy → 远端发布；db → 数据库运维（YAML 往返保真）
+        assert_eq!(
+            p.groups,
+            vec![
+                "本地构建".to_string(),
+                "远端发布".to_string(),
+                "数据库运维".to_string()
+            ]
+        );
         let g: Job = crate::storage::files::load_yaml(&ex_dir.join("jobs").join("git.yaml")).unwrap();
         assert_eq!(g.group.as_deref(), Some("本地构建"));
         let d: Job = crate::storage::files::load_yaml(&ex_dir.join("jobs").join("deploy.yaml")).unwrap();
         assert_eq!(d.group.as_deref(), Some("远端发布"));
+        let db: Job = crate::storage::files::load_yaml(&ex_dir.join("jobs").join("db.yaml")).unwrap();
+        assert_eq!(db.group.as_deref(), Some("数据库运维"));
+        assert_eq!(db.steps[1].tool, "mysqldump", "第三方 CLI 工具绑定演示");
 
         // 干跑预览 Linux 合集：占位目标/变量应全部解析（无「未定义」警告），
         // upload 相对路径应拼上 demo-server 的 work_root /opt/demo

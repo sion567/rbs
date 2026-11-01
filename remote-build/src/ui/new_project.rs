@@ -101,6 +101,7 @@ pub fn show(ctx: &egui::Context, main: &mut MainState) {
     }
 
     crate::ui::centered_window(egui::Window::new("＋ 新建项目"), ctx)
+    .collapsible(false)
         .open(&mut open)
         .order(egui::Order::Foreground)
         .default_width(600.0)
@@ -126,11 +127,23 @@ pub fn show(ctx: &egui::Context, main: &mut MainState) {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 ui.label("项目名称:");
-                ui.add(
+                let name_resp = ui.add(
                     egui::TextEdit::singleline(&mut main.new_project.project_name)
                         .desired_width(crate::ui::input::MED),
                 );
                 ui.weak("（配置将创建在 ~/.remote-build/projects/<项目名>/ 下）");
+                // 项目名变化时联动补默认克隆目录（仅在目标目录还空着时；
+                // 已手动填过 / URL 已推导过的值不覆盖）。Git 模式专属：本地模式无此字段
+                if name_resp.changed()
+                    && main.new_project.kind == SourceKind::Git
+                    && main.new_project.git_target.trim().is_empty()
+                {
+                    let name = sanitize_name(main.new_project.project_name.trim());
+                    if !name.is_empty() {
+                        main.new_project.git_target =
+                            crate::config::default_clone_target(&name).to_string_lossy().to_string();
+                    }
+                }
             });
 
             ui.add_space(10.0);
@@ -242,9 +255,21 @@ fn git_form(ui: &mut egui::Ui, main: &mut MainState) {
 
             ui.label("目标目录:");
             ui.horizontal(|ui| {
+                // 默认下载地址随项目名实时显示在输入框内（像本地目录模式的提示一样）；
+                // 真值会在输入仓库地址 / 项目名时自动填充，留空提示只作预告
+                let name = sanitize_name(main.new_project.project_name.trim());
+                let hint = if name.is_empty() {
+                    "留空 = ~/.remote-build/workspace/<项目名>".to_string()
+                } else {
+                    format!(
+                        "留空 = {}",
+                        crate::config::default_clone_target(&name).to_string_lossy()
+                    )
+                };
                 ui.add(
                     egui::TextEdit::singleline(&mut main.new_project.git_target)
-                        .desired_width(crate::ui::input::LONG),
+                        .desired_width(crate::ui::input::LONG)
+                        .hint_text(hint),
                 );
                 if ui.small_button("📂").clicked() {
                     // 起点 = 输入框当前路径（所有浏览按钮统一约定）

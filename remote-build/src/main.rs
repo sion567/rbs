@@ -17,6 +17,8 @@ mod secrets;
 mod storage;
 mod transport;
 mod ui;
+#[cfg(test)]
+mod ui_snapshots;
 mod variables;
 mod version;
 

@@ -116,7 +116,6 @@ fn scope_map_ref(main: &MainState) -> Option<&std::collections::HashMap<String, 
 pub enum SettingsTab {
     #[default]
     Tools,
-    Putty,
     Global,
     History,
 }
@@ -204,29 +203,28 @@ pub fn show(ctx: &egui::Context, main: &mut MainState) {
         crate::ui::modal_backdrop(ctx, "mask_settings");
     }
     crate::ui::centered_window(egui::Window::new("⚙ 设置"), ctx)
+    .collapsible(false)
         .open(&mut open)
         .order(egui::Order::Foreground)
         .default_width(780.0)
         .default_height(560.0)
         .show(ctx, |ui| {
-            // ── 窗口级 tab：工具管理 / PuTTY / 全局配置 / 运行历史 ──
+            // ── 窗口级 tab：工具管理 / 全局配置 / 运行历史 ──
+            //（PuTTY 不再单开 tab：套件目录配置并入工具管理的 putty 条目表单）
             let tab_idx = match main.settings_tab {
                 SettingsTab::Tools => 0,
-                SettingsTab::Putty => 1,
-                SettingsTab::Global => 2,
-                SettingsTab::History => 3,
+                SettingsTab::Global => 1,
+                SettingsTab::History => 2,
             };
             let section_tabs = vec![
-                "🧰 工具管理".to_string(),
-                "🔌 PuTTY".to_string(),
+                "🔧 工具管理".to_string(),
                 "⚙ 全局配置".to_string(),
                 "🕘 运行历史".to_string(),
             ];
-            if let Some(i) = tab_row(ui, &section_tabs, tab_idx, &[true, true, true, true]) {
+            if let Some(i) = tab_row(ui, &section_tabs, tab_idx, &[true, true, true]) {
                 main.settings_tab = match i {
-                    1 => SettingsTab::Putty,
-                    2 => SettingsTab::Global,
-                    3 => SettingsTab::History,
+                    1 => SettingsTab::Global,
+                    2 => SettingsTab::History,
                     _ => SettingsTab::Tools,
                 };
             }
@@ -296,7 +294,6 @@ pub fn show(ctx: &egui::Context, main: &mut MainState) {
                     ui.add_space(4.0);
                     tool_editor(ui, main);
                 }
-                SettingsTab::Putty => putty_section(ui, &mut main.global),
                 SettingsTab::Global => global_section(ctx, ui, main),
                 SettingsTab::History => history_section(ui, main),
             }
@@ -326,6 +323,19 @@ const TOOL_PRESETS: &[(&str, &str)] = &[
     ("gradle", "gradle -v"),
     ("maven", "mvn -v"),
     ("git", "git --version"),
+    // 数据库客户端（备份 / 迁移：mysqldump / pg_dump 等裸名命令经工具 PATH 解析）
+    ("mysql", "mysql --version"),
+    ("mysqldump", "mysqldump --version"),
+    ("psql", "psql --version"),
+    ("pg_dump", "pg_dump --version"),
+    ("pg_restore", "pg_restore --version"),
+    // 压缩 / 其他常用 CLI
+    ("7z", "7z i"),
+    ("sqlite3", "sqlite3 --version"),
+    ("redis-cli", "redis-cli --version"),
+    // putty 是套件（plink + pscp）：预设给裸名入口，选中条目后用专用表单配套件目录
+    // （传输层直接读探测结果，preset 条目会在重新探测时自动更新为真实路径）
+    ("putty", "plink -V"),
 ];
 
 fn tool_editor(ui: &mut egui::Ui, main: &mut MainState) {
@@ -334,42 +344,67 @@ fn tool_editor(ui: &mut egui::Ui, main: &mut MainState) {
         .unwrap_or_default();
     names.sort();
 
-    ui.columns(2, |columns| {
-        columns[0].set_min_width(160.0);
-        egui::ScrollArea::vertical()
-            .id_salt("tool_list")
-            .max_height(240.0)
-            .show(&mut columns[0], |ui| {
-                for name in &names {
-                    let sel =
-                        main.tool_editor.selected.as_deref() == Some(name.as_str());
-                    // 「最近验证」标记：本会话验证过的工具带 ✓/✗（运行期引擎自检的
-                    // 手动对应物；悬停看验证输出详情）
-                    let mut text = name.clone();
-                    if let Some((ok, _)) = main.tool_editor.verify_results.get(name) {
-                        text.push_str(if *ok { " ✓" } else { " ✗" });
-                    }
-                    let mut resp = ui.selectable_label(sel, egui::RichText::new(&text));
-                    if let Some((_, msg)) = main.tool_editor.verify_results.get(name) {
-                        resp = resp.on_hover_text(format!("最近验证：{msg}"));
-                    }
-                    if resp.clicked() {
-                        main.tool_editor.selected = Some(name.clone());
-                        load_buffers(main, name);
-                        main.tool_editor.verify = None;
-                    }
-                }
-                if names.is_empty() {
-                    ui.weak("（空，点下方「＋ 添加」或「＋ 常用工具…」）");
-                }
-            });
+    // 2:8 布局：工具名不长，左窄列足够；右侧表单（command 路径、env 多行）需要宽度。
+    // 与 🎯 目标管理的分栏同款（ui.columns 只会 1:1 均分，此处手动分配）
+    let total = ui.available_width();
+    let spacing = ui.spacing().item_spacing.x;
+    let left_w = ((total - spacing) * 0.2).clamp(150.0, 220.0);
+    let right_w = (total - spacing - left_w).max(200.0);
+    ui.horizontal(|ui| {
+        // 必须用 allocate_ui_with_layout 显式传 top_down 布局：allocate_ui 会继承
+        // 外层 ui.horizontal 的横向布局（egui 0.37），工具名列表被横排成一行
+        // （targets 分栏同款问题与修法）
+        ui.allocate_ui_with_layout(
+            egui::vec2(left_w, 240.0),
+            egui::Layout::top_down_justified(egui::Align::LEFT),
+            |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("tool_list")
+                    .max_height(240.0)
+                    .show(ui, |ui| {
+                        for name in &names {
+                            let sel =
+                                main.tool_editor.selected.as_deref() == Some(name.as_str());
+                            // 「最近验证」标记：本会话验证过的工具带 ✓/✗（运行期引擎自检的
+                            // 手动对应物；悬停看验证输出详情）
+                            let mut text = name.clone();
+                            if let Some((ok, _)) = main.tool_editor.verify_results.get(name) {
+                                text.push_str(if *ok { " ✓" } else { " ✗" });
+                            }
+                            // 长工具名截断 + 悬停看全（左列收窄后防折行把行高撑乱）
+                            let shown = crate::ui::truncate_label(&text, 18);
+                            let mut resp = ui.selectable_label(sel, egui::RichText::new(&shown));
+                            if shown != text {
+                                resp = resp.on_hover_text(&text);
+                            }
+                            if let Some((_, msg)) = main.tool_editor.verify_results.get(name) {
+                                resp = resp.on_hover_text(format!("最近验证：{msg}"));
+                            }
+                            if resp.clicked() {
+                                main.tool_editor.selected = Some(name.clone());
+                                load_buffers(main, name);
+                                main.tool_editor.verify = None;
+                            }
+                        }
+                        if names.is_empty() {
+                            ui.weak("（空，在下方添加）");
+                        }
+                    });
+            },
+        );
 
-        egui::ScrollArea::vertical()
-            .id_salt("tool_form")
-            .max_height(240.0)
-            .show(&mut columns[1], |ui| {
-                edit_form(ui, main);
-            });
+        ui.allocate_ui_with_layout(
+            egui::vec2(right_w, 240.0),
+            egui::Layout::top_down_justified(egui::Align::LEFT),
+            |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("tool_form")
+                    .max_height(240.0)
+                    .show(ui, |ui| {
+                        edit_form(ui, main);
+                    });
+            },
+        );
     });
 
     ui.add_space(6.0);
@@ -494,6 +529,20 @@ fn edit_form(ui: &mut egui::Ui, main: &mut MainState) {
     };
     if !scope_map_ref(main).map(|m| m.contains_key(&selected)).unwrap_or(false) {
         main.tool_editor.selected = None;
+        return;
+    }
+
+    // putty 特例：它是"套件"不是单个命令行工具——传输层（plink / pscp）直接读取
+    // 套件目录的探测结果，通用 command / 版本字段对它无意义。原「🔌 PuTTY」tab
+    // 并入此处：选中 putty 条目即显示套件目录配置（原 tab 内容同款）。
+    // tools.yaml 的 putty 条目由探测自动生成 / 更新，仅供展示。
+    if selected == "putty" {
+        ui.weak(
+            "putty 是套件（plink + pscp + ...），传输层直接读取下方目录的探测结果；\
+             此条目由探测自动生成 / 更新，通用字段不生效。",
+        );
+        ui.add_space(4.0);
+        putty_section(ui, &mut main.global);
         return;
     }
 
@@ -624,7 +673,7 @@ fn option_text_row(
                 changed |= ui
                     .add(egui::TextEdit::singleline(v).desired_width(width))
                     .changed();
-                if ui.small_button("×").clicked() {
+                if ui.small_button("🗑").clicked() {
                     clear = true;
                 }
             });
@@ -679,6 +728,43 @@ fn start_verify(main: &mut MainState) {
     let Some(name) = main.tool_editor.selected.clone() else {
         return;
     };
+    // putty 特例：套件版本经探测到的 plink -V 验证，不走 version_check——
+    // putty.exe 本体是 GUI 程序（--version 弹窗、不往 stdout 打）；
+    // plink 在 PuTTY 安装器默认不进 PATH，裸名验证只会"无输出"，
+    // 必须用套件探测（自定义目录 → PATH → Program Files）拿到的完整路径
+    if name == "putty" {
+        let detection = crate::transport::putty::detect_putty_tools();
+        let result = if !detection.found {
+            Err(
+                "未找到 PuTTY 套件（自定义目录 / PATH / Program Files 均未命中）——\
+                 请先安装 PuTTY，或在此表单指定套件目录"
+                    .to_string(),
+            )
+        } else {
+            let plink = detection.plink.to_string_lossy().to_string();
+            match crate::env_detect::probe(&plink, &["-V"]) {
+                Some(line) => Ok(line),
+                None => Err(format!("plink -V 无输出（套件目录缺 plink.exe？）: {plink}")),
+            }
+        };
+        main.tool_editor.verify = Some(match &result {
+            Ok(line) => (true, line.clone()),
+            Err(msg) => (false, msg.clone()),
+        });
+        match result {
+            Ok(line) => {
+                main.tool_editor
+                    .verify_results
+                    .insert(name, (true, line));
+            }
+            Err(msg) => {
+                main.tool_editor
+                    .verify_results
+                    .insert(name, (false, msg));
+            }
+        }
+        return;
+    }
     let Some(check) = scope_map_ref(main)
         .and_then(|m| m.get(&name))
         .and_then(|t| t.version_check.clone())
@@ -730,7 +816,7 @@ fn putty_section(ui: &mut egui::Ui, global: &mut crate::models::GlobalConfig) {
                     )
                     .changed();
                 if ui
-                    .small_button("×")
+                    .small_button("🗑")
                     .on_hover_text("清除，恢复自动探测")
                     .clicked()
                 {
@@ -851,7 +937,7 @@ fn global_section(
             ui.end_row();
         });
     ui.weak(
-        "提示：PuTTY 自定义目录在「🔌 PuTTY」页设置（putty.custom_path）；\
+        "提示：PuTTY 自定义目录在「🔧 工具管理」选中 putty 条目后设置（putty.custom_path）；\
          tools.yaml 的 putty 条目由探测自动生成，仅供展示。控制台配色跟随主题（深浅两套色板各自调校）。",
     );
 
@@ -860,23 +946,25 @@ fn global_section(
     ui.heading("示范工程");
     ui.horizontal(|ui| {
         if ui
-            .button("重新生成 example（四本示范合集）")
+            .button("重新生成 example（五本示范合集）")
             .on_hover_text(
-                "覆盖 projects/example 下的 project.yaml 与 git/build/linux/deploy 四本合集 yaml。\n\
+                "覆盖 projects/example 下的 project.yaml 与 git/build/linux/deploy/db 五本合集 yaml。\n\
                  只影响示范工程，你自己的项目不动",
             )
             .clicked()
         {
             match crate::config::create_example_project() {
                 Ok(()) => {
-                    main.status_msg =
-                        Some("示范工程已重新生成（Git / 构建 / Linux / 发布 四本合集）".to_string());
+                    main.status_msg = Some(
+                        "示范工程已重新生成（Git / 构建 / Linux / 发布 / 数据库 五本合集）"
+                            .to_string(),
+                    );
                     main.reload();
                 }
                 Err(e) => main.status_msg = Some(format!("重新生成失败: {e}")),
             }
         }
-        ui.weak("Git / 构建 / Linux 远端 / 发布 四本合集，点「👁 预览」当活文档看");
+        ui.weak("Git / 构建 / Linux 远端 / 发布 / 数据库 五本合集，点「👁 预览」当活文档看");
     });
 }
 

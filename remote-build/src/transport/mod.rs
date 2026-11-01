@@ -183,7 +183,7 @@ pub fn make_transport(target: Option<&Target>) -> anyhow::Result<std::sync::Arc<
                         anyhow::bail!(
                             "目标「{}」选择 putty 传输，但未找到 PuTTY（plink/pscp）。\
                              请安装 PuTTY（安装目录通常在 Program Files、安装器会加入 PATH），\
-                             或在 ⚙ 设置的「PuTTY 目录」指定安装位置；\
+                             或在 ⚙ 设置 → 🔧 工具管理选中 putty 指定套件目录；\
                              也可以在目标编辑器把「传输」切换为 russh（免装套件）",
                             t.name
                         );
