@@ -1441,7 +1441,11 @@ fn edit_step(
                             .suffix("s")
                             .speed(1.0)
                             .clip_text(true)
-                            .min_size(egui::vec2(64.0, 0.0)),
+                            .min_size(egui::vec2(64.0, 0.0))
+                            // 无符号数拖到 0 以下会回绕成 u64::MAX（真实发生过：
+                            // yaml 里写出 timeout: 18446744073709551615），
+                            // 上限 30 天足够任何构建，0 = 不限时
+                            .range(0..=2_592_000),
                     );
                     t_resp.on_hover_text(
                         "秒。填 0 = 本步不限时（跑多久都行，仍受流程级总超时约束）；\n\
