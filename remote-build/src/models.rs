@@ -109,7 +109,7 @@ pub struct Job {
     pub target: Option<String>,
     /// 默认环境（staging / prod），决定变量替换
     pub environment: Option<String>,
-    /// 整个 job 超时（秒）
+    /// 整个 job 超时（秒）；0 / 不填 = 不限时（步骤级 timeout: 0 同语义）
     pub timeout: Option<u64>,
     /// 人工确认门（GHA environment protection 思路）：执行前要求输入该确认词才放行，
     /// 防手滑上生产。例：confirm: prod —— 运行时弹窗输入 prod 才开始。
@@ -178,7 +178,8 @@ pub struct Step {
     pub step_type: StepType,
     pub enabled: bool,
     pub continue_on_error: bool,
-    /// 单步超时（秒），默认 300
+    /// 单步超时（秒）：不填 = 全局 default_timeout（config.yaml，缺省 600）；
+    /// 填 0 = 本步不限时（仍受作业级 timeout 掐顶）
     pub timeout: Option<u64>,
     pub retry: Option<RetryConfig>,
     /// 相对 project.local_path 的子目录

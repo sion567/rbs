@@ -410,13 +410,13 @@ fn start_clone(main: &mut MainState, name: String) -> bool {
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| "git".to_string());
 
-    let full_url = build_url_with_creds(
-        &url,
-        main.new_project.git_user.trim(),
-        &main.new_project.git_password,
-    );
+    // 密码必须裁掉首尾空白：egui 单行输入框粘贴时会把换行替换成空格
+    // （builder.rs insert_replacing_selection 的 replace(['\r','\n'], " ")），
+    // 从网页/密码管理器复制的密码常带尾部换行，不裁剪会以 %20 进 URL，
+    // 远端收到"密码+空格"报认证失败（账号此前已 trim，密码漏了）。
+    let password = main.new_project.git_password.trim().to_string();
+    let full_url = build_url_with_creds(&url, main.new_project.git_user.trim(), &password);
     let branch = main.new_project.git_branch.trim().to_string();
-    let password = main.new_project.git_password.clone();
 
     let (tx, rx) = std::sync::mpsc::channel();
     let progress: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
@@ -600,8 +600,12 @@ pub fn derive_name_from_url(url: &str) -> String {
     sanitize_name(last.trim_end_matches(".git"))
 }
 
-/// https URL 内嵌凭证（仅用于本次 clone，不落盘）；ssh 等其他形式原样返回
+/// https URL 内嵌凭证（仅用于本次 clone，不落盘）；ssh 等其他形式原样返回。
+/// 账号密码先去首尾空白（粘贴带出的换行→空格、IME 全角空格等，见 start_clone）；
+/// 密码内部空格保留，仍会正常编码。
 fn build_url_with_creds(url: &str, user: &str, password: &str) -> String {
+    let user = user.trim();
+    let password = password.trim();
     if user.is_empty() && password.is_empty() {
         return url.to_string();
     }
@@ -656,6 +660,13 @@ mod tests {
         );
         // 凭证为空原样返回
         assert_eq!(build_url_with_creds("https://x/y.git", "", ""), "https://x/y.git");
+        // 首尾空白（粘贴换行被 egui 换成空格、IME 全角空格）不得进 URL
+        assert_eq!(
+            build_url_with_creds("https://git.internal/team/app.git", "dev", " pw \n"),
+            "https://dev:pw@git.internal/team/app.git"
+        );
+        // 密码仅含空白 → 视同未填凭证
+        assert_eq!(build_url_with_creds("https://x/y.git", "", "  "), "https://x/y.git");
         // ssh 形式忽略账号密码
         assert_eq!(
             build_url_with_creds("git@host:path/repo.git", "dev", "pw"),

@@ -585,11 +585,13 @@ fn edit_form(ui: &mut egui::Ui, main: &mut MainState) {
                                     main.target_editor.unsaved = true;
                                 }
                                 if ui.small_button("保存密码").clicked()
-                                    && !main.target_editor.password_buf.is_empty()
+                                    && !main.target_editor.password_buf.trim().is_empty()
                                 {
+                                    // 与克隆向导同理：egui 单行框粘贴时换行被替换成
+                                    // 空格，不裁剪会把"密码+空格"存进凭据库导致认证失败
                                     match crate::secrets::set_password(
                                         &cred_key,
-                                        &main.target_editor.password_buf,
+                                        main.target_editor.password_buf.trim(),
                                     ) {
                                         Ok(()) => {
                                             main.target_editor.password_saved = true;

@@ -93,8 +93,15 @@ pub fn show(main: &mut MainState, ui: &mut egui::Ui) {
                     && std::path::Path::new(&entry.project.local_path).join(".git").exists();
                 let name_shown = crate::ui::truncate_label(&entry.project.name, 14);
                 let badge = if is_git { " ⎇" } else { "" };
+                // 当前分支（reload 时缓存，git 项目才显示该行）
+                let branch_line = main
+                    .git_branches
+                    .get(&entry.project.name)
+                    .and_then(|b| b.as_ref())
+                    .map(|b| format!("\n当前分支：{b}"))
+                    .unwrap_or_default();
                 let hover = format!(
-                    "{}{}\n配置目录：{}\n代码目录：{}",
+                    "{}{}{branch_line}\n配置目录：{}\n代码目录：{}",
                     if is_git { "⎇ Git 仓库" } else { "本地目录" },
                     if entry.project.local_path.trim().is_empty() {
                         "（未配置代码目录）".to_string()

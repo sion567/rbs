@@ -492,6 +492,7 @@ pub fn show(main: &mut MainState, ui: &mut egui::Ui) {
                     running,
                     &target_names,
                     job_target_display.as_str(),
+                    main.global.default_timeout,
                     state,
                     dark,
                     timeline,
@@ -862,7 +863,7 @@ pub fn show_var_help_window(ctx: &egui::Context, main: &mut MainState) {
             ui.monospace("preconditions:           # 前置检查：发版机本地断言，失败零秒退出（只放检查，别放拉代码/构建等动作）");
             ui.monospace("  - check: java -version");
             ui.monospace("    message: JDK 未安装");
-            ui.monospace("timeout: 600             # 流程级总超时（秒）；步骤级用 step.timeout");
+            ui.monospace("timeout: 600             # 流程级总超时（秒；0/不填 = 不限时）；步骤级 timeout: 0 同为不限时");
             ui.monospace("working_dir: sub/dir     # 项目级默认工作目录（相对项目目录）");
             ui.monospace("tools_require:           # 工具版本要求（project.yaml，mise 风格）");
             ui.monospace("  java: \">=21\"           # >= > <= < 数字段比较；\"22\" 前缀匹配 22.x；\"22.1.3\" 精确");
@@ -1275,6 +1276,7 @@ fn edit_step(
     running: bool,
     target_names: &[String],
     job_target_display: &str,
+    default_timeout: u64,
     state: StepVisualState,
     dark: bool,
     timeline: Option<(u64, f32, u32)>,
@@ -1434,19 +1436,29 @@ fn edit_step(
                     ui.label("超时:");
                     // 定宽：DragValue 缺省按内容自适应，输入位数越多框越宽，
                     // 会把右侧「从此 / 仅此 / ↑ / 🗑」推出卡片可视区
-                    ui.add(
+                    let t_resp = ui.add(
                         egui::DragValue::new(v)
                             .suffix("s")
                             .speed(1.0)
                             .clip_text(true)
                             .min_size(egui::vec2(64.0, 0.0)),
                     );
+                    t_resp.on_hover_text(
+                        "秒。填 0 = 本步不限时（跑多久都行，仍受流程级总超时约束）；\n\
+                         🗑 删掉 = 用全局默认；\n\
+                         mvn 首次拉依赖这类慢步骤建议 1800",
+                    );
+                    if *v == 0 {
+                        ui.weak("（不限时）");
+                    }
                     if ui.small_button("🗑").clicked() {
                         step.timeout = None;
                     }
                 }
                 None => {
-                    ui.weak("超时:300s");
+                    // 真实生效值 = config.yaml default_timeout（此前写死 "300s"，
+                    // 与全局默认 600s 不符，有误导）
+                    ui.weak(format!("超时:默认{default_timeout}s"));
                     if ui.small_button("⏱").clicked() {
                         step.timeout = Some(300);
                     }
@@ -2011,6 +2023,7 @@ mod tests {
                         false,
                         &target_names,
                         "无",
+                        600,
                         StepVisualState::Idle,
                         true,
                         None,

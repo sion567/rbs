@@ -218,6 +218,7 @@ fn test_main_state() -> MainState {
         .collect(),
         projects: vec![],
         validation: Default::default(),
+        git_branches: Default::default(),
         selected_project: None,
         selected_job: None,
         console: Default::default(),

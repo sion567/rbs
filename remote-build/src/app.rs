@@ -155,6 +155,10 @@ pub struct MainState {
     /// 本地目录 + .git，每帧逐项目 stat 在网络盘 / 死路径上可阻塞数秒——
     /// 这正是「程序卡卡的」的经典根源。项目列表只在 reload 变化，缓存同步刷新
     pub validation: std::collections::HashMap<String, Vec<crate::models::ValidationIssue>>,
+    /// 项目当前 git 分支缓存（reload 时读一次 .git/HEAD，不派生 git 进程）：
+    /// 项目名 → 分支显示文本；None = 非仓库 / 读不到，树上悬停时不显示该行。
+    /// clone / 更新代码完成都会走 reload，分支随之刷新
+    pub git_branches: std::collections::HashMap<String, Option<String>>,
     pub selected_project: Option<usize>,
     pub selected_job: Option<usize>,
     pub console: ui::console::ConsoleState,
@@ -308,6 +312,7 @@ impl MainState {
             selected_job: None,
             console: Default::default(),
             validation: Default::default(),
+            git_branches: Default::default(),
             run: None,
             stop_requested: None,
             show_settings: false,
@@ -394,6 +399,21 @@ impl MainState {
             .projects
             .iter()
             .map(|e| (e.project.name.clone(), crate::config::validate_project(&e.project)))
+            .collect();
+        // 当前分支随 reload 刷新：clone / 更新代码完成都会走 reload；
+        // 与 validation 同理，不在悬停时每帧读 .git/HEAD
+        self.git_branches = self
+            .projects
+            .iter()
+            .map(|e| {
+                let local = e.project.local_path.trim().to_string();
+                let branch = if local.is_empty() {
+                    None
+                } else {
+                    crate::config::current_branch(std::path::Path::new(&local))
+                };
+                (e.project.name.clone(), branch)
+            })
             .collect();
 
         // 收缩选择到有效范围

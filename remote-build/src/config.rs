@@ -941,6 +941,37 @@ pub fn validate_project(project: &Project) -> Vec<ValidationIssue> {
     issues
 }
 
+/// 读仓库当前分支（供项目树悬停显示）：直接解析 `.git/HEAD`，不派生 git 进程——
+/// 悬停这类轻展示经不起子进程 + git 启动的开销。
+/// - 普通仓库：`.git/HEAD` = `ref: refs/heads/<分支>`
+/// - worktree：`.git` 是文件（`gitdir: <路径>`），顺着指向读真实目录的 HEAD
+/// - 游离 HEAD：HEAD 是裸哈希，返回短哈希提示
+/// - 读不到（非仓库 / 权限）返回 None
+pub fn current_branch(dir: &Path) -> Option<String> {
+    let dot_git = dir.join(".git");
+    let git_dir = if dot_git.is_dir() {
+        dot_git
+    } else {
+        let s = std::fs::read_to_string(&dot_git).ok()?;
+        let p = Path::new(s.trim().strip_prefix("gitdir:")?.trim());
+        // worktree 的 gitdir 可能是相对路径（相对 .git 文件所在目录）
+        if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            dir.join(p)
+        }
+    };
+    let head = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
+    let head = head.trim();
+    if let Some(branch) = head.strip_prefix("ref: refs/heads/") {
+        Some(branch.to_string())
+    } else if head.len() >= 7 && head.chars().all(|c| c.is_ascii_hexdigit()) {
+        Some(format!("（游离 HEAD {}）", &head[..7]))
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1098,5 +1129,50 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&tmp);
         std::env::remove_var("REMOTE_BUILD_HOME");
+    }
+
+    /// current_branch：普通仓库取分支名；游离 HEAD 取短哈希提示；
+    /// 非仓库返回 None。本机无 git 时只跑 None 分支。
+    #[test]
+    fn current_branch_reads_git_head() {
+        // 非仓库目录 → None
+        let tmp = std::env::temp_dir().join(format!("rbs_branch_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        assert_eq!(current_branch(&tmp), None);
+
+        if std::process::Command::new("git").arg("--version").output().is_err() {
+            let _ = std::fs::remove_dir_all(&tmp);
+            return;
+        }
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&tmp)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?} 失败: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-b", "main"]);
+        assert_eq!(current_branch(&tmp).as_deref(), Some("main"));
+
+        // 游离 HEAD：返回短哈希提示（含「游离」字样）
+        std::fs::write(tmp.join("a.txt"), "a").unwrap();
+        git(&["add", "."]);
+        git(&["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-m", "init"]);
+        git(&["checkout", "--detach"]);
+        let detached = current_branch(&tmp).unwrap();
+        assert!(detached.contains("游离"), "游离 HEAD 应有提示: {detached}");
+
+        // 造一个 worktree：.git 是文件（gitdir: …），也应能读到分支名
+        git(&["worktree", "add", "wt", "-b", "feature/wt"]);
+        let wt_branch = current_branch(&tmp.join("wt")).unwrap();
+        assert_eq!(wt_branch, "feature/wt");
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

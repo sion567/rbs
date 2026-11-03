@@ -866,8 +866,14 @@ async fn run_single_step(
                 std::sync::Arc::new(std::sync::Mutex::new(String::new()))
             });
 
-            let step_timeout =
-                Duration::from_secs(step.timeout.unwrap_or(default_step_timeout));
+            // timeout: Some(0) = 步骤级不限时（与作业级 0/不填同语义，0 曾是
+            // "立即超时"的死值，改为不限时后与 UI 提示一致）；None = 全局默认。
+            // 不限时步骤仍受作业级 deadline 掐顶（run_step_with_retry 取更早者）
+            let step_timeout = if step.timeout == Some(0) {
+                None
+            } else {
+                Some(Duration::from_secs(step.timeout.unwrap_or(default_step_timeout)))
+            };
             let result = run_step_with_retry(
                 &transport,
                 eff_target.as_ref(),
@@ -945,7 +951,7 @@ async fn run_step_with_retry(
     remote_dir: &str,
     env_map: &HashMap<String, String>,
     workspace: &Path,
-    step_timeout: Duration,
+    step_timeout: Option<Duration>,
     job_deadline: Option<tokio::time::Instant>,
     capture: Option<&std::sync::Arc<std::sync::Mutex<String>>>,
     wait: Option<&WaitProbe>,
@@ -985,18 +991,23 @@ async fn run_step_with_retry(
         );
 
         let result = {
-            let deadline = {
-                let d = tokio::time::Instant::now() + step_timeout;
-                match job_deadline {
-                    Some(jd) if jd < d => jd,
-                    _ => d,
-                }
+            // 步骤截止与作业截止取更早者；两者都无 = 真不限时（只受取消影响）
+            let step_deadline = step_timeout.map(|d| tokio::time::Instant::now() + d);
+            let deadline = match (step_deadline, job_deadline) {
+                (Some(d), Some(jd)) => Some(d.min(jd)),
+                (Some(d), None) | (None, Some(d)) => Some(d),
+                (None, None) => None,
             };
-            // deadline 是绝对时刻，tokio::time::timeout 需要 Duration
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            match tokio::time::timeout(remaining, fut).await {
-                Ok(inner) => inner,
-                Err(_) => return StepResult::Timeout,
+            match deadline {
+                Some(dl) => {
+                    // deadline 是绝对时刻，tokio::time::timeout 需要 Duration
+                    let remaining = dl.saturating_duration_since(tokio::time::Instant::now());
+                    match tokio::time::timeout(remaining, fut).await {
+                        Ok(inner) => inner,
+                        Err(_) => return StepResult::Timeout,
+                    }
+                }
+                None => fut.await,
             }
         };
 
@@ -2485,6 +2496,43 @@ mod tests {
         input.default_step_timeout = 1;
         let status = rt.block_on(engine.run_job(input, cancel_rx, tx));
         assert!(matches!(status, JobStatus::Timeout), "got: {status:?}");
+    }
+
+    #[test]
+    fn step_timeout_zero_is_unlimited() {
+        // timeout: Some(0) = 步骤级不限时（与作业级 0/不填语义对齐）：
+        // ① 步骤跑 ~2s、全局默认仅 1s → 不限时 ⇒ 成功（旧语义 Some(0)=立即超时，
+        //    本断言即回归锁，防止有人把 0 特判删掉回退成 Duration::ZERO）
+        // ② 不限时步骤 + 作业级 timeout: 1 → 仍被作业级掐住 ⇒ Timeout
+        let rt = runtime();
+        let engine = Engine;
+
+        {
+            let (tx, _rx) = mpsc::channel(1024);
+            let (_cancel_tx, cancel_rx) = broadcast::channel(4);
+            let mut s = exec_step("ping -n 3 127.0.0.1 > nul");
+            s.timeout = Some(0);
+            let mut input = simple_job(vec![s]);
+            input.default_step_timeout = 1;
+            let status = rt.block_on(engine.run_job(input, cancel_rx, tx));
+            assert!(
+                status.ok(),
+                "不限时步骤应成功（哪怕超过全局默认 1s）: {status:?}"
+            );
+        }
+        {
+            let (tx, _rx) = mpsc::channel(1024);
+            let (_cancel_tx, cancel_rx) = broadcast::channel(4);
+            let mut s = exec_step("ping -n 6 127.0.0.1 > nul");
+            s.timeout = Some(0); // 步骤不限时，超时必须来自 job 级
+            let mut input = simple_job(vec![s]);
+            input.job.timeout = Some(1);
+            let status = rt.block_on(engine.run_job(input, cancel_rx, tx));
+            assert!(
+                matches!(status, JobStatus::Timeout),
+                "作业级 deadline 仍应掐住不限时步骤: {status:?}"
+            );
+        }
     }
 
     #[test]
