@@ -11,6 +11,7 @@ mod env_detect;
 mod group;
 mod k8s;
 mod models;
+mod notify;
 mod pack;
 mod runlock;
 mod secrets;

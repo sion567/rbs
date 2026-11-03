@@ -941,6 +941,8 @@ fn global_section(
          tools.yaml 的 putty 条目由探测自动生成，仅供展示。控制台配色跟随主题（深浅两套色板各自调校）。",
     );
 
+    notify_section(ui, main);
+
     ui.add_space(8.0);
     ui.separator();
     ui.heading("示范工程");
@@ -966,6 +968,240 @@ fn global_section(
         }
         ui.weak("Git / 构建 / Linux 远端 / 发布 / 数据库 五本合集，点「👁 预览」当活文档看");
     });
+}
+
+// ---------------------------------------------------------------------------
+// 消息通知（Mattermost / 钉钉 / 邮箱）：全局触发开关 + 三渠道配置。
+// 凭据字段改动即写凭据管理器（不落 YAML）；「发送测试」同步实发一条。
+// ---------------------------------------------------------------------------
+
+fn notify_section(ui: &mut egui::Ui, main: &mut MainState) {
+    ui.add_space(8.0);
+    ui.separator();
+    ui.heading("消息通知（作业结束推送）");
+    let mut changed = false;
+    let mut test_msg: Option<String> = None;
+
+    {
+        let notify = &mut main.global.notify;
+        ui.horizontal(|ui| {
+            changed |= ui.checkbox(&mut notify.on_failure, "失败时推送").changed();
+            changed |= ui.checkbox(&mut notify.on_success, "成功时推送").changed();
+        });
+
+        // ── Mattermost：webhook URL 存凭据管理器（键 notify:mattermost）──
+        ui.add_space(4.0);
+        let mut mm_url = crate::secrets::get_password(crate::notify::KEY_MATTERMOST)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        ui.horizontal(|ui| {
+            changed |= ui
+                .checkbox(&mut notify.mattermost.enabled, "📨 Mattermost")
+                .changed();
+            ui.label("Webhook URL:");
+            let resp = ui
+                .add(egui::TextEdit::singleline(&mut mm_url).password(true).desired_width(220.0))
+                .on_hover_text("incoming webhook 地址（含 token，只存本机凭据管理器）");
+            if resp.changed() {
+                if let Err(e) = save_notify_secret(crate::notify::KEY_MATTERMOST, &mm_url) {
+                    test_msg = Some(format!("❌ 保存凭据失败: {e}"));
+                }
+            }
+            if ui.small_button("发送测试").clicked() {
+                let ctx = notify_test_ctx();
+                test_msg = Some(match crate::notify::send_mattermost(&notify.mattermost.clone(), &ctx) {
+                    Ok(m) => format!("✅ Mattermost 测试通知{m}"),
+                    Err(e) => format!("❌ Mattermost 发送失败: {e:#}"),
+                });
+            }
+        });
+
+        // ── 钉钉：access_token + 加签 secret 存凭据管理器 ──
+        let mut dd_token = crate::secrets::get_password(crate::notify::KEY_DINGTALK_TOKEN)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let mut dd_secret = crate::secrets::get_password(crate::notify::KEY_DINGTALK_SECRET)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        ui.horizontal(|ui| {
+            changed |= ui
+                .checkbox(&mut notify.dingtalk.enabled, "🔔 钉钉机器人")
+                .changed();
+            ui.label("access_token:");
+            let resp = ui
+                .add(
+                    egui::TextEdit::singleline(&mut dd_token)
+                        .password(true)
+                        .desired_width(180.0),
+                )
+                .on_hover_text("机器人 webhook 的 access_token（或整条 URL）");
+            if resp.changed() {
+                if let Err(e) = save_notify_secret(crate::notify::KEY_DINGTALK_TOKEN, &dd_token) {
+                    test_msg = Some(format!("❌ 保存凭据失败: {e}"));
+                }
+            }
+            ui.label("加签secret:");
+            let resp = ui
+                .add(
+                    egui::TextEdit::singleline(&mut dd_secret)
+                        .password(true)
+                        .desired_width(140.0),
+                )
+                .on_hover_text("安全设置选「加签」时填；留空 = 不加签");
+            if resp.changed() {
+                if let Err(e) = save_notify_secret(crate::notify::KEY_DINGTALK_SECRET, &dd_secret) {
+                    test_msg = Some(format!("❌ 保存凭据失败: {e}"));
+                }
+            }
+            if ui.small_button("发送测试").clicked() {
+                let ctx = notify_test_ctx();
+                test_msg = Some(match crate::notify::send_dingtalk(&notify.dingtalk.clone(), &ctx) {
+                    Ok(m) => format!("✅ 钉钉测试通知{m}"),
+                    Err(e) => format!("❌ 钉钉发送失败: {e:#}"),
+                });
+            }
+        });
+
+        // ── 邮箱：服务器参数落 YAML，密码存凭据管理器 ──
+        ui.add_space(4.0);
+        let mut smtp_password = crate::secrets::get_password(crate::notify::KEY_SMTP_PASSWORD)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        ui.horizontal(|ui| {
+            changed |= ui
+                .checkbox(&mut notify.email.enabled, "✉ 邮箱（SMTP）")
+                .changed();
+            ui.label("服务器:");
+            changed |= ui
+                .add(
+                    egui::TextEdit::singleline(&mut notify.email.smtp_host)
+                        .desired_width(120.0)
+                        .hint_text("smtp.example.com"),
+                )
+                .changed();
+            ui.label("端口:");
+            changed |= ui
+                .add(egui::DragValue::new(&mut notify.email.smtp_port).range(1..=65535))
+                .changed();
+            ui.label("加密:");
+            let modes = ["starttls", "ssl", "none"];
+            let hints = ["587 STARTTLS", "465 隐式SSL", "25 明文(内网中继)"];
+            let cur = modes
+                .iter()
+                .position(|m| *m == notify.email.ssl)
+                .unwrap_or(0);
+            let combo = egui::ComboBox::from_id_salt("notify_ssl_combo")
+                .selected_text(hints[cur])
+                .width(110.0)
+                .show_ui(ui, |ui| {
+                    for (i, h) in hints.iter().enumerate() {
+                        ui.selectable_value(&mut notify.email.ssl, modes[i].to_string(), *h);
+                    }
+                });
+            changed |= combo.response.changed();
+        });
+        ui.horizontal(|ui| {
+            ui.label("用户名:");
+            changed |= ui
+                .add(
+                    egui::TextEdit::singleline(&mut notify.email.username)
+                        .desired_width(140.0)
+                        .hint_text("一般即邮箱地址"),
+                )
+                .changed();
+            ui.label("密码:");
+            let resp = ui
+                .add(
+                    egui::TextEdit::singleline(&mut smtp_password)
+                        .password(true)
+                        .desired_width(120.0),
+                )
+                .on_hover_text("SMTP 密码/授权码，只存本机凭据管理器");
+            if resp.changed() {
+                if let Err(e) = save_notify_secret(crate::notify::KEY_SMTP_PASSWORD, &smtp_password) {
+                    test_msg = Some(format!("❌ 保存凭据失败: {e}"));
+                }
+            }
+            ui.label("发件人:");
+            changed |= ui
+                .add(
+                    egui::TextEdit::singleline(&mut notify.email.from)
+                        .desired_width(130.0)
+                        .hint_text("缺省用用户名"),
+                )
+                .changed();
+        });
+        ui.horizontal(|ui| {
+            ui.label("收件人:");
+            // 多收件人单行编辑：分号/逗号分隔，存 Vec<String>
+            let mut to_text = notify.email.to.join(";");
+            let resp = ui
+                .add(
+                    egui::TextEdit::singleline(&mut to_text)
+                        .desired_width(240.0)
+                        .hint_text("a@x.com;b@x.com"),
+                )
+                .on_hover_text("多个收件人用分号或逗号分隔");
+            if resp.changed() {
+                let to: Vec<String> = to_text
+                    .split([',', ';', '，', '；'])
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect();
+                if to != notify.email.to {
+                    notify.email.to = to;
+                    changed = true;
+                }
+            }
+            if ui.small_button("发送测试").clicked() {
+                let ctx = notify_test_ctx();
+                test_msg = Some(match crate::notify::send_email(&notify.email.clone(), &ctx) {
+                    Ok(m) => format!("✅ 测试邮件{m}"),
+                    Err(e) => format!("❌ 邮件发送失败: {e:#}"),
+                });
+            }
+        });
+        ui.weak(
+            "凭据（webhook URL / token / 密码）只存 Windows 凭据管理器，不写 config.yaml；\
+             测试按钮会实际发送一条（最长等 15 秒）。",
+        );
+    }
+
+    // 配置改动统一落盘（凭据字段不走这里——它们只进凭据管理器）
+    if changed {
+        if let Err(e) = crate::config::save_global(&main.global) {
+            test_msg = Some(format!("保存 config.yaml 失败: {e}"));
+        }
+    }
+    if let Some(m) = test_msg {
+        main.status_msg = Some(m);
+    }
+}
+
+/// 凭据字段改动即存凭据管理器；清空 = 删除该凭据
+fn save_notify_secret(key: &str, value: &str) -> Result<(), String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        crate::secrets::delete_password(key);
+        Ok(())
+    } else {
+        crate::secrets::set_password(key, trimmed).map_err(|e| format!("{key}: {e:#}"))
+    }
+}
+
+fn notify_test_ctx() -> crate::notify::NotifyCtx {
+    crate::notify::NotifyCtx {
+        label: "测试通知/测试流程".into(),
+        status_text: "success（来自设置窗口的测试消息）".into(),
+        ok: true,
+        duration_ms: 0,
+        run_id: "test".into(),
+    }
 }
 
 // ---------------------------------------------------------------------------

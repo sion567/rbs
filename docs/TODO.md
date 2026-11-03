@@ -288,6 +288,18 @@
   单文件下载后 sha256 校验（transport 层 pscp download 早已就绪，本轮接线）。
 - **✅ 桌面通知**：JobEnd 弹 Windows toast（隐藏 PowerShell + WinRT Toast，零 Rust 依赖），
   `config.yaml desktop_notify` 可关；👀 监听模式自动重跑后尤其有用。
+- **✅ 消息通知（Mattermost / 钉钉 / 邮箱，2026-11-03）**：作业结束按渠道推送结果，
+  与桌面通知同一挂钩点（GUI/CLI 单流程 + 组运行聚合 JobEnd）。
+  - 配置：`config.yaml` 的 `notify` 块——`on_failure`（默认开）/ `on_success`（默认关）+
+    三渠道各自 `enabled`；邮箱落 host/port/ssl（starttls 587 / ssl 465 / none 25）/username/from/to。
+    凭据（webhook URL、钉钉 access_token+加签 secret、SMTP 密码）一律存 Windows 凭据管理器
+    （键 `notify:mattermost` / `notify:dingtalk-token` / `notify:dingtalk-secret` / `notify:smtp-password`），
+    不落 YAML；⚙ 设置 → 全局配置可改，「发送测试」按钮实发一条（15s 超时）。
+  - 实现：零 Rust 依赖——`src/notify.rs` 起隐藏 PowerShell 发送（desktop_notify 同款模式，
+    内网自签证书走 Windows 证书库天然可用）。消息内容经**环境变量**传脚本（不进命令行，
+    进程列表不可见也免转义）；钉钉加签在脚本内 HMAC-SHA256；465 隐式 TLS 用 SslStream
+    手写最小 SMTP 对话（Send-MailMessage 不支持 465）。每渠道独立线程互不阻塞，失败打 stderr。
+  - 消息格式：`[rbs] ❌ 项目/流程 失败` + 状态（status.short()）/ 耗时 / 主机 / 时间 / run_id。
 - **✅ 危险命令静态检查**（§14 P1）：`rm -rf /`、`chmod -R 777`、`mkfs` 等模式——
   预览 ⚠ + 执行前告警（不拦截，操作者自己判断）。
 - **✅ 控制台导出**：💾 导出按钮，存 .log 文件（§9.3 的 [导出] 终于补上）。
@@ -964,3 +976,31 @@ secret_files:
 - **连带发现**：🗑 比宽 ~4px，三个「填充宽度输入 + 尾随 🗑」的行预留 34px
   不够 → 行溢出 3.375px（布局回归测试当场抓住）。预留改 40，测试面板预算
   同步 724 并注明构成。
+
+## 2026-11-03 命令与工具速查（docs + UI 窗口）
+
+> 需求：写 build.yaml 步骤时缺"命令怎么写"的参考——Linux 命令 / 包管理、构建工具
+> （Maven / Gradle）、Docker / k8s、MySQL 等各补实例 + 参数说明。
+
+### ✅ 文档：docs/命令速查.md（17 章 + 附表）
+
+- 执行位置约定先行：【本地】= 发版机 Windows（cmd /C，$VAR 不可用）、【远端】= SSH 步骤
+  发到远端 Linux；gradlew.bat vs ./gradlew 这类跨平台坑写进约定
+- 覆盖：Linux 常用命令（含 rsync / crontab / lsof / 防火墙 / SSH 免密）、Shell 片段与管道
+  （wait command 探测模板）、systemctl / journalctl、apt / yum、tar / zip / 7z、
+  Windows 本地 cmd（robocopy / mklink / netsh / schtasks / certutil）、git、Maven、Gradle、
+  pnpm / npm、Java 运行时与排障（jps / jstack / keytool）、Docker、kubectl、Nginx、
+  MySQL / mysqldump、PostgreSQL / pg_dump、redis-cli
+- 实例尽量用示范工程同款写法（变量组 / secret_env / ${{ targets.* }}），文末附
+  「想要什么效果 → 用哪个 RBS 字段」搭配速记表
+- 踩坑点重点标注：robocopy 退出码 0-7 都算成功、MySQL 大写 -P vs pg 小写 -p、
+  JVM 参数必须在 -jar 前、crontab | crontab - 整体覆盖、SSH 每步新 shell export 不跨步骤
+
+### ✅ UI：「？ 命令速查」独立窗口（与 docs 同源）
+
+- 工具栏新增「❓ 命令速查」按钮（「❓ 变量语法」旁）：命令速查是"命令本体 + 参数"，
+  与变量语法（"怎么写占位符"）分两窗，各自直达
+- 内容量大（约 190 行）不走逐行 ui.monospace：`CmdHelpLine` 枚举（H 标题 / M 命令行 /
+  W 说明）+ `cmd_help_lines()` 静态数组数据驱动渲染——后续改内容只动数组
+- 变量语法窗口第九节保留为高频 16 条速览，尾部指引改指向新窗口
+- 快照测试新增 `cmd_help_window` 用例；ui_snapshots 模块注释补覆盖页面

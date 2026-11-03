@@ -1,8 +1,10 @@
 # Remote Build System
 
 Windows 桌面构建部署工具，覆盖"下载 → 编译 → 打包 → 上传 → 部署"链路。
-架构设计见 `../docs/RemoteBuildSystem架构设计文档_v0.4.md`；变量语法速查见 `../docs/变量速查.md`
-（GUI 流程编辑器里也有「？ 变量语法」窗口）；功能路线与完成情况见 `../docs/TODO.md`。
+架构设计见 `../docs/RemoteBuildSystem架构设计文档_v0.4.md`；变量语法速查见 `../docs/变量速查.md`，
+常用命令与工具速查（Linux / Windows cmd / Maven / Gradle / Docker / kubectl / MySQL 等，实例 + 参数）见
+`../docs/命令速查.md`（GUI 工具栏有「？ 变量语法」「？ 命令速查」两个速查窗口，与文档同源）；
+功能路线与完成情况见 `../docs/TODO.md`。
 
 ## 构建与运行
 
@@ -74,6 +76,10 @@ remote-build preview <项目名> <流程名>           # 干跑预览：解析�
 - **👀 监听模式**：工作目录文件变化自动重跑当前流程（3s mtime 轮询，排除构建产物目录）
 - **状态可视化**：步骤光圈（运行蓝/等待黄/成功绿/失败红）+ 耗时条 + 重试标注
 - **桌面通知**：流程结束弹 Windows toast（`desktop_notify` 可关）
+- **消息通知**：作业结束推送 Mattermost / 钉钉机器人 / 邮箱（SMTP 直发）——config.yaml
+  `notify` 块配置（`on_failure` 默认开、`on_success` 默认关），webhook/token/密码只存
+  Windows 凭据管理器；⚙ 设置 → 全局配置里填写并发送测试。实现零 Rust 依赖
+  （隐藏 PowerShell），内网自签证书开箱可用
 - **控制台**：实时流式输出、「只看错误」过滤器、可折叠（编辑步骤时收起）、复制 / 导出 .log
 - **危险命令提醒**：`rm -rf /`、`chmod -R 777` 等模式预览 ⚠ + 执行前告警（不拦截）
 

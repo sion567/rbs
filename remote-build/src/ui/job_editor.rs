@@ -948,8 +948,293 @@ pub fn show_var_help_window(ctx: &egui::Context, main: &mut MainState) {
             ui.monospace("dist -> app.tar.gz        # 目录源带目录名根（里面是 dist/...，同 tar -czf / zip -r 习惯）");
             ui.monospace("dist/. -> app.tar.gz      # 源以 /. 结尾 = tar -C dist . 语义：条目不带目录根，解包直接铺文件");
             ui.weak("单文件 / 通配源条目为裸文件名。");
+
+            ui.add_space(8.0);
+            ui.separator();
+            ui.add_space(4.0);
+            ui.strong("九、常用命令速查（构建 / 部署高频命令；逐参数说明见 docs/命令速查.md）");
+            ui.monospace("mvn -B clean package -DskipTests -T 1C   # -B 非交互 -q 静默 -P prod 选 profile -U 刷 SNAPSHOT");
+            ui.monospace("mvn -pl 模块 -am clean package           # 只构建指定模块及依赖；-o 离线；timeout 建议 1800");
+            ui.monospace("mvn help:evaluate -Dexpression=project.version -q -DforceStdout   # 配 outputs 捕获版本号");
+            ui.monospace("gradlew.bat bootJar --no-daemon -x test -Penv=prod   # Windows 本地必须 .bat；远端 Linux 写 ./gradlew");
+            ui.monospace("pnpm install --frozen-lockfile && pnpm run build     # CI 标准装依赖（不一致即失败）；creates: node_modules");
+            ui.monospace("docker build -t reg/app:${{ env.VER }} . && docker push reg/app:${{ env.VER }}");
+            ui.monospace("docker save -o app.tar reg/app:tag       # 离线包走 upload → 目标机 docker load -i（无 registry 链路）");
+            ui.monospace("kubectl apply -f deploy.yaml -n ${{ variables.NAMESPACE }}   # k8s 目标自动注入 KUBECONFIG，无需手动指定");
+            ui.monospace("kubectl rollout status deployment/app --timeout=120s   # restart / undo 回滚 / logs -f --tail=100");
+            ui.monospace("mysqldump -h 主机 -P 3306 -u root --single-transaction 库名 > backup.sql   # 大写 -P；不锁表；密码走 secret_env");
+            ui.monospace("mysql -h 主机 -P 3306 -u root -D 库 -e \"SQL\"   # -e 单条 SQL；导入恢复：mysql 库 < dump.sql");
+            ui.monospace("pg_dump -h 主机 -p 5432 -U postgres -f backup.sql 库名   # 小写 -p（跟 mysql 相反）；密码 PGPASSWORD");
+            ui.monospace("systemctl restart app && systemctl is-active --quiet app   # is-active 退出码 = 判活，可接前置检查");
+            ui.monospace("journalctl -u app -n 100 --since \"10 min ago\"   # -f 跟踪日志 -p err 只看错误");
+            ui.monospace("tar -xzf app.tar.gz -C /opt/app          # 解包铺目录；-czf 建 --exclude 排除 -tzf 只看不解");
+            ui.monospace("find /opt/backup -name \"app-*.jar\" -mtime +7 -delete   # 清 7 天前备份；du -sh /opt/* 看占用");
+            ui.monospace("java -Xms512m -Xmx2g -jar app.jar --spring.profiles.active=prod   # JVM 参数在 -jar 前，-- 程序参数在后");
+            ui.monospace("netstat -ano | findstr :8080 & taskkill /PID 1234 /F   # Windows 本地查端口占用并强杀（sc query 查服务）");
+            ui.monospace("robocopy dist release /MIR /XD node_modules   # Windows 镜像同步；退出码 0-7 都算成功，需接 if %ERRORLEVEL% GEQ 8 判失败");
+            ui.monospace("nginx -t && nginx -s reload              # 测配置语法后热加载；502 先看 /var/log/nginx/error.log");
+            ui.monospace("sha256sum app.tar.gz                     # 传后校验；Windows 本地 certutil -hashfile 文件 SHA256");
+            ui.weak("【本地】步骤 = 发版机 Windows（cmd 语法：&& | > 可用，$VAR 不可用）；【远端】SSH 步骤 = Linux 全语法。\n\
+                     Shell 片段（判断 / $( ) / xargs / wait 探测模板）、Windows cmd 全套（robocopy / mklink / certutil…）、\n\
+                     Java 运行时与排障（jps / jstack / keytool）、Nginx、apt / yum、7z、redis-cli 等\n\
+                     完整逐参数说明：工具栏「❓ 命令速查」窗口（docs/命令速查.md）。");
         });
     main.show_var_help = open;
+}
+
+/// 「？ 命令速查」窗口内容行（与 docs/命令速查.md 同源）：
+/// H = 小节标题、M = 命令/示例/参数表行（monospace）、W = 说明 / 注意点（weak，自动换行）
+enum CmdHelpLine {
+    H(&'static str),
+    M(&'static str),
+    W(&'static str),
+}
+
+fn cmd_help_lines() -> &'static [CmdHelpLine] {
+    use CmdHelpLine::{H, M, W};
+    &[
+        W("【本地】= 发版机 Windows（cmd /C 执行）：&& | > >> 可用；变量写 %VAR%（cmd）或 ${{ }}（RBS 替换）；单引号、$VAR、$() 不可用"),
+        W("【远端】= SSH 步骤发到远端 Linux：bash 语法全量可用（$VAR、$()、单引号等）。cmd 会自动补扩展名（mvn → mvn.cmd），但无扩展名的 sh 脚本不行——Windows 本地跑 Gradle 写 gradlew.bat，远端写 ./gradlew。"),
+        W("命令找不到 / 版本不对 → tool: 绑定（tools.yaml 登记路径）+ tools_require 版本门禁；装包类命令放一次性初始化或 preconditions，别放发版主流程。"),
+
+        H("一、Linux 常用命令【远端】"),
+        M("ls -lah /opt/app                              # 长格式 + 隐藏文件 + 人读大小"),
+        M("cp -a app.jar backup/app-${{ now }}.jar       # 归档复制（保留权限/时间戳，递归）"),
+        M("mkdir -p /opt/app/backup                      # 多级创建，已存在不报错"),
+        M("ln -sfn /opt/releases/app-1.2.3 /opt/app      # 软链指向新版本（原子切换惯用）"),
+        M("find /opt/backup -name \"app-*.jar\" -mtime +7 -delete   # 删 7 天前的备份"),
+        M("chmod +x deploy.sh && chown -R app:app /opt/app"),
+        W("cp -a 保留权限/属主/时间戳（备份首选）；ln -sfn 原子切换软链；find 支持 -name / -mtime +N / -size +N M / -delete / -exec；rm -rf 属危险命令：预览与执行前会 ⚠，路径写全别用变量拼根。"),
+        M("tail -n 100 app.log / tail -f app.log         # 末 100 行 / 跟踪新增"),
+        M("grep -in \"timeout\" app.log                    # 忽略大小写 + 行号"),
+        M("ps -ef | grep java | grep -v grep             # 查进程（-v 剔除 grep 自身）"),
+        M("sed -i 's/8080/8081/g' config.yml             # 就地替换（g = 全局；不加 -i 只打印）"),
+        M("awk -F: '{print $1}' /etc/passwd              # 按冒号切列取第 1 列（$NF = 末列）"),
+        M("du -sh /opt/* | sort -rh | head -5            # 各目录占用 Top5（df -h 看磁盘余量）"),
+        M("pgrep -f app.jar / pkill -f app.jar           # 按命令行片段查 / 杀 PID"),
+        M("nohup /opt/app/start.sh > app.out 2>&1 &      # 后台起飞，SSH 断开不连带（长任务配方）"),
+        M("ss -tlnp | grep 8080 / lsof -i:8080           # 谁在监听 / 谁占着端口"),
+        M("curl -sf http://127.0.0.1:8080/health         # 健康检查（-f：非 2xx 返回非零）"),
+        M("curl -s -X POST -H \"Content-Type: application/json\" -d '{\"k\":\"v\"}' http://host/api"),
+        M("ssh -p 2222 user@host / scp -P 2222 文件 user@host:/dst   # scp 端口是大写 -P"),
+        W("grep：-i 忽略大小写 -n 行号 -v 反选 -c 计数 -r 递归 -E 扩展正则 -A2/-B2/-C2 上下文。curl：-s 静默 -o 写文件 -m 10 总超时；wait 的 http 模式不支持 https，探测用命令模式 curl -skf。RBS 的 upload / download 已覆盖主链路，ssh/scp 用于远端侧中转或手工调试。"),
+        M("rsync -avz dist/ user@host:/opt/app/          # 增量同步（-avn 先干跑看会传什么）"),
+        M("rsync -avz --delete dist/ /opt/app/           # 镜像同步：目标多出的删掉（想清楚再 --delete）"),
+        W("rsync：-a 递归保权限 -z 压缩 --exclude 排除；尾随斜杠有语义：dist/ 传内容不带 dist 根，dist 会多套一层——与 pack 的「源/.」语义对应。"),
+        M("firewall-cmd --permanent --add-port=8080/tcp && firewall-cmd --reload   # firewalld 开端口（--list-ports 查）"),
+        M("ufw allow 8080/tcp && ufw status              # Ubuntu 系"),
+        M("ssh-keygen -t ed25519 / ssh-copy-id user@host   # 公钥免密（RBS 目标 key 认证的前置）"),
+        W("防火墙：--permanent 不加 reload 后丢失，加了还要 reload 才生效；本机通了仍不通 → 云安全组（排查顺序：ss 监听 → 本机防火墙 → 安全组）。免密：chmod 700 ~/.ssh && chmod 600 authorized_keys（权限不对 sshd 拒用）；russh 私钥须 OpenSSH 格式（PPK 先 puttygen 转）。"),
+        M("crontab -e                                    # 定时任务：分 时 日 月 周"),
+        M("(crontab -l; echo \"0 2 * * * /opt/app/backup.sh >> /var/log/backup.log 2>&1\") | crontab -"),
+        W("| crontab - 是整体覆盖——追加要 (crontab -l; echo 新任务) | crontab -，直接 echo 会清掉原有任务。"),
+        M("which mvn java / env | grep -i mysql          # 命令实际路径 / 验证 secret_env 注入结果"),
+        W("SSH 步骤每一步都是新 shell：上一步 export 的变量下一步不存在——跨步骤传值用 outputs / .env 约定，不要指望 export。"),
+
+        H("二、Shell 片段与管道【远端】"),
+        M("[ -f /opt/app/app.jar ] && echo 在 || echo 缺   # 判断（-d 目录 -e 存在 -z 空串 -n 非空）"),
+        M("VER=${TAG:-v0.0.0}                            # 变量默认值展开（未定义/空都取默认）"),
+        M("NOW=$(date +%Y%m%d%H%M%S)                     # 命令替换：拿命令输出当值用"),
+        M("if [ $? -eq 0 ]; then echo 上条成功; fi        # 上一条命令的退出码"),
+        M("ls -t /opt/backup/app-*.jar | tail -n +6 | xargs -r rm   # 只留最近 5 份（示范工程④同款）"),
+        M("echo \"$(date '+%F %T') 发版\" | tee -a /opt/release.log   # 打屏同时落文件"),
+        M("for f in /opt/backup/app-*.jar; do sha256sum \"$f\"; done"),
+        W("判断符别混：字符串 = !=、空/非空 -z -n、文件 -f -d -e、数字 -eq -ne -gt -lt（数字比较不是 > <——那是重定向/文本比较）。xargs -r：输入为空就不执行；$? 与 && || 组合是脚本判断成败的全部。"),
+        W("wait command 探测模板（fail_exit_code: 2）：读状态文件 → success exit 0 / failed exit 2 / 还在跑 exit 1（配方见 docs/长任务配方.md）。"),
+
+        H("三、systemctl 与日志【远端】"),
+        M("systemctl restart app                         # start / stop / status 同型"),
+        M("systemctl enable --now app                    # 开机自启 + 立即启动"),
+        M("systemctl is-active --quiet app && echo 存活   # 脚本判活（--quiet 只看退出码）"),
+        M("systemctl daemon-reload                       # 改过 *.service 文件后先执行"),
+        M("journalctl -u app -f --since \"10 min ago\"     # 跟日志（-n 100 最近 N 行 -p err 只看错误）"),
+        W("重启步骤常配 retry + wait 探活；首次部署服务不存在时 systemctl stop 加 continue_on_error: true 只黄灯不拦（示范工程 ④）。"),
+
+        H("四、包管理【远端】"),
+        M("apt update && apt install -y curl jq          # Debian/Ubuntu（-y 免交互必须带）"),
+        M("apt list --installed 2>/dev/null | grep mysql"),
+        M("yum install -y curl jq                        # CentOS/RHEL（新系统首选 dnf，同型）"),
+        M("rpm -q mysql-server                           # 查单个包版本"),
+        W("SSH 非交互终端没有确认机会，-y 必带否则卡死到超时；放流程里配 creates:（如 /usr/bin/jq）守卫，装过秒过。"),
+
+        H("五、压缩与解包"),
+        M("tar -czf app.tar.gz -C dist .                 # 打包（-C 进目录再打，条目不带 dist/ 前缀）"),
+        M("tar -xzf app.tar.gz -C /opt/app               # 解包到指定目录（目录先 mkdir -p）"),
+        M("tar -tzf app.tar.gz | head                    # 只看包里有什么，不解"),
+        M("unzip -o app.zip -d /opt/app                  # -o 覆盖不问（非交互必须）"),
+        M("7z a -t7z backup/db.7z backup/*.sql           # 压缩（tool: 7z 绑定；-mx=9 最高压缩率 -p 加密）"),
+        M("7z x backup/db.7z -o/opt/restore              # 解压（-o 后紧跟目录不加空格）"),
+        W("权限注意：Windows 侧打 zip 传 Linux 解压会丢可执行位——传带 .sh / 二进制的包用 tar.gz（RBS pack 的 tar.gz 保留 +x），或解压后补 chmod +x。"),
+
+        H("六、Windows 本地常用命令【本地 cmd】"),
+        M("dir /B target\\*.jar                           # 列文件名（/B 裸名，配 outputs 捕获产物名）"),
+        M("copy /Y target\\app.jar backup\\                # /Y 覆盖不问"),
+        M("xcopy dist\\* release\\ /E /I /Y                # 递归复制（/E 含空目录 /I 目标是目录）"),
+        M("robocopy dist release /MIR /XD node_modules   # 镜像同步（/XD 排除目录 /XF 排除文件）"),
+        M("mklink /J app D:\\releases\\app-1.2.3           # 目录 junction（免管理员；/D 真软链要管理员）"),
+        M("tasklist | findstr java                       # 查进程（findstr ≈ grep）"),
+        M("taskkill /PID 1234 /F                         # 强杀（/IM java.exe /F 按映像名）"),
+        M("netstat -ano | findstr :8080                  # 查端口占用（末列 = PID）"),
+        M("sc query demo-app                             # 查 Windows 服务（stop / start 同型，需管理员）"),
+        M("netsh advfirewall firewall add rule name=\"app-8080\" dir=in action=allow protocol=TCP localport=8080   # 防火墙开端口（需管理员）"),
+        M("schtasks /Create /SC DAILY /ST 02:00 /TN 备份 /TR D:\\app\\backup.bat   # 计划任务（crontab 对应物；/Run /TN 手动触发）"),
+        M("where mvn                                     # 命令实际路径（cmd 版 which）"),
+        M("curl.exe -sf http://127.0.0.1:8080/health     # Win10 1803+ 自带真 curl（写 .exe 最稳）"),
+        M("certutil -hashfile app.zip SHA256             # 算哈希（对 upload 的 sha256 校验排障）"),
+        M("powershell -Command \"Get-Content app.log -Tail 100\"   # 逃生舱：复杂逻辑借 PowerShell"),
+        W("⚠ robocopy 退出码 0-7 都算成功（1 = 复制了文件），直接用会被判失败——收尾接 & if %ERRORLEVEL% GEQ 8 (exit /B 1) else (exit /B 0)。"),
+        W("cmd 变量是 %VAR%（$VAR 不可用）；mklink /J 不需要管理员且跨卷，是 Linux 软链切换的 Windows 对应物；复杂逻辑别硬写一行串，借 powershell -Command 或放 脚本.bat 调用。"),
+
+        H("七、git【本地 workspace】"),
+        M("git clone --depth 1 https://gitee.com/x/demo.git demo   # 浅克隆（只要最新一层）"),
+        M("git pull --ff-only                            # 只快进合并（有分叉直接失败，不悄悄合）"),
+        M("git status -s / git log --oneline -5          # 短状态 / 最近 5 条"),
+        M("git tag -a v1.2.0 -m \"发版\""),
+        W("克隆步配 creates: demo/.git 守卫（克隆过秒过）；工作目录用步骤 working_dir: demo（示范工程 ①）。"),
+
+        H("八、Maven【本地】"),
+        M("mvn -B clean package -DskipTests"),
+        M("mvn -T 1C clean package -P prod -DskipTests   # 并行 + 指定 profile"),
+        M("mvn -pl yudao-server -am clean package -DskipTests   # 只构建指定模块及其依赖"),
+        M("mvn help:evaluate -Dexpression=project.version -q -DforceStdout   # 配 outputs 捕版本号"),
+        M("mvn dependency:tree -Dincludes=com.mysql      # 查依赖来源"),
+        M("mvn clean deploy -DskipTests                  # 发私服"),
+        M("  -B              批处理模式：关进度条彩色输出，日志干净（CI 标配）"),
+        M("  -q              只输出 ERROR；配 outputs 捕获 stdout 时用"),
+        M("  -T 1C           每核 1 线程并行构建模块"),
+        M("  -P 名           激活 pom 里的 profile（dev / prod）"),
+        M("  -D键=值         传系统属性：-DskipTests 编译测试类但不跑；-Dmaven.test.skip=true 连编译都跳"),
+        M("  -U              强制刷新 SNAPSHOT 依赖"),
+        M("  -o              离线模式：只吃本地仓库"),
+        M("  -pl 模块 -am    只构建该模块；-am 连上游依赖一起建"),
+        M("  -s 路径         指定 settings.xml（多私服 / 镜像源隔离）"),
+        M("  -Dmaven.repo.local=路径   指定本地仓库（多 JDK / 挪 C 盘）"),
+        W("RBS 配合：timeout: 1800（首次拉依赖慢，默认超时会误杀）、creates: target/*.jar（产物在就跳过，配作业级 retry 只补失败步骤）、tools_require: { java: \">=21\" }。"),
+
+        H("九、Gradle【本地 / 远端】"),
+        M("gradlew.bat clean bootJar --no-daemon         # Windows 本地必须带 .bat；远端写 ./gradlew"),
+        M("gradlew.bat build -x test                     # 跳过 test 任务"),
+        M("gradlew.bat bootJar -Penv=prod                # 传项目属性（build.gradle 里 project.env）"),
+        M("gradlew.bat --refresh-dependencies build      # 强刷依赖"),
+        W("gradlew（wrapper）按工程钉死的版本跑，永远优先于全局 gradle；bootJar = Spring Boot 可执行 jar（build 含 test，发版通常 clean bootJar -x test）；-x 排除任务、-P 传构建属性（区别 -D 的 JVM 属性）、--no-daemon 不驻留后台进程（CI 类环境推荐）。"),
+
+        H("十、前端 Node（pnpm / npm）【本地】"),
+        M("corepack enable && corepack prepare pnpm@latest --activate   # 按 packageManager 字段钉版本"),
+        M("pnpm install --frozen-lockfile                # CI 标准装依赖（lock 不一致直接失败不自动改）"),
+        M("pnpm run build / npm run build"),
+        M("npm ci                                        # npm 干净安装：严格按 lock 装、绝不改 lockfile"),
+        W("装依赖步 creates: node_modules（装过跳过）；构建步 creates: dist。corepack：工程没写 packageManager 字段时才需要手动装 pnpm。"),
+
+        H("十一、Java 运行时与排障【本地 / 远端】"),
+        M("java -Xms512m -Xmx2g -jar app.jar --spring.profiles.active=prod --server.port=8080"),
+        M("java -Dfile.encoding=UTF-8 -Duser.timezone=Asia/Shanghai -jar app.jar"),
+        M("jps -l                                        # 列 java 进程（cmd 同款可用）"),
+        M("jstack <pid> > /tmp/stack.txt                 # 线程栈快照（卡死 / 死锁排查）"),
+        M("jmap -histo:live <pid> | head -20             # 对象直方图（内存涨排查）"),
+        M("jar tf app.jar | head                         # 看 jar 内容不解包"),
+        M("keytool -importcert -alias ca -file ca.cer -keystore trust.jks -storepass changeit -noprompt"),
+        W("参数位置别错：JVM 参数（-Xmx、-Dxxx）必须在 -jar 前面；jar 名后面的 --xxx 是程序参数（Spring Boot 解析）——写反了不生效还找不到原因。-Xms/-Xmx 生产设同值；-Dfile.encoding 治日志乱码；keytool 默认库口令 changeit。"),
+
+        H("十二、Docker【本地】"),
+        M("docker build -t registry.internal:5000/app:${{ env.VER }} ."),
+        M("docker build -f Dockerfile.prod --build-arg APP_ENV=prod -t app:${{ env.VER }} ."),
+        M("docker push registry.internal:5000/app:${{ env.VER }}"),
+        M("docker save -o app.tar registry/app:tag       # 导出离线包 → upload 传目标机 docker load -i"),
+        M("docker logs -f --tail=100 容器名"),
+        M("docker login registry.internal:5000 -u user   # 密码交互输入，别进命令行"),
+        W("-t 名:tag、-f 指定 Dockerfile、--build-arg 传 ARG 构建参数；层缓存按顺序命中：常变的源码 COPY 放 Dockerfile 靠后，依赖安装放前面。版本号用上游 outputs 捕获（${{ env.VER }}），不要手写 latest。"),
+
+        H("十三、Kubernetes（kubectl）【本地 · k8s 目标】"),
+        M("kubectl apply -f deploy.yaml                  # k8s-apply 步骤；-n 指命名空间"),
+        M("kubectl apply -f k8s/ -n ${{ variables.NAMESPACE }}   # 目录全量应用（幂等：存在即更新）"),
+        M("kubectl get pods -n demo-prod -o wide         # 列表（-w 持续 watch）"),
+        M("kubectl logs -f --tail=100 pod名 -c 容器名    # 多容器要 -c"),
+        M("kubectl describe pod pod名                    # 排查拉不起 / 镜像失败 / 挂载错误"),
+        M("kubectl rollout restart deployment/app        # 滚动重启（改了 ConfigMap 后）"),
+        M("kubectl rollout status deployment/app --timeout=120s   # 等滚动完成"),
+        M("kubectl rollout undo deployment/app           # 回滚上一版（history 看版本）"),
+        M("kubectl set image deployment/app app=registry/app:${{ env.VER }}"),
+        M("kubectl scale deployment/app --replicas=3"),
+        M("kubectl exec -it pod名 -- sh / kubectl cp pod名:/path ./file"),
+        W("RBS 配合：目标类型选 k8s（kubeconfig / context / namespace 存目标，步骤里 ${{ targets.名.* }} 引用）；k8s-apply 步骤在发版机跑 kubectl，KUBECONFIG 由引擎自动注入——命令里不用手动指定。"),
+
+        H("十四、Nginx【远端】"),
+        M("nginx -t && nginx -s reload                   # 测语法后热加载（不断现有连接）"),
+        M("nginx -s quit / nginx -s reopen               # 优雅停 / 重开日志（切割用）"),
+        M("systemctl reload nginx                        # apt/yum 装的走 systemd，别与 -s 混用"),
+        M("tail -f /var/log/nginx/error.log              # 502/504 第一现场"),
+        W("reload 前必 -t：配置有语法错 reload 失败且保持旧配置在跑；-s 信号要找得到 pid 文件（编译安装），包管理器装的一律 systemctl。502 排查：error.log → 后端进程活着吗（ss -tlnp）→ SELinux / 防火墙。"),
+
+        H("十五、MySQL（mysql / mysqldump）【本地客户端 → 远程库】"),
+        M("mysql -h ${{ variables.DB_HOST }} -P 3306 -u root -D app_db -e \"SELECT COUNT(*) FROM t_order;\""),
+        M("mysql -h 主机 -P 3306 -u root app_db < backup/mysql-20261031.sql   # 导入恢复"),
+        M("mysqldump -h ${{ variables.DB_HOST }} -P ${{ variables.DB_PORT }} -u ${{ variables.DB_USER }} \\"),
+        M("  --single-transaction --routines --triggers --events \\"),
+        M("  ${{ variables.DB_NAME }} > backup/mysql-${{ now.date }}.sql   # 全量备份（不锁表）"),
+        M("mysqldump ... --no-data 库名 > schema.sql     # 只导表结构"),
+        M("mysqldump ... --where=\"created_at >= '2026-10-01'\" 库 t_order   # 条件导出单表"),
+        M("  -h / -P         主机 / 端口——MySQL 端口是大写 -P（pg 是小写 -p）"),
+        M("  -u / -p         用户 / 密码；-p 单独写 = 交互；严禁 -p密码 连写（进程列表可见）→ secret_env 注入 MYSQL_PWD"),
+        M("  -D 库名         默认数据库（-e 里不用写库前缀）；-t 表格化输出"),
+        M("  --single-transaction   InnoDB 一致性快照不锁表，生产必备"),
+        M("  --routines --triggers --events   存储过程 / 触发器 / 事件（默认不含 routines 与 events）"),
+        M("  --databases db1 db2     备多库且带 CREATE DATABASE；不带则只备表"),
+        M("  --no-data / --no-create-info   只结构 / 只数据"),
+        M("  --set-gtid-purged=OFF   GTID 库备份导到非 GTID 库报错时加"),
+        M("  --max-allowed-packet=512M   超大行报包超限时加"),
+        M("  --login-path=名  mysql_config_editor 存过的混淆凭据路径"),
+        W("RBS 配合：tool: mysqldump + secret_env: { MYSQL_PWD: db/prod-mysql }（先 remote-build set-password 存密码），连接信息走变量组——示范工程 ⑤ 即完整示例。"),
+
+        H("十六、PostgreSQL（psql / pg_dump）【本地客户端 → 远程库】"),
+        M("psql -h ${{ variables.DB_HOST }} -p 5432 -U postgres -d app_db -c \"\\dt\""),
+        M("pg_dump -h 主机 -p 5432 -U postgres -f backup/pg-${{ now.date }}.sql 库名"),
+        M("pg_dump -Fc -f backup/pg.dump 库名            # 自定义压缩格式"),
+        M("pg_restore -h 主机 -U postgres -d app_db backup/pg.dump   # -Fc 格式用它恢复（-j 4 并行）"),
+        W("端口是小写 -p（MySQL 是大写 -P，两库连用最容易踩）；密码走 PGPASSWORD = pg 官方推荐 → secret_env 注入；-s 只结构 / -a 只数据、-t 表 / -n schema 范围导出。"),
+
+        H("十七、redis-cli【本地客户端 → 远程库】"),
+        M("redis-cli -h 主机 -p 6379 ping                # PONG = 通"),
+        M("redis-cli -h host info memory | grep used_memory_human"),
+        M("redis-cli -h host --rdb backup/dump-${{ now.date }}.rdb   # 远程拉 RDB 备份"),
+        W("密码建议 REDISCLI_AUTH 环境变量（比 -a 命令行安全，同样可走 secret_env）；-n N 选 db。"),
+
+        W("完整逐参数说明与更多命令见 docs/命令速查.md；变量替换语法见「❓ 变量语法」窗口。"),
+    ]
+}
+
+/// 「？ 命令速查」帮助窗口（工具栏 ❓ 命令速查 打开；与 docs/命令速查.md 内容一致）。
+/// 内容量大（17 章），用行数组数据驱动渲染（cmd_help_lines），避免几百行重复 UI 调用。
+pub fn show_cmd_help_window(ctx: &egui::Context, main: &mut MainState) {
+    let mut open = main.show_cmd_help;
+    if open {
+        crate::ui::modal_backdrop(ctx, "mask_cmd_help");
+    }
+    crate::ui::centered_window(egui::Window::new("？ 命令速查"), ctx)
+        .collapsible(false)
+        .open(&mut open)
+        .order(egui::Order::Foreground)
+        .default_width(840.0)
+        .default_height(560.0)
+        .vscroll(true)
+        .show(ctx, |ui| {
+            ui.weak("构建 / 部署高频命令速查：每条实例 + 参数说明，与 docs/命令速查.md 同源。先看执行位置：【本地】= 发版机 Windows（cmd），【远端】= SSH 步骤发到远端 Linux。");
+            ui.add_space(6.0);
+            for line in cmd_help_lines() {
+                match line {
+                    CmdHelpLine::H(t) => {
+                        ui.add_space(6.0);
+                        ui.strong(*t);
+                    }
+                    CmdHelpLine::M(t) => {
+                        ui.monospace(*t);
+                    }
+                    CmdHelpLine::W(t) => {
+                        ui.weak(*t);
+                    }
+                }
+            }
+        });
+    main.show_cmd_help = open;
 }
 
 fn delete_current_job(main: &mut MainState) {

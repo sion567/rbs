@@ -179,6 +179,8 @@ pub struct MainState {
     pub settings_tab: ui::settings::SettingsTab,
     /// 「？ 变量语法」帮助窗口
     pub show_var_help: bool,
+    /// 「？ 命令速查」帮助窗口（docs/命令速查.md 的 UI 镜像）
+    pub show_cmd_help: bool,
     /// 主题是否已在首帧应用（egui ctx 需要在 show 阶段才能设置）
     pub theme_applied: bool,
     pub status_msg: Option<String>,
@@ -319,6 +321,7 @@ impl MainState {
             target_editor: Default::default(),
             settings_tab: Default::default(),
             show_var_help: false,
+            show_cmd_help: false,
             theme_applied: false,
             status_msg: None,
             run_steps: Vec::new(),
@@ -596,10 +599,19 @@ impl MainState {
                     // 配目标 / 看历史时都可能要查，放常驻工具栏不挑场景
                     if ui
                         .button("❓ 变量语法")
-                        .on_hover_text("变量 / 条件 / outputs / wait 等写法速查\n（与 docs/变量速查.md 同源）")
+                        .on_hover_text("变量 / 条件 / outputs / wait / 常用命令写法速查\n（与 docs/变量速查.md、docs/命令速查.md 同源）")
                         .clicked()
                     {
                         self.show_var_help = true;
+                    }
+                    // 命令速查独立成窗：变量语法是"怎么写占位符"，命令速查是"命令本体 +
+                    // 参数"（Linux / cmd / Maven / Gradle / Docker / k8s / MySQL 等），内容量大不挤同一窗
+                    if ui
+                        .button("❓ 命令速查")
+                        .on_hover_text("构建 / 部署高频命令速查（实例 + 参数说明）\n（与 docs/命令速查.md 同源）")
+                        .clicked()
+                    {
+                        self.show_cmd_help = true;
                     }
                     // 状态消息截断：right_to_left 布局里文字从右往左长，
                     // 长作业名 / 监听路径 / ⚠ 长提示会无边界延伸，压到 ⟳ Reload
@@ -657,6 +669,7 @@ impl MainState {
         ui::new_project::show(&ctx, self);
         ui::job_editor::show_new_job_window(&ctx, self);
         ui::job_editor::show_var_help_window(&ctx, self);
+        ui::job_editor::show_cmd_help_window(&ctx, self);
         show_confirm_gate_window(&ctx, self);
 
         // 运行中保持帧率：日志流畅上屏 + 蓝黄光圈 1Hz 呼吸动画；更新代码中保持进度上屏；
@@ -975,7 +988,7 @@ impl MainState {
                         *st = StepVisualState::Waiting;
                     }
                 }
-                LogEvent::JobEnd { status, .. } => {
+                LogEvent::JobEnd { status, total_duration_ms, run_id, .. } => {
                     run.finished = Some(status.clone());
                     // 引擎正常收尾（含响应 ⏹ 停止后的取消终态）：退出"停止中"状态
                     self.stop_requested = None;
@@ -1000,20 +1013,31 @@ impl MainState {
                     if matches!(status, JobStatus::Cancelled | JobStatus::Timeout) {
                         mark_interrupted_cancelled(&mut self.run_steps);
                     }
+                    // 标签：组运行显示组标签（run_group_label 在此消费），单流程显示流程名
+                    let label = self
+                        .run_group_label
+                        .take()
+                        .or_else(|| {
+                            self.run_job
+                                .as_ref()
+                                .map(|(p, j)| format!("{p}/{j}"))
+                        })
+                        .unwrap_or_default();
                     // 桌面通知（toast）：最小化在干别的也能看到结果；watch 自动重跑尤其需要。
-                    // 组运行显示组标签（run_group_label 在此消费），单流程显示流程名
                     if self.global.desktop_notify {
-                        let label = self
-                            .run_group_label
-                            .take()
-                            .or_else(|| {
-                                self.run_job
-                                    .as_ref()
-                                    .map(|(p, j)| format!("{p}/{j}"))
-                            })
-                            .unwrap_or_default();
                         desktop_notify(&label, &crate::ui::console::job_label_public(status));
                     }
+                    // 消息通知（Mattermost / 钉钉 / 邮箱）：按触发时机与渠道开关推送
+                    crate::notify::send_job_end(
+                        &self.global,
+                        &crate::notify::NotifyCtx {
+                            label,
+                            status_text: status.short(),
+                            ok: status.ok(),
+                            duration_ms: *total_duration_ms,
+                            run_id: run_id.clone(),
+                        },
+                    );
                     // 组运行全部通过：清除续跑指针
                     if status.ok() {
                         self.last_group_failure = None;

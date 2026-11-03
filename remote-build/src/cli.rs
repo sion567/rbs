@@ -261,10 +261,24 @@ fn run(args: &[String]) {
     let status = rt.block_on(engine.run_job(input, cancel_rx, tx));
     // CLI 没有外层包装任务：这里补发 JobEnd（历史入库收尾 / 与 GUI 事件协议对齐）
     let _ = rt.block_on(end_tx.send(LogEvent::JobEnd {
-        run_id: cli_run_id,
+        run_id: cli_run_id.clone(),
         status: status.clone(),
         total_duration_ms: started.elapsed().as_millis() as u64,
     }));
+    // 消息通知（Mattermost / 钉钉 / 邮箱）：与 GUI 同一份触发语义（独立加载全局配置，
+    // 不动上面 default_timeout 的回退语义）；CLI 随即退出进程，必须阻塞发送
+    if let Ok(g) = crate::config::load_global() {
+        crate::notify::send_job_end_blocking(
+            &g,
+            &crate::notify::NotifyCtx {
+                label: format!("{}/{}", entry.project.name, je.job.name),
+                status_text: status.short(),
+                ok: status.ok(),
+                duration_ms: started.elapsed().as_millis() as u64,
+                run_id: cli_run_id,
+            },
+        );
+    }
     drop(end_tx); // 通道关闭 → printer 循环退出
     let _ = rt.block_on(printer);
     println!("==== {} ====", status.short());
@@ -448,11 +462,24 @@ fn run_group(args: &[String]) {
     rt.block_on(crate::group::GroupSink::on_event(
         &sink,
         LogEvent::JobEnd {
-            run_id: agg_run_id,
+            run_id: agg_run_id.clone(),
             status: agg.clone(),
             total_duration_ms: started.elapsed().as_millis() as u64,
         },
     ));
+    // 消息通知：组运行只发聚合一条（与 GUI 桌面通知同语义）；CLI 阻塞发送
+    if let Ok(g) = crate::config::load_global() {
+        crate::notify::send_job_end_blocking(
+            &g,
+            &crate::notify::NotifyCtx {
+                label: format!("{project_name}/{group_name}"),
+                status_text: agg.short(),
+                ok: agg.ok(),
+                duration_ms: started.elapsed().as_millis() as u64,
+                run_id: agg_run_id,
+            },
+        );
+    }
     let summary: Vec<String> = outcome
         .results
         .iter()

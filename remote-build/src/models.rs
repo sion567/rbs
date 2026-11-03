@@ -631,6 +631,10 @@ pub struct GlobalConfig {
     pub theme: Theme,
     /// PuTTY 配置
     pub putty: PuttyConfig,
+    /// 消息通知（Mattermost / 钉钉 / 邮箱）：作业结束时按渠道推送。
+    /// 凭据（webhook URL、钉钉 token/secret、SMTP 密码）一律存凭据管理器，不落 YAML
+    #[serde(skip_serializing_if = "NotifyConfig::is_default")]
+    pub notify: NotifyConfig,
 }
 
 impl Default for GlobalConfig {
@@ -645,6 +649,7 @@ impl Default for GlobalConfig {
             putty: PuttyConfig {
                 custom_path: None,
             },
+            notify: NotifyConfig::default(),
         }
     }
 }
@@ -654,6 +659,79 @@ pub struct PuttyConfig {
     /// 自定义 PuTTY 目录（需含 plink.exe / pscp.exe）；
     /// 未设置时探测系统 PATH → Program Files（内置捆绑目录 2026-10-28 移除）
     pub custom_path: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// 消息通知（Mattermost / 钉钉 / 邮箱）
+// ---------------------------------------------------------------------------
+
+/// 通知总配置：触发时机 + 各渠道开关。
+/// 全部字段 serde default——旧 config.yaml（无 notify 键）照常解析；
+/// 未启用任何渠道时序列化回 YAML 也整块省略，不污染手写配置。
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct NotifyConfig {
+    /// 作业失败时推送（默认开：失败通知是本功能的最初动机）
+    pub on_failure: bool,
+    /// 作业成功时推送（默认关：成功刷屏，失败才值得打扰）
+    pub on_success: bool,
+    /// Mattermost incoming webhook
+    pub mattermost: MattermostNotify,
+    /// 钉钉自定义机器人
+    pub dingtalk: DingTalkNotify,
+    /// 邮箱（SMTP 直发）
+    pub email: EmailNotify,
+}
+
+impl NotifyConfig {
+    /// 未启用任何渠道 = 全默认，序列化时整块省略（serde skip_serializing_if）
+    pub fn is_default(&self) -> bool {
+        *self == NotifyConfig::default()
+    }
+}
+
+/// Mattermost：webhook URL 是 bearer 凭据，存凭据管理器（键 notify:mattermost），
+/// YAML 只留开关
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct MattermostNotify {
+    pub enabled: bool,
+}
+
+/// 钉钉：access_token 与加签 secret 均为凭据，存凭据管理器
+/// （键 notify:dingtalk-token / notify:dingtalk-secret）
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct DingTalkNotify {
+    pub enabled: bool,
+}
+
+/// 邮箱：服务器参数非敏感，落 YAML；密码存凭据管理器（键 notify:smtp-password）。
+/// ssl: starttls（587 常规）/ ssl（465 隐式 TLS）/ none（25 明文，内网中继）
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct EmailNotify {
+    pub enabled: bool,
+    #[serde(default)]
+    pub smtp_host: String,
+    #[serde(default = "default_smtp_port")]
+    pub smtp_port: u16,
+    /// starttls / ssl / none（kebab）
+    #[serde(default = "default_smtp_ssl")]
+    pub ssl: String,
+    /// SMTP 认证用户名（一般即邮箱地址）；空 = 匿名（内网中继）
+    #[serde(default)]
+    pub username: String,
+    /// 发件人（缺省用 username）
+    #[serde(default)]
+    pub from: String,
+    /// 收件人列表
+    #[serde(default)]
+    pub to: Vec<String>,
+}
+
+fn default_smtp_port() -> u16 {
+    587
+}
+
+fn default_smtp_ssl() -> String {
+    "starttls".to_string()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1058,6 +1136,42 @@ targets:
         .unwrap();
         assert_eq!(old.default_timeout, 600);
         assert_eq!(old.putty.custom_path, None);
+    }
+
+    #[test]
+    fn notify_config_compat_and_roundtrip() {
+        // 旧 config.yaml（无 notify 键）照常解析，取全默认（全关）
+        let old: GlobalConfig = yaml_serde::from_str("theme: light").unwrap();
+        assert_eq!(old.notify, NotifyConfig::default());
+        assert!(!old.notify.on_failure);
+        assert!(!old.notify.mattermost.enabled);
+
+        // 新字段 roundtrip；未启用任何渠道时序列化整块省略（不污染手写配置）
+        let mut g = GlobalConfig::default();
+        g.notify.on_failure = true;
+        g.notify.email = EmailNotify {
+            enabled: true,
+            smtp_host: "smtp.corp.local".into(),
+            smtp_port: 465,
+            ssl: "ssl".into(),
+            username: "rbs@corp.local".into(),
+            from: String::new(),
+            to: vec!["ops@corp.local".into(), "dev@corp.local".into()],
+        };
+        let yaml = yaml_serde::to_string(&g).unwrap();
+        assert!(yaml.contains("notify:"), "有配置应序列化 notify 块: {yaml}");
+        assert!(yaml.contains("smtp.corp.local"));
+        assert!(yaml.contains("starttls") || yaml.contains("ssl"), "ssl 模式应落盘: {yaml}");
+        let back: GlobalConfig = yaml_serde::from_str(&yaml).unwrap();
+        assert_eq!(back.notify, g.notify);
+        assert_eq!(back.notify.email.to.len(), 2);
+
+        let bare = yaml_serde::to_string(&GlobalConfig::default()).unwrap();
+        // 注意 desktop_notify 含 "notify" 子串，须按行首键名判断
+        assert!(
+            !bare.lines().any(|l| l.starts_with("notify")),
+            "全默认应整块省略 notify: {bare}"
+        );
     }
 
     #[test]
