@@ -864,7 +864,7 @@ fn putty_section(ui: &mut egui::Ui, global: &mut crate::models::GlobalConfig) {
 }
 
 // ---------------------------------------------------------------------------
-// 全局参数（只读展示，P0）
+// 全局参数（超时可编辑，其余只读/开关即时落盘）
 // ---------------------------------------------------------------------------
 
 fn global_section(
@@ -885,7 +885,28 @@ fn global_section(
             ui.monospace(&global.projects_root);
             ui.end_row();
             ui.label("默认超时:");
-            ui.label(format!("{}s", global.default_timeout));
+            // 可编辑（此前只读展示）：未显式配 step.timeout 的步骤用它兜底；
+            // 0 = 不限时，与步骤级 timeout: 0 语义统一。改动即落盘 config.yaml
+            let dt_resp = ui.add(
+                egui::DragValue::new(&mut global.default_timeout)
+                    .suffix("s")
+                    .speed(10.0)
+                    .clip_text(true)
+                    // 无符号数拖到 0 以下会回绕成 u64::MAX（超时框真实踩过），
+                    // 上限 30 天足够任何构建
+                    .range(0..=2_592_000),
+            );
+            let dt_changed = dt_resp.changed();
+            let _ = dt_resp.on_hover_text(
+                "步骤没写 timeout 时的兜底超时（秒）。\n\
+                 0 = 这些步骤不限时；\n\
+                 只影响没写 timeout 的步骤，显式配置不受影响",
+            );
+            if dt_changed {
+                if let Err(e) = crate::config::save_global(global) {
+                    eprintln!("保存 config.yaml 失败: {e}");
+                }
+            }
             ui.end_row();
             ui.label("日志保留:");
             ui.label(format!("{} 天（日志文件与运行历史共用）", global.log_retention_days));

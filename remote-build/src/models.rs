@@ -616,7 +616,8 @@ impl<'de> Deserialize<'de> for AuthMethod {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GlobalConfig {
-    /// 步骤默认超时（秒）：步骤未显式配 step.timeout 时的兜底（引擎接线）
+    /// 步骤默认超时（秒）：步骤未显式配 step.timeout 时的兜底（引擎接线）；
+    /// 0 = 未配置步骤不限时
     pub default_timeout: u64,
     /// 日志与运行历史的保留天数（SQLite runs 按 started_at 清理）
     pub log_retention_days: u32,

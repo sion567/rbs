@@ -10,6 +10,7 @@ mod engine;
 mod env_detect;
 mod group;
 mod k8s;
+mod logging;
 mod models;
 mod notify;
 mod pack;
@@ -28,13 +29,15 @@ use std::sync::Arc;
 fn main() -> eframe::Result<()> {
     #[cfg(windows)]
     enable_utf8_console();
-    init_logger();
+    logging::init();
 
     // 无头子命令（脚本 / CI 使用），不带子命令则进入 GUI
     let cli_args: Vec<String> = std::env::args().skip(1).collect();
     if cli::dispatch(&cli_args).is_some() {
         return Ok(());
     }
+    // 看门狗只服务 GUI：CLI 子命令没有 UI 线程可监测
+    logging::spawn_watchdog();
     let runtime = Arc::new(
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -86,27 +89,4 @@ fn enable_utf8_console() {
         winapi::um::wincon::SetConsoleOutputCP(CP_UTF8);
         winapi::um::wincon::SetConsoleCP(CP_UTF8);
     }
-}
-
-/// 轻量 stderr logger：egui-winit / arboard / wgpu 的错误默认无人接收，
-/// 全部丢弃会让「复制坏了」这类问题无从排查（这里只落 Warn 及以上）。
-struct StderrLogger;
-
-static STDERR_LOGGER: StderrLogger = StderrLogger;
-
-impl log::Log for StderrLogger {
-    fn enabled(&self, metadata: &log::Metadata) -> bool {
-        metadata.level() <= log::Level::Warn
-    }
-
-    fn log(&self, record: &log::Record) {
-        eprintln!("[{} {}] {}", record.level(), record.target(), record.args());
-    }
-
-    fn flush(&self) {}
-}
-
-fn init_logger() {
-    let _ = log::set_logger(&STDERR_LOGGER);
-    log::set_max_level(log::LevelFilter::Warn);
 }

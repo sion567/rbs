@@ -5,6 +5,36 @@ use crate::models::{FailureAction, Job, Step, StepType, Tool};
 use crate::ui::status::{self, StepVisualState};
 use eframe::egui;
 use egui::Color32;
+use std::collections::HashMap;
+
+/// 项目级编辑缓冲（变量表 / 工具版本要求）：跨帧保存正在输入的文本。
+/// 直接绑 HashMap 键编辑会让行序随迭代乱跳、键名逐键变形——一律
+/// 「缓冲输入 → changed 时收集动作 → 渲染后统一校验应用」
+#[derive(Default)]
+pub struct ProjectEditBufs {
+    /// 新建变量组名输入缓冲
+    pub vars_new_group: String,
+    /// 组名 → 新变量名 / 新变量值（添加行缓冲）
+    pub var_new_key: HashMap<String, String>,
+    pub var_new_val: HashMap<String, String>,
+    /// 组名 → 改组名缓冲（✓ 确认才生效）
+    pub var_group_rename: HashMap<String, String>,
+    /// 两段删除确认：待删变量组名
+    pub var_del_armed: Option<String>,
+    /// 工具版本要求：新条目的工具名 / 版本表达式
+    pub tr_new_name: String,
+    pub tr_new_expr: String,
+}
+
+/// 组名变化（改名/删除）后清掉该组的全部输入缓冲，避免残留旧名键
+fn bufs_cleanup_group(bufs: &mut ProjectEditBufs, gname: &str) {
+    bufs.var_new_key.remove(gname);
+    bufs.var_new_val.remove(gname);
+    bufs.var_group_rename.remove(gname);
+    if bufs.var_del_armed.as_deref() == Some(gname) {
+        bufs.var_del_armed = None;
+    }
+}
 /// 步骤「工具」下拉的菜单数据：项目级 / 全局分组 + 合并解析表
 pub struct ToolMenu {
     /// 当前项目 project.yaml tools 的键（含对全局的覆盖），已排序
@@ -170,6 +200,19 @@ pub fn show(main: &mut MainState, ui: &mut egui::Ui) {
 
     // 同一 ProjectEntry 的两个字段分别借用（字段级借用拆分）
     let entry = &mut main.projects[pi];
+    // 变量组的引用计数（排除当前流程）：改名/删除前检查用。必须在 job_entry
+    // 的可变借用占住 entry.jobs 之前收集——之后整个 show 期间不能再遍历 jobs
+    let env_refs_other: HashMap<String, usize> = {
+        let mut m: HashMap<String, usize> = HashMap::new();
+        for (idx, je) in entry.jobs.iter().enumerate() {
+            if idx != ji {
+                if let Some(g) = &je.job.environment {
+                    *m.entry(g.clone()).or_default() += 1;
+                }
+            }
+        }
+        m
+    };
     let project = &mut entry.project;
     let Some(job_entry) = entry.jobs.get_mut(ji) else {
         return;
@@ -336,6 +379,45 @@ pub fn show(main: &mut MainState, ui: &mut egui::Ui) {
                     ui.separator();
                 }
             }
+            // 流程级总闸（job.timeout）：编译构建类流程一般不需要；
+            // 部署类可设兜底（如 1800）防失控（起步模板不再强加 60s 的教训）
+            match &mut job.timeout {
+                Some(v) => {
+                    ui.label("总超时:").on_hover_text(
+                        "流程级总闸（秒）：到点后剩余步骤不再启动，运行中的步骤被提前掐断。\n\
+                         填 0 = 不限时；🗑 清除 = 不限时（字段从 yaml 移除）。\n\
+                         单步超时在每张步骤卡片上配；没配的步骤走 ⚙ 设置的全局默认超时",
+                    );
+                    ui.add(
+                        egui::DragValue::new(v)
+                            .suffix("s")
+                            .speed(10.0)
+                            .clip_text(true)
+                            .min_size(egui::vec2(64.0, 0.0))
+                            // 无符号数拖到 0 以下会回绕成 u64::MAX（真实踩坑），30 天封顶
+                            .range(0..=2_592_000),
+                    );
+                    if *v == 0 {
+                        ui.weak("（不限时）");
+                    }
+                    if ui.small_button("🗑").clicked() {
+                        job.timeout = None;
+                    }
+                }
+                None => {
+                    if ui
+                        .small_button("⏱ 总超时")
+                        .on_hover_text(
+                            "加流程级总闸（job.timeout，默认 3600s）：到点后剩余步骤不再启动。\n\
+                             编译构建类流程一般不需要；部署类流程可设兜底防失控",
+                        )
+                        .clicked()
+                    {
+                        job.timeout = Some(3600);
+                    }
+                }
+            }
+            ui.separator();
             // 与 ⚙ 设置窗口的「🔧 工具管理」页同名：这里是一键直达本项目的工具覆盖页
             if ui
                 .button("🔧 工具管理")
@@ -444,7 +526,281 @@ pub fn show(main: &mut MainState, ui: &mut egui::Ui) {
         job.preconditions.push(crate::models::Precondition::default());
     }
 
-    ui.add_space(4.0);
+    // ── 变量表（project.yaml variables）──────────────────────────
+    // 此前只能手写 yaml（用户反馈：最常用、手写最容易错）。缓冲输入 →
+    // changed 收集动作 → 渲染后统一校验应用（键名逐键改会乱跳，见 ProjectEditBufs）
+    let mut var_add_group = false;
+    let mut var_del_group: Option<String> = None;
+    let mut var_rename_group: Option<(String, String)> = None; // (旧组名, 新组名)
+    let mut var_add: Option<String> = None; // 组名（键值从缓冲取）
+    let mut var_del: Option<(String, String)> = None; // (组名, 键)
+    let mut var_key_rename: Option<(String, String, String)> = None; // (组名, 旧键, 新键)
+    {
+        let bufs = &mut main.project_edit;
+        let total_vars: usize = project.variables.values().map(|g| g.vars.len()).sum();
+        let header = egui::CollapsingHeader::new(egui::RichText::new(format!(
+            "⛁ 变量表（{} 个变量组 / {} 个变量）",
+            project.variables.len(),
+            total_vars
+        )))
+        .icon(crate::ui::chevron_icon)
+        .id_salt("job_editor_variables")
+        .default_open(false);
+        ui.add_enabled_ui(!running, |ui| {
+            header.show(ui, |ui| {
+                ui.weak("${{ variables.键 }} 按当前流程的「变量组」从这里取值；改动随 💾 Save 写入 project.yaml。");
+                let mut gnames: Vec<String> = project.variables.keys().cloned().collect();
+                gnames.sort();
+                for gname in &gnames {
+                    let Some(group) = project.variables.get_mut(gname) else {
+                        continue;
+                    };
+                    ui.add_space(2.0);
+                    ui.horizontal(|ui| {
+                        ui.strong(gname);
+                        // 改组名：缓冲 + ✓ 确认（被其他流程引用时拒绝）
+                        let ren = bufs.var_group_rename.entry(gname.clone()).or_default();
+                        let resp = ui.add(
+                            egui::TextEdit::singleline(ren)
+                                .desired_width(110.0)
+                                .hint_text("新组名"),
+                        );
+                        if resp.changed()
+                            && !ren.trim().is_empty()
+                            && ren.trim() != gname
+                            && env_refs_other.get(gname).copied().unwrap_or(0) > 0
+                        {
+                            main.status_msg = Some(format!(
+                                "⚠ 变量组「{gname}」被其他 {} 个流程引用，先在那些流程里换组再改名",
+                                env_refs_other[gname]
+                            ));
+                            ren.clear();
+                        } else if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                            || ui.small_button("✓").clicked()
+                        {
+                            let new_name = ren.trim().to_string();
+                            if !new_name.is_empty() && &new_name != gname {
+                                var_rename_group = Some((gname.clone(), new_name));
+                            }
+                        }
+                        if bufs.var_del_armed.as_deref() == Some(gname.as_str()) {
+                            ui.colored_label(
+                                Color32::from_rgb(230, 120, 90),
+                                format!("删除「{gname}」？"),
+                            );
+                            if ui.small_button("确认").clicked() {
+                                var_del_group = Some(gname.clone());
+                            }
+                            if ui.small_button("取消").clicked() {
+                                bufs.var_del_armed = None;
+                            }
+                        } else if ui.small_button("🗑").clicked() {
+                            bufs.var_del_armed = Some(gname.clone());
+                        }
+                    });
+                    // 键值行：键名排序展示（HashMap 迭代序每帧乱跳，行会闪）
+                    let mut keys: Vec<String> = group.vars.keys().cloned().collect();
+                    keys.sort();
+                    for k in &keys {
+                        ui.horizontal(|ui| {
+                            let Some(val) = group.vars.get_mut(k) else {
+                                return;
+                            };
+                            // 改键名 = 收集动作（渲染后校验重名再换键）
+                            let mut kb = k.clone();
+                            let k_resp = ui.add(
+                                egui::TextEdit::singleline(&mut kb)
+                                    .desired_width(160.0)
+                                    .hint_text("键，如 REGISTRY"),
+                            );
+                            if k_resp.changed() && kb != *k && !kb.trim().is_empty() {
+                                var_key_rename = Some((gname.clone(), k.clone(), kb.trim().to_string()));
+                            }
+                            ui.add(
+                                egui::TextEdit::singleline(val)
+                                    .desired_width(ui.available_width() - 40.0)
+                                    .hint_text("值"),
+                            );
+                            if ui.small_button("🗑").clicked() {
+                                var_del = Some((gname.clone(), k.clone()));
+                            }
+                        });
+                    }
+                    // ＋变量行：键值缓冲（组名键控）
+                    let nk = bufs.var_new_key.entry(gname.clone()).or_default();
+                    let nv = bufs.var_new_val.entry(gname.clone()).or_default();
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(nk)
+                                .desired_width(160.0)
+                                .hint_text("新键名"),
+                        );
+                        ui.add(
+                            egui::TextEdit::singleline(nv)
+                                .desired_width(200.0)
+                                .hint_text("值（可含 ${{ … }} 占位符）"),
+                        );
+                        if ui.small_button("＋变量").clicked() && !nk.trim().is_empty() {
+                            var_add = Some(gname.clone());
+                        }
+                    });
+                }
+                ui.add_space(4.0);
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut bufs.vars_new_group)
+                            .desired_width(160.0)
+                            .hint_text("新变量组名，如 prod"),
+                    );
+                    if ui
+                        .small_button("＋新建变量组")
+                        .on_hover_text("同一流程换组即换一套参数（私服地址 / 部署目录等）；建好后在流程第 2 行「变量组」下拉选用")
+                        .clicked()
+                        && !bufs.vars_new_group.trim().is_empty()
+                    {
+                        var_add_group = true;
+                    }
+                });
+            });
+        });
+    }
+    // 应用变量表动作（渲染期收集，统一校验——重名/空名在此拦截）
+    if var_add_group {
+        let name = main.project_edit.vars_new_group.trim().to_string();
+        if !name.is_empty() && !project.variables.contains_key(&name) {
+            project.variables.insert(name, Default::default());
+        }
+        main.project_edit.vars_new_group.clear();
+    }
+    if let Some((old, new)) = var_rename_group {
+        if !project.variables.contains_key(&new) {
+            if let Some(g) = project.variables.remove(&old) {
+                project.variables.insert(new.clone(), g);
+            }
+            // 当前流程正用着旧组名 → 同步换过来；别的流程在收集期已拦截
+            if job.environment.as_deref() == Some(old.as_str()) {
+                job.environment = Some(new.clone());
+            }
+            bufs_cleanup_group(&mut main.project_edit, &old);
+            main.status_msg = Some(format!("变量组已改名: {old} → {new}（💾 Save 落盘）"));
+        } else {
+            main.status_msg = Some(format!("⚠ 变量组「{new}」已存在"));
+        }
+    }
+    if let Some(g) = var_del_group {
+        let referenced_by_current = job.environment.as_deref() == Some(g.as_str());
+        if referenced_by_current || env_refs_other.contains_key(&g) {
+            main.status_msg = Some(format!(
+                "⚠ 变量组「{g}」仍被流程引用（{} 个其他流程{}），先换掉引用再删",
+                env_refs_other.get(&g).copied().unwrap_or(0),
+                if referenced_by_current { "，含当前流程" } else { "" }
+            ));
+        } else {
+            project.variables.remove(&g);
+            bufs_cleanup_group(&mut main.project_edit, &g);
+            main.status_msg = Some(format!("变量组「{g}」已删除（💾 Save 落盘）"));
+        }
+        main.project_edit.var_del_armed = None;
+    }
+    if let Some((g, k)) = var_del {
+        if let Some(group) = project.variables.get_mut(&g) {
+            group.vars.remove(&k);
+        }
+    }
+    if let Some((g, old_k, new_k)) = var_key_rename {
+        if let Some(group) = project.variables.get_mut(&g) {
+            if !group.vars.contains_key(&new_k) {
+                if let Some(v) = group.vars.remove(&old_k) {
+                    group.vars.insert(new_k, v);
+                }
+            }
+        }
+    }
+    if let Some(g) = var_add {
+        let key = main.project_edit.var_new_key.get(&g).cloned().unwrap_or_default();
+        let val = main.project_edit.var_new_val.get(&g).cloned().unwrap_or_default();
+        if let Some(group) = project.variables.get_mut(&g) {
+            if group.vars.contains_key(key.trim()) {
+                main.status_msg = Some(format!("⚠ 变量「{}」已存在", key.trim()));
+            } else {
+                group.vars.insert(key.trim().to_string(), val);
+                main.project_edit.var_new_key.insert(g.clone(), String::new());
+                main.project_edit.var_new_val.insert(g, String::new());
+            }
+        }
+    }
+
+    // ── 工具版本要求（project.yaml tools_require，mise 风格）──────────
+    // 运行前逐项断言（>= / > / <= / < 段比较或前缀匹配），不满足零步失败。
+    // 此前只能手写 yaml
+    let mut tr_del: Option<String> = None;
+    let mut tr_add = false;
+    {
+        let bufs = &mut main.project_edit;
+        let header = egui::CollapsingHeader::new(egui::RichText::new(format!(
+            "🛠 工具版本要求（{} 项，运行前断言不满足即失败）",
+            project.tools_require.len()
+        )))
+        .icon(crate::ui::chevron_icon)
+        .id_salt("job_editor_tools_require")
+        .default_open(false);
+        ui.add_enabled_ui(!running, |ui| {
+            header.show(ui, |ui| {
+                ui.weak("表达式：\">=21\" 段比较、\"22\" 前缀匹配 22.x、\"22.1.3\" 精确；工具名须在 ⚙ 设置的工具清单里。");
+                let mut names: Vec<String> = project.tools_require.keys().cloned().collect();
+                names.sort();
+                for name in &names {
+                    ui.horizontal(|ui| {
+                        ui.monospace(name);
+                        let Some(expr) = project.tools_require.get_mut(name) else {
+                            return;
+                        };
+                        ui.add(
+                            egui::TextEdit::singleline(expr)
+                                .desired_width(160.0)
+                                .hint_text("\">=21\""),
+                        );
+                        if ui.small_button("🗑").clicked() {
+                            tr_del = Some(name.clone());
+                        }
+                    });
+                }
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut bufs.tr_new_name)
+                            .desired_width(160.0)
+                            .hint_text("工具名，如 java"),
+                    );
+                    ui.add(
+                        egui::TextEdit::singleline(&mut bufs.tr_new_expr)
+                            .desired_width(160.0)
+                            .hint_text("\">=21\""),
+                    );
+                    if ui.small_button("＋要求").clicked() && !bufs.tr_new_name.trim().is_empty() {
+                        tr_add = true;
+                    }
+                });
+            });
+        });
+    }
+    if let Some(name) = tr_del {
+        project.tools_require.remove(&name);
+    }
+    if tr_add {
+        let name = main.project_edit.tr_new_name.trim().to_string();
+        let expr = main.project_edit.tr_new_expr.trim().to_string();
+        if project.tools_require.contains_key(&name) {
+            main.status_msg = Some(format!("⚠ 工具「{name}」已有版本要求，先删旧再加"));
+        } else if expr.is_empty() {
+            main.status_msg = Some("⚠ 版本表达式不能为空".to_string());
+        } else {
+            project.tools_require.insert(name, expr);
+            main.project_edit.tr_new_name.clear();
+            main.project_edit.tr_new_expr.clear();
+        }
+    }
+
     ui.add_space(4.0);
 
     // ── 步骤列表 ─────────────────────────────────────────────────────
@@ -681,8 +1037,11 @@ fn create_job(main: &mut MainState) {
     }
     let path = crate::config::job_file_path(&dir, &display);
     if path.exists() {
-        main.new_job.message =
-            Some((false, format!("文件已存在: {}", path.display())));
+        main.new_job.message = Some((false, format!(
+            "文件已存在: {}（该文件不属于当前任何流程，多半是旧版改名留下的孤儿文件——\
+             确认无用后手动删除，或把文件里 name 字段改成要的流程名即可复用）",
+            path.display()
+        )));
         return;
     }
 
@@ -1461,8 +1820,12 @@ fn edit_step(
                 }
                 None => {
                     // 真实生效值 = config.yaml default_timeout（此前写死 "300s"，
-                    // 与全局默认 600s 不符，有误导）
-                    ui.weak(format!("超时:默认{default_timeout}s"));
+                    // 与全局默认 600s 不符，有误导）；全局默认 0 = 不限时
+                    if default_timeout == 0 {
+                        ui.weak("超时:不限时");
+                    } else {
+                        ui.weak(format!("超时:默认{default_timeout}s"));
+                    }
                     if ui.small_button("⏱").clicked() {
                         step.timeout = Some(300);
                     }
@@ -1771,6 +2134,40 @@ fn edit_step(
                 .clicked()
             {
                 step.condition = Some("${{ env.VERSION != '' }}".to_string());
+            }
+        });
+
+        // 📁 步骤级工作目录：相对项目代码目录的子目录（多模块仓库常用——
+        // backend / frontend 各自一条流水线）。可选行模式同「＋条件」：
+        // 多数步骤用不到，不设时常驻噪音压到最低
+        ui.horizontal(|ui| {
+            match &mut step.working_dir {
+                Some(wd) => {
+                    ui.label("工作目录:").on_hover_text(
+                        "本步骤命令的执行子目录（相对项目代码目录，如 backend、apps/web）。\n\
+                         留空 = 流程默认（job.working_dir）或项目根；支持 ${{ … }} 占位符",
+                    );
+                    ui.add(
+                        egui::TextEdit::singleline(wd)
+                            .desired_width(220.0)
+                            .hint_text("backend"),
+                    );
+                    if ui.small_button("🗑").clicked() {
+                        step.working_dir = None;
+                    }
+                }
+                None => {
+                    if ui
+                        .small_button("＋工作目录")
+                        .on_hover_text(
+                            "本步骤命令在项目代码目录的哪个子目录下执行；\n\
+                             命令里的相对路径（如 target/*.jar 产物）都以此为基准",
+                        )
+                        .clicked()
+                    {
+                        step.working_dir = Some(String::new());
+                    }
+                }
             }
         });
 

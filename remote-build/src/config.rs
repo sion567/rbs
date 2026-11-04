@@ -246,7 +246,9 @@ pub fn create_project_entry(name: &str, local_path: &Path) -> Result<PathBuf> {
         description: Some("起始流程，可在编辑器中修改".to_string()),
         target: Some("local".to_string()),
         environment: None,
-        timeout: Some(60),
+        // 作业级总闸不预设：起步流程编译/构建耗时不可预估，写死 60s 会把
+        // mvn 这类慢构建掐死（真实踩坑）。需要总闸的场景在编辑器里自行加
+        timeout: None,
         confirm: None,
         preconditions,
         handlers: Vec::new(),

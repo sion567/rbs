@@ -1164,8 +1164,26 @@ fn rename_job(main: &mut MainState, pi: usize, ji: usize, new_name: &str) {
     if new_name == old_name {
         return;
     }
+    // 文件名跟随流程名同步改（此前只改 yaml 里的 name 字段，文件还叫旧名，
+    // 之后新建同名流程会撞"文件已存在"）。目标文件已存在时拒绝改名，
+    // 旧文件原样保留——不静默覆盖别人
+    let dir = main.projects[pi].dir.clone();
+    let new_path = crate::config::job_file_path(&dir, &new_name);
+    if new_path != path && new_path.exists() {
+        main.status_msg = Some(format!(
+            "⚠ 改名失败：目标文件已存在（{}），换个名字或先处理它",
+            new_path.display()
+        ));
+        return;
+    }
     job.name = new_name.clone();
-    if let Err(e) = crate::storage::files::save_yaml(&path, &job) {
+    if new_path != path {
+        if let Err(e) = std::fs::rename(&path, &new_path) {
+            main.status_msg = Some(format!("改名失败（重命名文件）: {e}"));
+            return;
+        }
+    }
+    if let Err(e) = crate::storage::files::save_yaml(&new_path, &job) {
         main.status_msg = Some(format!("改名失败: {e}"));
         return;
     }

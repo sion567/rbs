@@ -36,7 +36,7 @@ pub struct RunInput {
     /// 本次运行唯一标识（与日志文件同名），供 ${{ run.id }}；空串 = 未设置
     pub run_id: String,
     /// 步骤未显式配置 timeout 时的默认超时秒数（来自 config.yaml default_timeout；
-    /// 0 视为未设置，回退 DEFAULT_STEP_TIMEOUT）
+    /// 0 = 未配置步骤不限时）
     pub default_step_timeout: u64,
     /// GHA concurrency 开关：传入本运行的取消发送端即启用「同项目运行互斥」
     /// （新运行接管锁文件 → 旧运行 watcher 自杀）。None = 不启用（单测/预览）。
@@ -182,12 +182,8 @@ impl Engine {
             .timeout
             .filter(|s| *s > 0)
             .map(|s| tokio::time::Instant::now() + Duration::from_secs(s));
-        // 步骤默认超时：config.yaml default_timeout（0/未传回退内置默认）
-        let default_step_timeout = if input.default_step_timeout == 0 {
-            DEFAULT_STEP_TIMEOUT
-        } else {
-            input.default_step_timeout
-        };
+        // 步骤默认超时：config.yaml default_timeout（0 = 未配置步骤不限时）
+        let default_step_timeout = input.default_step_timeout;
 
         // 前端工程：package.json 声明了 packageManager（钉版）时，
         // 本地步骤里的 pnpm/yarn 自动经 corepack 执行（用户无需知道 corepack 存在）
@@ -866,13 +862,14 @@ async fn run_single_step(
                 std::sync::Arc::new(std::sync::Mutex::new(String::new()))
             });
 
-            // timeout: Some(0) = 步骤级不限时（与作业级 0/不填同语义，0 曾是
-            // "立即超时"的死值，改为不限时后与 UI 提示一致）；None = 全局默认。
+            // timeout: Some(0) = 步骤级不限时；None = 全局默认 default_timeout，
+            // 全局默认 0 同样 = 不限时（0 在三层超时里语义统一：不限时）。
             // 不限时步骤仍受作业级 deadline 掐顶（run_step_with_retry 取更早者）
-            let step_timeout = if step.timeout == Some(0) {
-                None
-            } else {
-                Some(Duration::from_secs(step.timeout.unwrap_or(default_step_timeout)))
+            let step_timeout = match step.timeout {
+                Some(0) => None,
+                Some(t) => Some(Duration::from_secs(t)),
+                None if default_step_timeout == 0 => None,
+                None => Some(Duration::from_secs(default_step_timeout)),
             };
             let result = run_step_with_retry(
                 &transport,
@@ -2496,6 +2493,21 @@ mod tests {
         input.default_step_timeout = 1;
         let status = rt.block_on(engine.run_job(input, cancel_rx, tx));
         assert!(matches!(status, JobStatus::Timeout), "got: {status:?}");
+    }
+
+    #[test]
+    fn default_timeout_zero_is_unlimited() {
+        // 全局默认 default_timeout: 0 → 未显式配 timeout 的步骤不限时
+        //（三层超时语义统一：0 到处都是不限时）
+        let rt = runtime();
+        let (tx, _rx) = mpsc::channel(1024);
+        let (_cancel_tx, cancel_rx) = broadcast::channel(4);
+        let engine = Engine;
+
+        let mut input = simple_job(vec![exec_step("ping -n 3 127.0.0.1 > nul")]);
+        input.default_step_timeout = 0;
+        let status = rt.block_on(engine.run_job(input, cancel_rx, tx));
+        assert!(status.ok(), "默认超时 0 = 不限时，步骤应成功: {status:?}");
     }
 
     #[test]

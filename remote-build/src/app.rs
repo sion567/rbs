@@ -54,9 +54,19 @@ impl RemoteBuildApp {
 }
 
 impl eframe::App for RemoteBuildApp {
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // 看门狗心跳（logging::spawn_watchdog 每 1 秒核对一次）。放在 logic() 而非 ui()：
+        // 窗口隐藏 / 最小化时 eframe 不跑 egui pass（ui() 不被调用），只有 logic() 还会调。
+        // request_repaint_after 保证空闲期也有 0.5fps 心跳——否则空闲时完全不刷帧，
+        // 看门狗会把「没活干」误判成「卡死」
+        crate::logging::touch_ui();
+        ctx.request_repaint_after(Duration::from_secs(2));
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         match &mut self.page {
             Page::FirstRun(page) => {
+                crate::logging::set_screen("首次启动引导");
                 page.show(ui);
                 if page.confirmed() {
                     if let Some(report) = page.report.clone() {
@@ -69,8 +79,15 @@ impl eframe::App for RemoteBuildApp {
                     }
                 }
             }
-            Page::Main(main) => main.show(ui),
+            Page::Main(main) => {
+                crate::logging::set_screen("主界面");
+                main.show(ui)
+            }
         }
+    }
+
+    fn on_exit(&mut self) {
+        log::info!("==== 正常退出 ====");
     }
 }
 
@@ -220,6 +237,30 @@ pub struct MainState {
     /// 组运行实时进度（树上分组头显示 ▶ N/总数）：(组名, 当前第几个 1 起, 总数)。
     /// GroupJobBegin 推进 / 流程级 JobEnd 清除；单流程运行不设置
     pub group_run_progress: Option<(String, usize, usize)>,
+    /// 未保存修改检测基线：(项目名, 流程名, 保存/重选时的指纹)。
+    /// 每帧对比当前指纹：换了选中项静默重设基线；同一项指纹变了 = 有未保存修改。
+    /// reload / 保存成功都会重设基线
+    pub dirty_baseline: Option<(String, String, u64)>,
+    /// 当前选中流程是否有未保存修改（工具栏 ● 未保存 徽标 + 状态栏提示）
+    pub job_dirty: bool,
+    /// 项目级编辑缓冲（变量表 / 工具版本要求，job_editor 渲染用）
+    pub project_edit: ui::job_editor::ProjectEditBufs,
+}
+
+/// 选中配置的指纹：经 serde_json 归一化后哈希（会话内自比对，不要求跨版本稳定）。
+/// 不能直接哈希 Debug 文本：Project 里嵌着 HashMap，其迭代顺序每帧随机，
+/// 指纹会漂移 → 「● 未保存」徽标随机闪现（快照测试抓到的真 bug）。
+/// serde_json 默认无 preserve_order，Map 是 BTreeMap —— 按键排序，输出稳定
+fn config_fingerprint(project: &crate::models::Project, job: Option<&crate::models::Job>) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    serde_json::to_string(project)
+        .unwrap_or_default()
+        .hash(&mut h);
+    if let Some(j) = job {
+        serde_json::to_string(j).unwrap_or_default().hash(&mut h);
+    }
+    h.finish()
 }
 
 /// 👀 监听模式状态：盯住项目代码目录，变化后自动重跑指定流程
@@ -313,6 +354,9 @@ impl MainState {
             console: Default::default(),
             validation: Default::default(),
             git_branches: Default::default(),
+            dirty_baseline: None,
+            job_dirty: false,
+            project_edit: Default::default(),
             run: None,
             stop_requested: None,
             show_settings: false,
@@ -394,6 +438,9 @@ impl MainState {
             }
         };
         self.projects = files::discover_projects(&self.projects_root);
+        // reload 后内存与磁盘一致，未保存基线重置（下一帧 refresh_dirty 静默重建）
+        self.dirty_baseline = None;
+        self.job_dirty = false;
         // 校验结果随 reload 刷新（目录存在性 / .git 只在项目列表变化时才可能变）
         self.validation = self
             .projects
@@ -469,6 +516,7 @@ impl MainState {
         self.drain_events();
         self.drain_pull();
         self.poll_watch();
+        self.refresh_dirty();
 
         // ── 工具栏 ──────────────────────────────────────────────────
         egui::Panel::top("toolbar").show(ui, |ui| {
@@ -603,6 +651,10 @@ impl MainState {
                 // 运行中禁用一切会改盘/改配置的入口（引擎正按路径读写、状态可视化依赖步骤索引稳定）
                 if ui.add_enabled(!running, egui::Button::new("💾 Save")).clicked() {
                     self.save_selected();
+                }
+                if self.job_dirty {
+                    ui.colored_label(egui::Color32::from_rgb(230, 180, 80), "● 未保存")
+                        .on_hover_text("当前流程有未保存的修改（💾 Save 落盘后熄灭）");
                 }
                 if ui.add_enabled(!running, egui::Button::new("⟳ Reload")).clicked() {
                     self.reload();
@@ -1822,9 +1874,50 @@ impl MainState {
         };
 
         self.status_msg = Some(match (project_result, job_result) {
-            (Ok(()), Ok(())) => "已保存 ✅".to_string(),
+            (Ok(()), Ok(())) => {
+                // 保存成功 → 以当前内容为新基线，「● 未保存」徽标随之熄灭
+                let fp = config_fingerprint(&entry.project, entry.jobs.get(ji).map(|j| &j.job));
+                self.dirty_baseline = Some((
+                    entry.project.name.clone(),
+                    entry.jobs.get(ji).map(|j| j.job.name.clone()).unwrap_or_default(),
+                    fp,
+                ));
+                self.job_dirty = false;
+                "已保存 ✅".to_string()
+            }
             (Err(e), _) | (_, Err(e)) => format!("保存失败: {e}"),
         });
+    }
+
+    /// 每帧刷新 job_dirty：与保存时的基线指纹比对；换了选中项则静默重设基线
+    /// （选中变化不应误报「未保存」）。状态栏残留的「已保存 ✅」同步换成未保存提示
+    fn refresh_dirty(&mut self) {
+        self.job_dirty = false;
+        let (Some(pi), Some(ji)) = (self.selected_project, self.selected_job) else {
+            return;
+        };
+        let Some(entry) = self.projects.get(pi) else { return };
+        let fp = config_fingerprint(&entry.project, entry.jobs.get(ji).map(|j| &j.job));
+        let sel = (
+            entry.project.name.clone(),
+            entry
+                .jobs
+                .get(ji)
+                .map(|j| j.job.name.clone())
+                .unwrap_or_default(),
+        );
+        match &self.dirty_baseline {
+            Some((p, j, bfp)) if *p == sel.0 && *j == sel.1 => {
+                self.job_dirty = fp != *bfp;
+                // 「保存后再改，状态栏还挂着已保存 ✅」的真实反馈：指纹一变就换文案
+                if self.job_dirty && self.status_msg.as_deref() == Some("已保存 ✅") {
+                    self.status_msg = Some("✏ 有未保存的修改（💾 Save 落盘）".to_string());
+                }
+            }
+            _ => {
+                self.dirty_baseline = Some((sel.0, sel.1, fp));
+            }
+        }
     }
 }
 
