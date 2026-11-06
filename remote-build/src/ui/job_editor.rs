@@ -1103,6 +1103,52 @@ fn create_job(main: &mut MainState) {
     main.status_msg = Some(format!("流程「{display}」已创建 ✅"));
 }
 
+// ---------------------------------------------------------------------------
+// 速查窗口共用排版（变量语法速查 / 命令速查）
+// ---------------------------------------------------------------------------
+
+/// 折叠章头：默认展开（与旧版平铺等价），点标题收起——章节多（变量 9 节 / 命令 17 章）
+/// 时滚动定位快，长窗口不再一眼望不到底
+fn help_section(ui: &mut egui::Ui, title: &str, body: impl FnOnce(&mut egui::Ui)) {
+    egui::CollapsingHeader::new(title)
+        .default_open(true)
+        .show(ui, body);
+}
+
+/// 速查里的等宽行渲染：行内「空白 # …」注释拆到下一行灰字缩进展示。
+/// 此前注释与命令靠手工空格在同一行对齐，中文与等宽字体混排宽度对不齐，
+/// 窗口窄时折行更是全乱——结构性分行后排版不再依赖对齐，折行也不破坏结构。
+/// 整行注释（行首 #，示例里的步骤编号行）保持等宽灰字原样。
+fn help_mono(ui: &mut egui::Ui, line: &str) {
+    if line.trim_start().starts_with('#') {
+        ui.monospace(egui::RichText::new(line).weak());
+        return;
+    }
+    match split_inline_comment(line) {
+        Some((cmd, comment)) => {
+            ui.monospace(cmd.trim_end());
+            ui.indent("help_inline_cmt", |ui| {
+                ui.weak(egui::RichText::new(comment).small());
+            });
+        }
+        None => {
+            ui.monospace(line);
+        }
+    }
+}
+
+/// 行内注释切分：第一个前面是空白的 `#` 起算；无则 None。
+/// 速查数据（变量速查各节 / cmd_help_lines）里 # 只以注释形态出现，不存在裸 # 命令语法
+fn split_inline_comment(line: &str) -> Option<(&str, &str)> {
+    let bytes = line.as_bytes();
+    for i in 1..bytes.len() {
+        if bytes[i] == b'#' && (bytes[i - 1] == b' ' || bytes[i - 1] == b'\t') {
+            return Some((&line[..i], &line[i..]));
+        }
+    }
+    None
+}
+
 /// 「？ 变量语法」帮助窗口（速查表，与 docs/变量速查.md 内容一致）
 pub fn show_var_help_window(ctx: &egui::Context, main: &mut MainState) {
     let mut open = main.show_var_help;
@@ -1121,223 +1167,219 @@ pub fn show_var_help_window(ctx: &egui::Context, main: &mut MainState) {
             ui.weak("可用于步骤命令、步骤 env、工作目录、条件字段、wait 探测目标。执行前一次性替换；未解析的占位符原样保留。");
             ui.add_space(6.0);
 
-            ui.strong("一、取值形态");
-            // 不用 Grid：窗口按内容自适应宽度时，Grid 末列宽度 = 剩余空间（受 max_col_width
-            // 封顶），与窗口宽度互相反馈会塌缩成几个字符宽。改为「写法一行 + 来源/示例缩进
-            // 两行」的纵向堆叠，宽度只受窗口约束，永不互相挤压
-            let rows: Vec<(String, &str, &str)> = vec![
-                (
-                    "${{ variables.X }}".into(),
-                    "project.yaml 的 variables.<组名>（「变量组」下拉选中的表；YAML 字段名仍为 environment）",
-                    "选 prod 组时 ${{ variables.DEPLOY_DIR }} → /opt/yudao/prod",
-                ),
-                (
-                    "${{ 取值表达式 || 默认值 }}".into(),
-                    "左侧未定义时取默认值——|| 适用于所有取值形态（variables / env / targets.* / now* / run.id）；\
-                     默认值可带引号；左侧已定义但为空串仍算已定义（用空串，不取默认）",
-                    "${{ variables.PORT || 8080 }} / ${{ run.id || manual-run }}",
-                ),
-                (
-                    "${{ env.X }}".into(),
-                    "前序步骤产出（往 workspace/.env 写 KEY=VALUE，步骤成功后自动捕获；与 outputs 捕获同命名空间）",
-                    "前一步 echo VERSION=1.2.0>.env，本步 docker build -t app:${{ env.VERSION }}",
-                ),
-                (
-                    "${{ targets.名.字段 }}".into(),
-                    "本项目目标（project.yaml targets 表）的字段：host / port / user / kubeconfig /\ncontext / namespace / registry / work_root / name",
-                    "${{ targets.prod.host }} → 192.168.40.198",
-                ),
-                (
-                    "${{ now }}".into(),
-                    "运行启动时刻（引擎侧生成，一次运行所有步骤同值，备份后缀场景）",
-                    "cp app.jar app.jar.${{ now }} → app.jar.20261023153045",
-                ),
-                (
-                    "${{ now.date }} / ${{ now.time }} / ${{ now.iso }}".into(),
-                    "同上的日期 / 时间 / 可读格式",
-                    "20261023 · 153045 · 2026-10-23 15:30:45",
-                ),
-                (
-                    "${{ run.id }}".into(),
-                    "本次运行唯一标识（与控制台日志文件同名）",
-                    "echo ${{ run.id }} >> /opt/release.log",
-                ),
-                (
-                    "${VAR}".into(),
-                    "步骤产出 env → 环境变量表 → 系统环境变量（依次查找）",
-                    "${JAVA_HOME}",
-                ),
-            ];
-            for (syn, src, ex) in rows {
-                ui.add(egui::Label::new(egui::RichText::new(&syn).monospace()));
-                ui.indent("var_help_indent", |ui| {
-                    ui.add(egui::Label::new(egui::RichText::new(src).weak()).wrap());
-                    ui.add(egui::Label::new(egui::RichText::new(ex).monospace()).wrap());
-                });
-                ui.add_space(4.0);
-            }
-            ui.weak(
-                "⏱ 时区：now 系列 = 发版机本地时间；要以服务器时间为准，远端（SSH）步骤里直接写 \
-                 $(date +%Y%m%d%H%M%S)——由远端 shell 求值。跨步骤一致性用 ${{ now }}，服务器侧实时值用 $(date …)。",
-            );
+            help_section(ui, "一、取值形态", |ui| {
+                // 不用 Grid：窗口按内容自适应宽度时，Grid 末列宽度 = 剩余空间（受 max_col_width
+                // 封顶），与窗口宽度互相反馈会塌缩成几个字符宽。改为「写法一行 + 来源/示例缩进
+                // 两行」的纵向堆叠，宽度只受窗口约束，永不互相挤压
+                let rows: Vec<(String, &str, &str)> = vec![
+                    (
+                        "${{ variables.X }}".into(),
+                        "project.yaml 的 variables.<组名>（「变量组」下拉选中的表；YAML 字段名仍为 environment）",
+                        "选 prod 组时 ${{ variables.DEPLOY_DIR }} → /opt/yudao/prod",
+                    ),
+                    (
+                        "${{ 取值表达式 || 默认值 }}".into(),
+                        "左侧未定义时取默认值——|| 适用于所有取值形态（variables / env / targets.* / now* / run.id）；\
+                         默认值可带引号；左侧已定义但为空串仍算已定义（用空串，不取默认）",
+                        "${{ variables.PORT || 8080 }} / ${{ run.id || manual-run }}",
+                    ),
+                    (
+                        "${{ env.X }}".into(),
+                        "前序步骤产出（往 workspace/.env 写 KEY=VALUE，步骤成功后自动捕获；与 outputs 捕获同命名空间）",
+                        "前一步 echo VERSION=1.2.0>.env，本步 docker build -t app:${{ env.VERSION }}",
+                    ),
+                    (
+                        "${{ targets.名.字段 }}".into(),
+                        "本项目目标（project.yaml targets 表）的字段：host / port / user / kubeconfig /\ncontext / namespace / registry / work_root / name",
+                        "${{ targets.prod.host }} → 192.168.40.198",
+                    ),
+                    (
+                        "${{ now }}".into(),
+                        "运行启动时刻（引擎侧生成，一次运行所有步骤同值，备份后缀场景）",
+                        "cp app.jar app.jar.${{ now }} → app.jar.20261023153045",
+                    ),
+                    (
+                        "${{ now.date }} / ${{ now.time }} / ${{ now.iso }}".into(),
+                        "同上的日期 / 时间 / 可读格式",
+                        "20261023 · 153045 · 2026-10-23 15:30:45",
+                    ),
+                    (
+                        "${{ run.id }}".into(),
+                        "本次运行唯一标识（与控制台日志文件同名）",
+                        "echo ${{ run.id }} >> /opt/release.log",
+                    ),
+                    (
+                        "${VAR}".into(),
+                        "步骤产出 env → 环境变量表 → 系统环境变量（依次查找）",
+                        "${JAVA_HOME}",
+                    ),
+                ];
+                for (syn, src, ex) in rows {
+                    ui.add(egui::Label::new(egui::RichText::new(&syn).monospace()));
+                    ui.indent("var_help_indent", |ui| {
+                        ui.add(egui::Label::new(egui::RichText::new(src).weak()).wrap());
+                        ui.add(egui::Label::new(egui::RichText::new(ex).monospace()).wrap());
+                    });
+                    ui.add_space(4.0);
+                }
+                ui.weak(
+                    "⏱ 时区：now 系列 = 发版机本地时间；要以服务器时间为准，远端（SSH）步骤里直接写 \
+                     $(date +%Y%m%d%H%M%S)——由远端 shell 求值。跨步骤一致性用 ${{ now }}，服务器侧实时值用 $(date …)。",
+                );
 
-            ui.add_space(8.0);
-            ui.separator();
-            ui.add_space(4.0);
-            ui.strong("二、条件与状态守卫（步骤的「＋条件」/「＋creates」字段；YAML 里 when: 与 condition: 等价）");
-            ui.monospace("${{ env.VERSION != '' }}        # 非空才执行本步；为空/未产出/拼错 → 跳过");
-            ui.monospace("${{ env.VERSION == '' }}         # 为空才执行（首次构建场景：还没版本号时）");
-            ui.monospace("${{ variables.ENV }} == prod    # 与字面量等值比较");
-            ui.monospace("${{ variables.ENV }} == 'prod'  # 字面量可带引号（单/双引号成对去除）");
-            ui.monospace("${{ variables.ENV }} != prod    # 不等比较；左侧未定义按空串参与");
-            ui.monospace("variables.A == variables.B     # 两侧都可为取值表达式（支持 || 默认值）");
-            ui.monospace("${{ targets.prod.port }} == 2222 # 数字按文本精确匹配（== 只做字符串比较）");
-            ui.monospace("creates: node_modules         # 产物路径已存在 → 跳过本步（重跑秒过）");
-            ui.weak("条件两侧支持 env. / variables. / targets.名.字段 / now / run.id；解析失败按真值执行并警告（fail-open）。");
-            ui.weak("⚠ 仅支持 == / !=，不支持 > < >= <= 数值比较——需要时在命令里用 shell 判断（如 [ \"$N\" -gt 3 ] && exit 1）。");
-            ui.weak("比较右侧的取值表达式未定义时，会按字面量文本参与比较（通常判不等）——两侧都可能未定义时，改用 != '' 判空。");
-            ui.weak("creates 路径：本地步骤相对项目目录（支持 * ? 通配）；SSH 步骤为远端路径（相对 = work_root），远端用 test -e 判定。");
+            });
 
-            ui.add_space(8.0);
-            ui.separator();
-            ui.add_space(4.0);
-            ui.strong("三、关键行为");
-            ui.weak("• 执行前一次性替换：不是运行时动态读。命令可预览、可日志、可审计。");
-            ui.weak("• 未解析的占位符原样保留：${{ variables.TYPO }} 拼错会原样出现在命令里，一眼可见（预览会 ⚠）。");
-            ui.weak("• 步骤间传递：前一步往 workspace/.env 追加 KEY=VALUE，或声明 outputs 正则捕获 stdout；后续步骤 ${{ env.KEY }} 引用。");
-            ui.weak("• 注意：本地命令已由引擎包 cmd /C 执行，直接写 echo VERSION=… 即可；手写 cmd /C 嵌套会引入引号残留。");
+            help_section(ui, "二、条件与状态守卫（步骤的「＋条件」/「＋creates」字段；YAML 里 when: 与 condition: 等价）", |ui| {
+                help_mono(ui, "${{ env.VERSION != '' }}        # 非空才执行本步；为空/未产出/拼错 → 跳过");
+                help_mono(ui, "${{ env.VERSION == '' }}         # 为空才执行（首次构建场景：还没版本号时）");
+                help_mono(ui, "${{ variables.ENV }} == prod    # 与字面量等值比较");
+                help_mono(ui, "${{ variables.ENV }} == 'prod'  # 字面量可带引号（单/双引号成对去除）");
+                help_mono(ui, "${{ variables.ENV }} != prod    # 不等比较；左侧未定义按空串参与");
+                help_mono(ui, "variables.A == variables.B     # 两侧都可为取值表达式（支持 || 默认值）");
+                help_mono(ui, "${{ targets.prod.port }} == 2222 # 数字按文本精确匹配（== 只做字符串比较）");
+                help_mono(ui, "creates: node_modules         # 产物路径已存在 → 跳过本步（重跑秒过）");
+                ui.weak("条件两侧支持 env. / variables. / targets.名.字段 / now / run.id；解析失败按真值执行并警告（fail-open）。");
+                ui.weak("⚠ 仅支持 == / !=，不支持 > < >= <= 数值比较——需要时在命令里用 shell 判断（如 [ \"$N\" -gt 3 ] && exit 1）。");
+                ui.weak("比较右侧的取值表达式未定义时，会按字面量文本参与比较（通常判不等）——两侧都可能未定义时，改用 != '' 判空。");
+                ui.weak("creates 路径：本地步骤相对项目目录（支持 * ? 通配）；SSH 步骤为远端路径（相对 = work_root），远端用 test -e 判定。");
 
-            ui.add_space(8.0);
-            ui.separator();
-            ui.add_space(4.0);
-            ui.strong("四、env 注入优先级（后者被前者覆盖）");
-            ui.monospace("步骤 env > 工具 env > target env > 系统环境变量");
-            ui.weak("JAVA_HOME 这类注入只影响该步骤的子进程，不改系统设置；env.X 特指前序步骤产出，全局配置请走 variables.X。");
+            });
 
-            ui.add_space(8.0);
-            ui.separator();
-            ui.add_space(4.0);
-            ui.strong("五、流程级开关（build.yaml）");
-            ui.monospace("confirm: prod            # 确认门：运行前弹窗输入 prod 才放行");
-            ui.monospace("preconditions:           # 前置检查：发版机本地断言，失败零秒退出（只放检查，别放拉代码/构建等动作）");
-            ui.monospace("  - check: java -version");
-            ui.monospace("    message: JDK 未安装");
-            ui.monospace("timeout: 600             # 流程级总超时（秒；0/不填 = 不限时）；步骤级 timeout: 0 同为不限时");
-            ui.monospace("working_dir: sub/dir     # 项目级默认工作目录（相对项目目录）");
-            ui.monospace("tools_require:           # 工具版本要求（project.yaml，mise 风格）");
-            ui.monospace("  java: \">=21\"           # >= > <= < 数字段比较；\"22\" 前缀匹配 22.x；\"22.1.3\" 精确");
-            ui.weak("运行期自动自检：引擎启动时对本次用到的工具逐个跑 version_check 现算版本，\n未配 version_check 的工具降级为检查 command 是否存在；失败零步失败 + 人话报错。\n同项目运行互斥（GHA concurrency）：新运行自动取消旧运行，无需配置。");
+            help_section(ui, "三、关键行为", |ui| {
+                ui.weak("• 执行前一次性替换：不是运行时动态读。命令可预览、可日志、可审计。");
+                ui.weak("• 未解析的占位符原样保留：${{ variables.TYPO }} 拼错会原样出现在命令里，一眼可见（预览会 ⚠）。");
+                ui.weak("• 步骤间传递：前一步往 workspace/.env 追加 KEY=VALUE，或声明 outputs 正则捕获 stdout；后续步骤 ${{ env.KEY }} 引用。");
+                ui.weak("• 注意：本地命令已由引擎包 cmd /C 执行，直接写 echo VERSION=… 即可；手写 cmd /C 嵌套会引入引号残留。");
 
-            ui.add_space(8.0);
-            ui.separator();
-            ui.add_space(4.0);
-            ui.strong("六、运行时变量与变更触发（outputs / notify / handlers / wait）");
-            ui.monospace("outputs:                 # 步骤 stdout 按正则捕获 → ${{ env.键 }}");
-            ui.monospace("  VER: 'VERSION=(\\S+)'   # 有捕获组取组 1，无则取整行匹配；未匹配留空并告警");
-            ui.monospace("notify: [重启服务]       # 本步骤真的执行/真传了新内容 → 登记通知");
-            ui.monospace("handlers:                # 流程成功收尾后按定义顺序执行被通知到的");
-            ui.monospace("  - name: 重启服务");
-            ui.monospace("    command: systemctl restart app");
-            ui.weak("creates / when 跳过、上传 hash 未变更 → 不算变更，handler 不执行（Ansible handlers 语义）。");
-            ui.monospace("secret_env:               # 凭据注入：环境变量名 → 凭据管理器键");
-            ui.monospace("  MYSQL_PWD: db/prod-mysql # 运行时取密码注入子进程 env；先 set-password 存密码");
-            ui.weak("数据库备份（mysqldump / pg_dump）配合 tool 绑定使用——密码不进命令行、不落 YAML。");
-            ui.monospace("wait: { mode: tcp, target: 1.2.3.4:8080 }");
-            ui.weak("wait 探测三模式：命令 / tcp 可连 / http 2xx（部署后验证可达，从发版机直连）；interval_seconds 缺省 5。");
-            ui.monospace("wait: { mode: command, target: 探测命令, fail_exit_code: 2 }");
-            ui.weak(
-                "fail_exit_code：探测命令返回该退出码 = 任务已死，立即失败不再傻等\n\
-                 （长任务配方：远端 nohup 起任务写 status 文件，探测读它，failed 以约定码退出）",
-            );
+            });
 
-            ui.add_space(8.0);
-            ui.strong("七、实战示例");
-            ui.strong("① 微服务发布最小骨架");
-            ui.monospace("# 1. 本地构建（creates 守卫：产物在就跳过）");
-            ui.monospace("mvn -B clean package -DskipTests     creates: target/*.jar");
-            ui.monospace("# 2. 上传（多 jar 多行映射；内容未变更自动跳过）");
-            ui.monospace("target/user.jar -> release/user.jar");
-            ui.monospace("target/order.jar -> release/order.jar    notify: [重启服务]");
-            ui.monospace("# 3. 远端重启（handler：只有真的传了新包才执行）");
-            ui.monospace("systemctl restart app && ${{ now.iso }} >> /opt/release.log");
-            ui.monospace("# 4. 等健康（wait tcp 从发版机探测，2 分钟总限）");
-            ui.monospace("wait: { mode: tcp, target: ${{ targets.prod.host }}:8080 }   timeout: 120");
+            help_section(ui, "四、env 注入优先级（后者被前者覆盖）", |ui| {
+                help_mono(ui, "步骤 env > 工具 env > target env > 系统环境变量");
+                ui.weak("JAVA_HOME 这类注入只影响该步骤的子进程，不改系统设置；env.X 特指前序步骤产出，全局配置请走 variables.X。");
 
-            ui.add_space(6.0);
-            ui.strong("② 条件实战（when / condition）");
-            ui.monospace("command: systemctl restart app    condition: ${{ variables.ENV }} == prod");
-            ui.monospace("#  ↑ 生产才重启；测试环境跑同一流程时本步自动跳过");
-            ui.monospace("command: curl -s .../debug/stats  condition: ${{ variables.ENV }} != prod");
-            ui.monospace("#  ↑ 非生产才采集调试信息");
-            ui.monospace("command: mvn deploy               condition: ${{ env.VERSION != '' }}");
-            ui.monospace("#  ↑ 上一步没产出版本号（构建失败/被跳过）→ 部署步也跳过");
+            });
 
-            ui.add_space(6.0);
-            ui.strong("③ 默认值实战（|| 适用于所有取值形态）");
-            ui.monospace("docker push ${{ variables.REGISTRY || registry.local:5000 }}/app:${{ env.TAG }}");
-            ui.monospace("#  ↑ 变量组没配 REGISTRY 时兜底本地仓库");
-            ui.monospace("echo 手动触发（run_id=${{ run.id || manual }}）>> /opt/audit.log");
-            ui.monospace("#  ↑ run.id 缺省（占位）时兜底固定标记");
+            help_section(ui, "五、流程级开关（build.yaml）", |ui| {
+                help_mono(ui, "confirm: prod            # 确认门：运行前弹窗输入 prod 才放行");
+                help_mono(ui, "preconditions:           # 前置检查：发版机本地断言，失败零秒退出（只放检查，别放拉代码/构建等动作）");
+                help_mono(ui, "  - check: java -version");
+                help_mono(ui, "    message: JDK 未安装");
+                help_mono(ui, "timeout: 600             # 流程级总超时（秒；0/不填 = 不限时）；步骤级 timeout: 0 同为不限时");
+                help_mono(ui, "working_dir: sub/dir     # 项目级默认工作目录（相对项目目录）");
+                help_mono(ui, "tools_require:           # 工具版本要求（project.yaml，mise 风格）");
+                help_mono(ui, "  java: \">=21\"           # >= > <= < 数字段比较；\"22\" 前缀匹配 22.x；\"22.1.3\" 精确");
+                ui.weak("运行期自动自检：引擎启动时对本次用到的工具逐个跑 version_check 现算版本，\n未配 version_check 的工具降级为检查 command 是否存在；失败零步失败 + 人话报错。\n同项目运行互斥（GHA concurrency）：新运行自动取消旧运行，无需配置。");
 
-            ui.add_space(6.0);
-            ui.strong("④ outputs 捕获 → 后续步骤引用（运行时变量）");
-            ui.monospace("# 步骤 A：捕获版本号（正则取 stdout，有捕获组取组 1）");
-            ui.monospace("command: mvn help:evaluate -Dexpression=project.version -q -DforceStdout");
-            ui.monospace("outputs: { VER: '(\\S+)$' }");
-            ui.monospace("# 步骤 B：直接引用（构建镜像并推送）");
-            ui.monospace("command: docker build -t registry/app:${{ env.VER }} .");
-            ui.monospace("command: docker push registry/app:${{ env.VER }}");
+            });
 
-            ui.add_space(6.0);
-            ui.strong("⑤ targets 字段拼装（连接信息不写死在命令里）");
-            ui.monospace("echo ssh -p ${{ targets.prod.port }} ${{ targets.prod.user }}@${{ targets.prod.host }}");
-            ui.monospace("rsync -av release/ ${{ targets.prod.user }}@${{ targets.prod.host }}:${{ targets.prod.work_root }}/");
+            help_section(ui, "六、运行时变量与变更触发（outputs / notify / handlers / wait）", |ui| {
+                help_mono(ui, "outputs:                 # 步骤 stdout 按正则捕获 → ${{ env.键 }}");
+                help_mono(ui, "  VER: 'VERSION=(\\S+)'   # 有捕获组取组 1，无则取整行匹配；未匹配留空并告警");
+                help_mono(ui, "notify: [重启服务]       # 本步骤真的执行/真传了新内容 → 登记通知");
+                help_mono(ui, "handlers:                # 流程成功收尾后按定义顺序执行被通知到的");
+                help_mono(ui, "  - name: 重启服务");
+                help_mono(ui, "    command: systemctl restart app");
+                ui.weak("creates / when 跳过、上传 hash 未变更 → 不算变更，handler 不执行（Ansible handlers 语义）。");
+                help_mono(ui, "secret_env:               # 凭据注入：环境变量名 → 凭据管理器键");
+                help_mono(ui, "  MYSQL_PWD: db/prod-mysql # 运行时取密码注入子进程 env；先 set-password 存密码");
+                ui.weak("数据库备份（mysqldump / pg_dump）配合 tool 绑定使用——密码不进命令行、不落 YAML。");
+                help_mono(ui, "wait: { mode: tcp, target: 1.2.3.4:8080 }");
+                ui.weak("wait 探测三模式：命令 / tcp 可连 / http 2xx（部署后验证可达，从发版机直连）；interval_seconds 缺省 5。");
+                help_mono(ui, "wait: { mode: command, target: 探测命令, fail_exit_code: 2 }");
+                ui.weak(
+                    "fail_exit_code：探测命令返回该退出码 = 任务已死，立即失败不再傻等\n\
+                     （长任务配方：远端 nohup 起任务写 status 文件，探测读它，failed 以约定码退出）",
+                );
 
-            ui.add_space(6.0);
-            ui.strong("⑥ ${VAR} 系统变量兜底 + run.id 台账");
-            ui.monospace("echo JAVA_HOME=${JAVA_HOME}     # 步骤产出 env → 变量表 → 系统环境变量");
-            ui.monospace("echo ${{ now.iso }} run=${{ run.id }} >> ${{ targets.prod.work_root }}/release.log");
+            });
 
-            ui.add_space(8.0);
-            ui.separator();
-            ui.add_space(4.0);
-            ui.strong("八、pack 打包格式与排除（映射行的目标扩展名决定格式）");
-            ui.monospace("target/ -> dist/app.tar.gz --exclude node_modules --exclude *.map");
-            ui.weak(".zip → zip；.tar.gz / .tgz → tar+gzip（tar 保留 +x 权限，Windows 打 zip 到 Linux 解压会丢）；\n\
-                     排除 = rsync --exclude 语义：字面量按目录/文件名分量整棵排除，* ? 通配相对路径与文件名。");
-            ui.monospace("dist -> app.tar.gz        # 目录源带目录名根（里面是 dist/...，同 tar -czf / zip -r 习惯）");
-            ui.monospace("dist/. -> app.tar.gz      # 源以 /. 结尾 = tar -C dist . 语义：条目不带目录根，解包直接铺文件");
-            ui.weak("单文件 / 通配源条目为裸文件名。");
+            help_section(ui, "七、实战示例", |ui| {
+                ui.strong("① 微服务发布最小骨架");
+                help_mono(ui, "# 1. 本地构建（creates 守卫：产物在就跳过）");
+                help_mono(ui, "mvn -B clean package -DskipTests     creates: target/*.jar");
+                help_mono(ui, "# 2. 上传（多 jar 多行映射；内容未变更自动跳过）");
+                help_mono(ui, "target/user.jar -> release/user.jar");
+                help_mono(ui, "target/order.jar -> release/order.jar    notify: [重启服务]");
+                help_mono(ui, "# 3. 远端重启（handler：只有真的传了新包才执行）");
+                help_mono(ui, "systemctl restart app && ${{ now.iso }} >> /opt/release.log");
+                help_mono(ui, "# 4. 等健康（wait tcp 从发版机探测，2 分钟总限）");
+                help_mono(ui, "wait: { mode: tcp, target: ${{ targets.prod.host }}:8080 }   timeout: 120");
 
-            ui.add_space(8.0);
-            ui.separator();
-            ui.add_space(4.0);
-            ui.strong("九、常用命令速查（构建 / 部署高频命令；逐参数说明见 docs/命令速查.md）");
-            ui.monospace("mvn -B clean package -DskipTests -T 1C   # -B 非交互 -q 静默 -P prod 选 profile -U 刷 SNAPSHOT");
-            ui.monospace("mvn -pl 模块 -am clean package           # 只构建指定模块及依赖；-o 离线；timeout 建议 1800");
-            ui.monospace("mvn help:evaluate -Dexpression=project.version -q -DforceStdout   # 配 outputs 捕获版本号");
-            ui.monospace("gradlew.bat bootJar --no-daemon -x test -Penv=prod   # Windows 本地必须 .bat；远端 Linux 写 ./gradlew");
-            ui.monospace("pnpm install --frozen-lockfile && pnpm run build     # CI 标准装依赖（不一致即失败）；creates: node_modules");
-            ui.monospace("docker build -t reg/app:${{ env.VER }} . && docker push reg/app:${{ env.VER }}");
-            ui.monospace("docker save -o app.tar reg/app:tag       # 离线包走 upload → 目标机 docker load -i（无 registry 链路）");
-            ui.monospace("kubectl apply -f deploy.yaml -n ${{ variables.NAMESPACE }}   # k8s 目标自动注入 KUBECONFIG，无需手动指定");
-            ui.monospace("kubectl rollout status deployment/app --timeout=120s   # restart / undo 回滚 / logs -f --tail=100");
-            ui.monospace("mysqldump -h 主机 -P 3306 -u root --single-transaction 库名 > backup.sql   # 大写 -P；不锁表；密码走 secret_env");
-            ui.monospace("mysql -h 主机 -P 3306 -u root -D 库 -e \"SQL\"   # -e 单条 SQL；导入恢复：mysql 库 < dump.sql");
-            ui.monospace("pg_dump -h 主机 -p 5432 -U postgres -f backup.sql 库名   # 小写 -p（跟 mysql 相反）；密码 PGPASSWORD");
-            ui.monospace("systemctl restart app && systemctl is-active --quiet app   # is-active 退出码 = 判活，可接前置检查");
-            ui.monospace("journalctl -u app -n 100 --since \"10 min ago\"   # -f 跟踪日志 -p err 只看错误");
-            ui.monospace("tar -xzf app.tar.gz -C /opt/app          # 解包铺目录；-czf 建 --exclude 排除 -tzf 只看不解");
-            ui.monospace("find /opt/backup -name \"app-*.jar\" -mtime +7 -delete   # 清 7 天前备份；du -sh /opt/* 看占用");
-            ui.monospace("java -Xms512m -Xmx2g -jar app.jar --spring.profiles.active=prod   # JVM 参数在 -jar 前，-- 程序参数在后");
-            ui.monospace("netstat -ano | findstr :8080 & taskkill /PID 1234 /F   # Windows 本地查端口占用并强杀（sc query 查服务）");
-            ui.monospace("robocopy dist release /MIR /XD node_modules   # Windows 镜像同步；退出码 0-7 都算成功，需接 if %ERRORLEVEL% GEQ 8 判失败");
-            ui.monospace("nginx -t && nginx -s reload              # 测配置语法后热加载；502 先看 /var/log/nginx/error.log");
-            ui.monospace("sha256sum app.tar.gz                     # 传后校验；Windows 本地 certutil -hashfile 文件 SHA256");
-            ui.weak("【本地】步骤 = 发版机 Windows（cmd 语法：&& | > 可用，$VAR 不可用）；【远端】SSH 步骤 = Linux 全语法。\n\
-                     Shell 片段（判断 / $( ) / xargs / wait 探测模板）、Windows cmd 全套（robocopy / mklink / certutil…）、\n\
-                     Java 运行时与排障（jps / jstack / keytool）、Nginx、apt / yum、7z、redis-cli 等\n\
-                     完整逐参数说明：工具栏「❓ 命令速查」窗口（docs/命令速查.md）。");
+                ui.add_space(6.0);
+                ui.strong("② 条件实战（when / condition）");
+                help_mono(ui, "command: systemctl restart app    condition: ${{ variables.ENV }} == prod");
+                help_mono(ui, "#  ↑ 生产才重启；测试环境跑同一流程时本步自动跳过");
+                help_mono(ui, "command: curl -s .../debug/stats  condition: ${{ variables.ENV }} != prod");
+                help_mono(ui, "#  ↑ 非生产才采集调试信息");
+                help_mono(ui, "command: mvn deploy               condition: ${{ env.VERSION != '' }}");
+                help_mono(ui, "#  ↑ 上一步没产出版本号（构建失败/被跳过）→ 部署步也跳过");
+
+                ui.add_space(6.0);
+                ui.strong("③ 默认值实战（|| 适用于所有取值形态）");
+                help_mono(ui, "docker push ${{ variables.REGISTRY || registry.local:5000 }}/app:${{ env.TAG }}");
+                help_mono(ui, "#  ↑ 变量组没配 REGISTRY 时兜底本地仓库");
+                help_mono(ui, "echo 手动触发（run_id=${{ run.id || manual }}）>> /opt/audit.log");
+                help_mono(ui, "#  ↑ run.id 缺省（占位）时兜底固定标记");
+
+                ui.add_space(6.0);
+                ui.strong("④ outputs 捕获 → 后续步骤引用（运行时变量）");
+                help_mono(ui, "# 步骤 A：捕获版本号（正则取 stdout，有捕获组取组 1）");
+                help_mono(ui, "command: mvn help:evaluate -Dexpression=project.version -q -DforceStdout");
+                help_mono(ui, "outputs: { VER: '(\\S+)$' }");
+                help_mono(ui, "# 步骤 B：直接引用（构建镜像并推送）");
+                help_mono(ui, "command: docker build -t registry/app:${{ env.VER }} .");
+                help_mono(ui, "command: docker push registry/app:${{ env.VER }}");
+
+                ui.add_space(6.0);
+                ui.strong("⑤ targets 字段拼装（连接信息不写死在命令里）");
+                help_mono(ui, "echo ssh -p ${{ targets.prod.port }} ${{ targets.prod.user }}@${{ targets.prod.host }}");
+                help_mono(ui, "rsync -av release/ ${{ targets.prod.user }}@${{ targets.prod.host }}:${{ targets.prod.work_root }}/");
+
+                ui.add_space(6.0);
+                ui.strong("⑥ ${VAR} 系统变量兜底 + run.id 台账");
+                help_mono(ui, "echo JAVA_HOME=${JAVA_HOME}     # 步骤产出 env → 变量表 → 系统环境变量");
+                help_mono(ui, "echo ${{ now.iso }} run=${{ run.id }} >> ${{ targets.prod.work_root }}/release.log");
+
+            });
+
+            help_section(ui, "八、pack 打包格式与排除（映射行的目标扩展名决定格式）", |ui| {
+                help_mono(ui, "target/ -> dist/app.tar.gz --exclude node_modules --exclude *.map");
+                ui.weak(".zip → zip；.tar.gz / .tgz → tar+gzip（tar 保留 +x 权限，Windows 打 zip 到 Linux 解压会丢）；\n\
+                         排除 = rsync --exclude 语义：字面量按目录/文件名分量整棵排除，* ? 通配相对路径与文件名。");
+                help_mono(ui, "dist -> app.tar.gz        # 目录源带目录名根（里面是 dist/...，同 tar -czf / zip -r 习惯）");
+                help_mono(ui, "dist/. -> app.tar.gz      # 源以 /. 结尾 = tar -C dist . 语义：条目不带目录根，解包直接铺文件");
+                ui.weak("单文件 / 通配源条目为裸文件名。");
+
+            });
+
+            help_section(ui, "九、常用命令速查（构建 / 部署高频命令；逐参数说明见 docs/命令速查.md）", |ui| {
+                help_mono(ui, "mvn -B clean package -DskipTests -T 1C   # -B 非交互 -q 静默 -P prod 选 profile -U 刷 SNAPSHOT");
+                help_mono(ui, "mvn -pl 模块 -am clean package           # 只构建指定模块及依赖；-o 离线；timeout 建议 1800");
+                help_mono(ui, "mvn help:evaluate -Dexpression=project.version -q -DforceStdout   # 配 outputs 捕获版本号");
+                help_mono(ui, "gradlew.bat bootJar --no-daemon -x test -Penv=prod   # Windows 本地必须 .bat；远端 Linux 写 ./gradlew");
+                help_mono(ui, "pnpm install --frozen-lockfile && pnpm run build     # CI 标准装依赖（不一致即失败）；creates: node_modules");
+                help_mono(ui, "docker build -t reg/app:${{ env.VER }} . && docker push reg/app:${{ env.VER }}");
+                help_mono(ui, "docker save -o app.tar reg/app:tag       # 离线包走 upload → 目标机 docker load -i（无 registry 链路）");
+                help_mono(ui, "kubectl apply -f deploy.yaml -n ${{ variables.NAMESPACE }}   # k8s 目标自动注入 KUBECONFIG，无需手动指定");
+                help_mono(ui, "kubectl rollout status deployment/app --timeout=120s   # restart / undo 回滚 / logs -f --tail=100");
+                help_mono(ui, "mysqldump -h 主机 -P 3306 -u root --single-transaction 库名 > backup.sql   # 大写 -P；不锁表；密码走 secret_env");
+                help_mono(ui, "mysql -h 主机 -P 3306 -u root -D 库 -e \"SQL\"   # -e 单条 SQL；导入恢复：mysql 库 < dump.sql");
+                help_mono(ui, "pg_dump -h 主机 -p 5432 -U postgres -f backup.sql 库名   # 小写 -p（跟 mysql 相反）；密码 PGPASSWORD");
+                help_mono(ui, "systemctl restart app && systemctl is-active --quiet app   # is-active 退出码 = 判活，可接前置检查");
+                help_mono(ui, "journalctl -u app -n 100 --since \"10 min ago\"   # -f 跟踪日志 -p err 只看错误");
+                help_mono(ui, "tar -xzf app.tar.gz -C /opt/app          # 解包铺目录；-czf 建 --exclude 排除 -tzf 只看不解");
+                help_mono(ui, "find /opt/backup -name \"app-*.jar\" -mtime +7 -delete   # 清 7 天前备份；du -sh /opt/* 看占用");
+                help_mono(ui, "java -Xms512m -Xmx2g -jar app.jar --spring.profiles.active=prod   # JVM 参数在 -jar 前，-- 程序参数在后");
+                help_mono(ui, "netstat -ano | findstr :8080 & taskkill /PID 1234 /F   # Windows 本地查端口占用并强杀（sc query 查服务）");
+                help_mono(ui, "robocopy dist release /MIR /XD node_modules   # Windows 镜像同步；退出码 0-7 都算成功，需接 if %ERRORLEVEL% GEQ 8 判失败");
+                help_mono(ui, "nginx -t && nginx -s reload              # 测配置语法后热加载；502 先看 /var/log/nginx/error.log");
+                help_mono(ui, "sha256sum app.tar.gz                     # 传后校验；Windows 本地 certutil -hashfile 文件 SHA256");
+                ui.weak("【本地】步骤 = 发版机 Windows（cmd 语法：&& | > 可用，$VAR 不可用）；【远端】SSH 步骤 = Linux 全语法。\n\
+                         Shell 片段（判断 / $( ) / xargs / wait 探测模板）、Windows cmd 全套（robocopy / mklink / certutil…）、\n\
+                         Java 运行时与排障（jps / jstack / keytool）、Nginx、apt / yum、7z、redis-cli 等\n\
+                         完整逐参数说明：工具栏「❓ 命令速查」窗口（docs/命令速查.md）。");
+            });
+
         });
     main.show_var_help = open;
 }
@@ -1579,19 +1621,35 @@ pub fn show_cmd_help_window(ctx: &egui::Context, main: &mut MainState) {
         .show(ctx, |ui| {
             ui.weak("构建 / 部署高频命令速查：每条实例 + 参数说明，与 docs/命令速查.md 同源。先看执行位置：【本地】= 发版机 Windows（cmd），【远端】= SSH 步骤发到远端 Linux。");
             ui.add_space(6.0);
+            // 分章：H 行切成折叠章头（默认展开），M/W 归入前一个 H；
+            // 首个 H 之前的 W 是全局导读（执行位置 / 工具绑定），留在窗外顶部
+            let mut sections: Vec<(&str, Vec<&CmdHelpLine>)> = Vec::new();
             for line in cmd_help_lines() {
                 match line {
-                    CmdHelpLine::H(t) => {
-                        ui.add_space(6.0);
-                        ui.strong(*t);
-                    }
-                    CmdHelpLine::M(t) => {
-                        ui.monospace(*t);
-                    }
-                    CmdHelpLine::W(t) => {
-                        ui.weak(*t);
-                    }
+                    CmdHelpLine::H(t) => sections.push((t, Vec::new())),
+                    _ => match sections.last_mut() {
+                        Some((_, body)) => body.push(line),
+                        None => {
+                            if let CmdHelpLine::W(t) = line {
+                                ui.weak(*t);
+                            }
+                        }
+                    },
                 }
+            }
+            for (title, body) in &sections {
+                help_section(ui, title, |ui| {
+                    ui.add_space(2.0);
+                    for &line in body {
+                        match line {
+                            CmdHelpLine::M(t) => help_mono(ui, *t),
+                            CmdHelpLine::W(t) => {
+                                ui.weak(*t);
+                            }
+                            CmdHelpLine::H(_) => unreachable!("章头已在分章阶段消费"),
+                        }
+                    }
+                });
             }
         });
     main.show_cmd_help = open;
