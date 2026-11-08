@@ -17,7 +17,7 @@
 //! - 🎯 目标管理：SSH / k8s / 本机面板 / 窄窗 / DPI 1.5 / 测试失败态，
 //!   以及输入流（点击列表、AccessKit SetValue 改文本、键盘输入密码、
 //!   点重命名 → 断言未保存标记与流程引用同步）
-//! - 变量语法速查 / 命令速查 / ＋新建流程 / ＋新建项目 / 删除确认 / 分组改名 / 人工确认门 / 首启引导
+//! - 帮助窗口（命令速查 / 变量语法两 tab）/ ＋新建流程 / ＋新建项目 / 删除确认 / 分组改名 / 人工确认门 / 首启引导
 //!
 //! 工程约束（踩过的坑）：
 //! - WGPU_BACKEND=dx12：本机 Vulkan 驱动会延迟段错误（main.rs 同款）
@@ -51,26 +51,16 @@ fn app_ui(ui: &mut egui::Ui, main: &mut MainState) {
     crate::ui::targets::show(ui.ctx(), main);
 }
 
-/// 变量语法速查窗口（主工具栏 ❓ 打开）：与 app_ui 同构，只换渲染目标
-fn var_help_ui(ui: &mut egui::Ui, main: &mut MainState) {
+/// 帮助窗口（主工具栏 ❓ 打开，命令速查 / 变量语法两 tab）：与 app_ui 同构，
+/// 只换渲染目标；tab 页由用例预置 main.help_tab 决定
+fn help_ui(ui: &mut egui::Ui, main: &mut MainState) {
     if !main.theme_applied {
         ui.ctx().set_missing_glyph_policy(egui::MissingGlyphPolicy::Tofu);
         load_cjk_font(ui.ctx());
         main.theme_applied = true;
     }
-    main.show_var_help = true;
-    crate::ui::job_editor::show_var_help_window(ui.ctx(), main);
-}
-
-/// 命令速查窗口（主工具栏 ❓ 命令速查 打开）：与 var_help_ui 同构，只换渲染目标
-fn cmd_help_ui(ui: &mut egui::Ui, main: &mut MainState) {
-    if !main.theme_applied {
-        ui.ctx().set_missing_glyph_policy(egui::MissingGlyphPolicy::Tofu);
-        load_cjk_font(ui.ctx());
-        main.theme_applied = true;
-    }
-    main.show_cmd_help = true;
-    crate::ui::job_editor::show_cmd_help_window(ui.ctx(), main);
+    main.show_help = true;
+    crate::ui::job_editor::show_help_window(ui.ctx(), main);
 }
 
 /// 完整主屏（工具栏 + 项目树 + 流程编辑器 + 控制台 + 全部弹窗）：
@@ -237,8 +227,8 @@ fn test_main_state() -> MainState {
         tree_rename_buf: String::new(),
         target_editor: Default::default(),
         settings_tab: Default::default(),
-        show_var_help: false,
-        show_cmd_help: false,
+        show_help: false,
+        help_tab: Default::default(),
         theme_applied: false,
         status_msg: None,
         run_steps: Vec::new(),
@@ -400,15 +390,16 @@ fn targets_local_panel() {
 }
 
 #[test]
-fn var_help_window() {
+fn help_window_cmd_tab() {
     let main = test_main_state();
-    snapshot_harness("var_help_window", (1280.0, 800.0), 1.0, main, var_help_ui);
+    snapshot_harness("help_window_cmd_tab", (1280.0, 800.0), 1.0, main, help_ui);
 }
 
 #[test]
-fn cmd_help_window() {
-    let main = test_main_state();
-    snapshot_harness("cmd_help_window", (1280.0, 800.0), 1.0, main, cmd_help_ui);
+fn help_window_var_tab() {
+    let mut main = test_main_state();
+    main.help_tab = crate::ui::job_editor::HelpTab::Var;
+    snapshot_harness("help_window_var_tab", (1280.0, 800.0), 1.0, main, help_ui);
 }
 
 /// 候选 emoji 的字形检查画廊：缺字形的会渲染成 □（豆腐块）。
@@ -705,4 +696,85 @@ fn first_run_screen() {
             page,
         );
     harness.snapshot("first_run_screen");
+}
+
+/// 命令输入自动补全（CompletionPopup）端到端交互：
+/// ① 命令模式：输入词 → 弹骨架表 → Tab 上屏替换输入词；
+/// ② 变量模式：光标落在未闭合 `${{ ` 内 → 弹变量组变量 → 上屏自动闭合 ` }}`。
+/// 布线用 SetValue 替换全文：egui 把光标放到替换文本末尾（词尾），确定性地触发弹层；
+/// 弹层按键拦截在打开的下一帧生效，所以每次 key_press 前先 run() 两帧。
+#[test]
+fn command_completion_popup_flow() {
+    let _gpu = gpu_lock_acquire();
+    let mut main = test_main_state_with_jobs();
+    // demo 项目没有变量组：补一个 prod 组（流程已选它），变量模式有东西可补
+    main.projects[0].project.variables.insert(
+        "prod".to_string(),
+        crate::models::EnvironmentVariables {
+            vars: [
+                ("DEPLOY_DIR".to_string(), "/opt/yudao/prod".to_string()),
+                ("REGISTRY".to_string(), "registry:5000".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        },
+    );
+    let mut harness = main_harness((1280.0, 800.0), main);
+    harness.run();
+
+    // Step 3（重启服务）的命令框：多行 TextEdit = MultilineTextInput 角色，
+    // 按现有值定位（egui TextEdit 天生无无障碍名称）；卡片可能 below fold，先滚进来
+    harness
+        .get(By::new().role(Role::MultilineTextInput).value("systemctl restart app"))
+        .scroll_to_me();
+    harness.run();
+    harness
+        .get(By::new().role(Role::MultilineTextInput).value("systemctl restart app"))
+        .click();
+    harness.run();
+
+    // ① 命令模式：全量替换为 "tail"（光标落词尾）→ 弹层列出 tail 骨架
+    harness
+        .get(By::new().role(Role::MultilineTextInput).value("systemctl restart app"))
+        .set_text_value_accesskit("tail");
+    harness.run();
+    harness.run();
+    harness.get(By::new().role(Role::Button).label_contains("tail -n 100"));
+    harness.key_press(egui::Key::Tab);
+    harness.run();
+    let cmd = harness.state().projects[0].jobs[0].job.steps[2].command.clone();
+    assert_eq!(cmd, "tail -n 100 ", "命令模式上屏：骨架应替换输入词");
+
+    // ② 变量模式：光标处于未闭合 `${{ var` 内 → 列变量组变量（带现值）
+    let field = harness
+        .get_all_by_role(Role::MultilineTextInput)
+        .find(|n| n.value().as_deref().is_some_and(|v| v.contains("tail")))
+        .expect("上屏后应能按值找回命令框");
+    field.set_text_value_accesskit("cp -a ${{ var");
+    harness.run();
+    harness.get(By::new().role(Role::Button).label_contains("variables.DEPLOY_DIR"));
+    harness.key_press(egui::Key::Tab);
+    harness.run();
+    let cmd = harness.state().projects[0].jobs[0].job.steps[2].command.clone();
+    assert_eq!(cmd, "cp -a ${{ variables.DEPLOY_DIR }}", "变量模式上屏应闭合 ` }}`");
+
+    // ③ 参数级提示：行首词是已知命令（mysqldump）→ 空格后列常用参数；
+    // ↓ 选中第 2 项 --single-transaction 后 Tab 上屏（顺带覆盖键盘导航）
+    let field = harness
+        .get_all_by_role(Role::MultilineTextInput)
+        .find(|n| {
+            n.value()
+                .as_deref()
+                .is_some_and(|v| v.contains("variables.DEPLOY_DIR"))
+        })
+        .expect("变量上屏后应能按值找回命令框");
+    field.set_text_value_accesskit("mysqldump ");
+    harness.run();
+    harness.get(By::new().role(Role::Button).label_contains("--single-transaction"));
+    harness.key_press(egui::Key::ArrowDown);
+    harness.run();
+    harness.key_press(egui::Key::Tab);
+    harness.run();
+    let cmd = harness.state().projects[0].jobs[0].job.steps[2].command.clone();
+    assert_eq!(cmd, "mysqldump --single-transaction ", "参数提示：↓ 选中参数后 Tab 上屏");
 }

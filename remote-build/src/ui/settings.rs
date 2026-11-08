@@ -160,6 +160,11 @@ pub(crate) fn tab_row(ui: &mut egui::Ui, tabs: &[String], selected: usize, enabl
     clicked
 }
 
+/// 设置窗口内容区固定高度：以「全局配置」tab 的自然高度为基准。三个 tab 内容
+/// 高度差异大（运行历史很短 / 全局配置最高），此前窗口随内容自适应、切换 tab
+/// 时高度跳变——统一 allocate 恒定内容区后：不足留白、超出滚动
+const SETTINGS_CONTENT_H: f32 = 484.0;
+
 pub fn show(ctx: &egui::Context, main: &mut MainState) {
     // 回收后台验证结果
     if let Some(rx) = &main.tool_editor.verify_rx {
@@ -230,7 +235,11 @@ pub fn show(ctx: &egui::Context, main: &mut MainState) {
             }
             ui.add_space(6.0);
 
-            match main.settings_tab {
+            // 滚动 id 先算好（在 tab_body 闭包捕获 main 之前）：每个 tab 独立 id，
+            // 切回来还记着各自的滚动位置
+            let scroll_id = format!("settings_scroll_{:?}", main.settings_tab);
+            // 内容高度固定（SETTINGS_CONTENT_H）：不足留白、超出滚动
+            let tab_body = |ui: &mut egui::Ui| match main.settings_tab {
                 SettingsTab::Tools => {
                     ui.colored_label(
                         Color32::from_rgb(230, 180, 80),
@@ -296,7 +305,13 @@ pub fn show(ctx: &egui::Context, main: &mut MainState) {
                 }
                 SettingsTab::Global => global_section(ctx, ui, main),
                 SettingsTab::History => history_section(ui, main),
-            }
+            };
+            ui.allocate_ui(egui::vec2(ui.available_width(), SETTINGS_CONTENT_H), |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt(scroll_id)
+                    .auto_shrink(false)
+                    .show(ui, tab_body);
+            });
         });
     // 每帧把窗口抬回遮罩之上（遮罩被点击/首帧会在这带内置顶）
     main.show_settings = open;

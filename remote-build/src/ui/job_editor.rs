@@ -230,6 +230,23 @@ pub fn show(main: &mut MainState, ui: &mut egui::Ui) {
     // 目标下拉 = 本项目 project.yaml 的 targets 表（§3.5 目标随项目走）
     let mut target_names: Vec<String> = project.targets.keys().cloned().collect();
     target_names.sort();
+    // 命令补全数据源：变量组的 (组名, 键, 值)（排序保证弹层稳定）。流程选了
+    // 变量组只提示该组；未选组提示全部组（desc 标注组名 + ⚠ 运行时不替换）
+    let mut var_names: Vec<(String, String, String)> = project
+        .variables
+        .iter()
+        .flat_map(|(g, group)| {
+            group
+                .vars
+                .iter()
+                .map(move |(k, v)| (g.clone(), k.clone(), v.clone()))
+        })
+        .collect();
+    var_names.sort();
+    let group_selected = job.environment.is_some();
+    if let Some(g) = &job.environment {
+        var_names.retain(|(vg, _, _)| vg == g);
+    }
     // 流程默认目标的展示文本（步骤「跟随流程」时显示它）
     let job_target_display = job.target.clone().unwrap_or_else(|| "无".to_string());
 
@@ -847,6 +864,8 @@ pub fn show(main: &mut MainState, ui: &mut egui::Ui) {
                     &tool_menu,
                     running,
                     &target_names,
+                    &var_names,
+                    group_selected,
                     job_target_display.as_str(),
                     main.global.default_timeout,
                     state,
@@ -1149,239 +1168,270 @@ fn split_inline_comment(line: &str) -> Option<(&str, &str)> {
     None
 }
 
-/// 「？ 变量语法」帮助窗口（速查表，与 docs/变量速查.md 内容一致）
-pub fn show_var_help_window(ctx: &egui::Context, main: &mut MainState) {
-    let mut open = main.show_var_help;
+/// 帮助窗口当前 tab（❓ 帮助 → 一窗两 tab：命令速查 / 变量语法）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HelpTab {
+    /// 命令骨架 / 参数速查（与 docs/命令速查.md 同源）
+    #[default]
+    Cmd,
+    /// 变量占位符 / 条件 / outputs 语法（与 docs/变量速查.md 同源）
+    Var,
+}
+
+/// 「❓ 帮助」窗口（主工具栏；原「变量语法」「命令速查」两窗合一）：
+/// tab 行切换两页，状态记在 MainState.help_tab——开关窗口后还停在上次看的页
+pub fn show_help_window(ctx: &egui::Context, main: &mut MainState) {
+    let mut open = main.show_help;
     if open {
-        crate::ui::modal_backdrop(ctx, "mask_var_help");
+        crate::ui::modal_backdrop(ctx, "mask_help");
     }
-    crate::ui::centered_window(egui::Window::new("？ 变量语法速查"), ctx)
-    .collapsible(false)
+    crate::ui::centered_window(egui::Window::new("？ 帮助"), ctx)
+        .collapsible(false)
         .open(&mut open)
         .order(egui::Order::Foreground)
-        .default_width(720.0)
-        .default_height(520.0)
-        // 内容超过屏幕高度时滚动可达：此前底部几节（wait / 长任务配方）不可见也不可滚
+        .default_width(840.0)
+        .default_height(560.0)
+        // 两个 tab 内容都超过一屏（变量语法的 wait / 长任务节、命令速查的 17 章），
+        // 内容超窗高时滚动可达
         .vscroll(true)
         .show(ctx, |ui| {
-            ui.weak("可用于步骤命令、步骤 env、工作目录、条件字段、wait 探测目标。执行前一次性替换；未解析的占位符原样保留。");
+            let tab_idx = match main.help_tab {
+                HelpTab::Cmd => 0,
+                HelpTab::Var => 1,
+            };
+            let tabs = vec!["命令速查".to_string(), "变量语法".to_string()];
+            if let Some(i) = crate::ui::settings::tab_row(ui, &tabs, tab_idx, &[true, true]) {
+                main.help_tab = match i {
+                    1 => HelpTab::Var,
+                    _ => HelpTab::Cmd,
+                };
+            }
             ui.add_space(6.0);
-
-            help_section(ui, "一、取值形态", |ui| {
-                // 不用 Grid：窗口按内容自适应宽度时，Grid 末列宽度 = 剩余空间（受 max_col_width
-                // 封顶），与窗口宽度互相反馈会塌缩成几个字符宽。改为「写法一行 + 来源/示例缩进
-                // 两行」的纵向堆叠，宽度只受窗口约束，永不互相挤压
-                let rows: Vec<(String, &str, &str)> = vec![
-                    (
-                        "${{ variables.X }}".into(),
-                        "project.yaml 的 variables.<组名>（「变量组」下拉选中的表；YAML 字段名仍为 environment）",
-                        "选 prod 组时 ${{ variables.DEPLOY_DIR }} → /opt/yudao/prod",
-                    ),
-                    (
-                        "${{ 取值表达式 || 默认值 }}".into(),
-                        "左侧未定义时取默认值——|| 适用于所有取值形态（variables / env / targets.* / now* / run.id）；\
-                         默认值可带引号；左侧已定义但为空串仍算已定义（用空串，不取默认）",
-                        "${{ variables.PORT || 8080 }} / ${{ run.id || manual-run }}",
-                    ),
-                    (
-                        "${{ env.X }}".into(),
-                        "前序步骤产出（往 workspace/.env 写 KEY=VALUE，步骤成功后自动捕获；与 outputs 捕获同命名空间）",
-                        "前一步 echo VERSION=1.2.0>.env，本步 docker build -t app:${{ env.VERSION }}",
-                    ),
-                    (
-                        "${{ targets.名.字段 }}".into(),
-                        "本项目目标（project.yaml targets 表）的字段：host / port / user / kubeconfig /\ncontext / namespace / registry / work_root / name",
-                        "${{ targets.prod.host }} → 192.168.40.198",
-                    ),
-                    (
-                        "${{ now }}".into(),
-                        "运行启动时刻（引擎侧生成，一次运行所有步骤同值，备份后缀场景）",
-                        "cp app.jar app.jar.${{ now }} → app.jar.20261023153045",
-                    ),
-                    (
-                        "${{ now.date }} / ${{ now.time }} / ${{ now.iso }}".into(),
-                        "同上的日期 / 时间 / 可读格式",
-                        "20261023 · 153045 · 2026-10-23 15:30:45",
-                    ),
-                    (
-                        "${{ run.id }}".into(),
-                        "本次运行唯一标识（与控制台日志文件同名）",
-                        "echo ${{ run.id }} >> /opt/release.log",
-                    ),
-                    (
-                        "${VAR}".into(),
-                        "步骤产出 env → 环境变量表 → 系统环境变量（依次查找）",
-                        "${JAVA_HOME}",
-                    ),
-                ];
-                for (syn, src, ex) in rows {
-                    ui.add(egui::Label::new(egui::RichText::new(&syn).monospace()));
-                    ui.indent("var_help_indent", |ui| {
-                        ui.add(egui::Label::new(egui::RichText::new(src).weak()).wrap());
-                        ui.add(egui::Label::new(egui::RichText::new(ex).monospace()).wrap());
-                    });
-                    ui.add_space(4.0);
-                }
-                ui.weak(
-                    "⏱ 时区：now 系列 = 发版机本地时间；要以服务器时间为准，远端（SSH）步骤里直接写 \
-                     $(date +%Y%m%d%H%M%S)——由远端 shell 求值。跨步骤一致性用 ${{ now }}，服务器侧实时值用 $(date …)。",
-                );
-
-            });
-
-            help_section(ui, "二、条件与状态守卫（步骤的「＋条件」/「＋creates」字段；YAML 里 when: 与 condition: 等价）", |ui| {
-                help_mono(ui, "${{ env.VERSION != '' }}        # 非空才执行本步；为空/未产出/拼错 → 跳过");
-                help_mono(ui, "${{ env.VERSION == '' }}         # 为空才执行（首次构建场景：还没版本号时）");
-                help_mono(ui, "${{ variables.ENV }} == prod    # 与字面量等值比较");
-                help_mono(ui, "${{ variables.ENV }} == 'prod'  # 字面量可带引号（单/双引号成对去除）");
-                help_mono(ui, "${{ variables.ENV }} != prod    # 不等比较；左侧未定义按空串参与");
-                help_mono(ui, "variables.A == variables.B     # 两侧都可为取值表达式（支持 || 默认值）");
-                help_mono(ui, "${{ targets.prod.port }} == 2222 # 数字按文本精确匹配（== 只做字符串比较）");
-                help_mono(ui, "creates: node_modules         # 产物路径已存在 → 跳过本步（重跑秒过）");
-                ui.weak("条件两侧支持 env. / variables. / targets.名.字段 / now / run.id；解析失败按真值执行并警告（fail-open）。");
-                ui.weak("⚠ 仅支持 == / !=，不支持 > < >= <= 数值比较——需要时在命令里用 shell 判断（如 [ \"$N\" -gt 3 ] && exit 1）。");
-                ui.weak("比较右侧的取值表达式未定义时，会按字面量文本参与比较（通常判不等）——两侧都可能未定义时，改用 != '' 判空。");
-                ui.weak("creates 路径：本地步骤相对项目目录（支持 * ? 通配）；SSH 步骤为远端路径（相对 = work_root），远端用 test -e 判定。");
-
-            });
-
-            help_section(ui, "三、关键行为", |ui| {
-                ui.weak("• 执行前一次性替换：不是运行时动态读。命令可预览、可日志、可审计。");
-                ui.weak("• 未解析的占位符原样保留：${{ variables.TYPO }} 拼错会原样出现在命令里，一眼可见（预览会 ⚠）。");
-                ui.weak("• 步骤间传递：前一步往 workspace/.env 追加 KEY=VALUE，或声明 outputs 正则捕获 stdout；后续步骤 ${{ env.KEY }} 引用。");
-                ui.weak("• 注意：本地命令已由引擎包 cmd /C 执行，直接写 echo VERSION=… 即可；手写 cmd /C 嵌套会引入引号残留。");
-
-            });
-
-            help_section(ui, "四、env 注入优先级（后者被前者覆盖）", |ui| {
-                help_mono(ui, "步骤 env > 工具 env > target env > 系统环境变量");
-                ui.weak("JAVA_HOME 这类注入只影响该步骤的子进程，不改系统设置；env.X 特指前序步骤产出，全局配置请走 variables.X。");
-
-            });
-
-            help_section(ui, "五、流程级开关（build.yaml）", |ui| {
-                help_mono(ui, "confirm: prod            # 确认门：运行前弹窗输入 prod 才放行");
-                help_mono(ui, "preconditions:           # 前置检查：发版机本地断言，失败零秒退出（只放检查，别放拉代码/构建等动作）");
-                help_mono(ui, "  - check: java -version");
-                help_mono(ui, "    message: JDK 未安装");
-                help_mono(ui, "timeout: 600             # 流程级总超时（秒；0/不填 = 不限时）；步骤级 timeout: 0 同为不限时");
-                help_mono(ui, "working_dir: sub/dir     # 项目级默认工作目录（相对项目目录）");
-                help_mono(ui, "tools_require:           # 工具版本要求（project.yaml，mise 风格）");
-                help_mono(ui, "  java: \">=21\"           # >= > <= < 数字段比较；\"22\" 前缀匹配 22.x；\"22.1.3\" 精确");
-                ui.weak("运行期自动自检：引擎启动时对本次用到的工具逐个跑 version_check 现算版本，\n未配 version_check 的工具降级为检查 command 是否存在；失败零步失败 + 人话报错。\n同项目运行互斥（GHA concurrency）：新运行自动取消旧运行，无需配置。");
-
-            });
-
-            help_section(ui, "六、运行时变量与变更触发（outputs / notify / handlers / wait）", |ui| {
-                help_mono(ui, "outputs:                 # 步骤 stdout 按正则捕获 → ${{ env.键 }}");
-                help_mono(ui, "  VER: 'VERSION=(\\S+)'   # 有捕获组取组 1，无则取整行匹配；未匹配留空并告警");
-                help_mono(ui, "notify: [重启服务]       # 本步骤真的执行/真传了新内容 → 登记通知");
-                help_mono(ui, "handlers:                # 流程成功收尾后按定义顺序执行被通知到的");
-                help_mono(ui, "  - name: 重启服务");
-                help_mono(ui, "    command: systemctl restart app");
-                ui.weak("creates / when 跳过、上传 hash 未变更 → 不算变更，handler 不执行（Ansible handlers 语义）。");
-                help_mono(ui, "secret_env:               # 凭据注入：环境变量名 → 凭据管理器键");
-                help_mono(ui, "  MYSQL_PWD: db/prod-mysql # 运行时取密码注入子进程 env；先 set-password 存密码");
-                ui.weak("数据库备份（mysqldump / pg_dump）配合 tool 绑定使用——密码不进命令行、不落 YAML。");
-                help_mono(ui, "wait: { mode: tcp, target: 1.2.3.4:8080 }");
-                ui.weak("wait 探测三模式：命令 / tcp 可连 / http 2xx（部署后验证可达，从发版机直连）；interval_seconds 缺省 5。");
-                help_mono(ui, "wait: { mode: command, target: 探测命令, fail_exit_code: 2 }");
-                ui.weak(
-                    "fail_exit_code：探测命令返回该退出码 = 任务已死，立即失败不再傻等\n\
-                     （长任务配方：远端 nohup 起任务写 status 文件，探测读它，failed 以约定码退出）",
-                );
-
-            });
-
-            help_section(ui, "七、实战示例", |ui| {
-                ui.strong("① 微服务发布最小骨架");
-                help_mono(ui, "# 1. 本地构建（creates 守卫：产物在就跳过）");
-                help_mono(ui, "mvn -B clean package -DskipTests     creates: target/*.jar");
-                help_mono(ui, "# 2. 上传（多 jar 多行映射；内容未变更自动跳过）");
-                help_mono(ui, "target/user.jar -> release/user.jar");
-                help_mono(ui, "target/order.jar -> release/order.jar    notify: [重启服务]");
-                help_mono(ui, "# 3. 远端重启（handler：只有真的传了新包才执行）");
-                help_mono(ui, "systemctl restart app && ${{ now.iso }} >> /opt/release.log");
-                help_mono(ui, "# 4. 等健康（wait tcp 从发版机探测，2 分钟总限）");
-                help_mono(ui, "wait: { mode: tcp, target: ${{ targets.prod.host }}:8080 }   timeout: 120");
-
-                ui.add_space(6.0);
-                ui.strong("② 条件实战（when / condition）");
-                help_mono(ui, "command: systemctl restart app    condition: ${{ variables.ENV }} == prod");
-                help_mono(ui, "#  ↑ 生产才重启；测试环境跑同一流程时本步自动跳过");
-                help_mono(ui, "command: curl -s .../debug/stats  condition: ${{ variables.ENV }} != prod");
-                help_mono(ui, "#  ↑ 非生产才采集调试信息");
-                help_mono(ui, "command: mvn deploy               condition: ${{ env.VERSION != '' }}");
-                help_mono(ui, "#  ↑ 上一步没产出版本号（构建失败/被跳过）→ 部署步也跳过");
-
-                ui.add_space(6.0);
-                ui.strong("③ 默认值实战（|| 适用于所有取值形态）");
-                help_mono(ui, "docker push ${{ variables.REGISTRY || registry.local:5000 }}/app:${{ env.TAG }}");
-                help_mono(ui, "#  ↑ 变量组没配 REGISTRY 时兜底本地仓库");
-                help_mono(ui, "echo 手动触发（run_id=${{ run.id || manual }}）>> /opt/audit.log");
-                help_mono(ui, "#  ↑ run.id 缺省（占位）时兜底固定标记");
-
-                ui.add_space(6.0);
-                ui.strong("④ outputs 捕获 → 后续步骤引用（运行时变量）");
-                help_mono(ui, "# 步骤 A：捕获版本号（正则取 stdout，有捕获组取组 1）");
-                help_mono(ui, "command: mvn help:evaluate -Dexpression=project.version -q -DforceStdout");
-                help_mono(ui, "outputs: { VER: '(\\S+)$' }");
-                help_mono(ui, "# 步骤 B：直接引用（构建镜像并推送）");
-                help_mono(ui, "command: docker build -t registry/app:${{ env.VER }} .");
-                help_mono(ui, "command: docker push registry/app:${{ env.VER }}");
-
-                ui.add_space(6.0);
-                ui.strong("⑤ targets 字段拼装（连接信息不写死在命令里）");
-                help_mono(ui, "echo ssh -p ${{ targets.prod.port }} ${{ targets.prod.user }}@${{ targets.prod.host }}");
-                help_mono(ui, "rsync -av release/ ${{ targets.prod.user }}@${{ targets.prod.host }}:${{ targets.prod.work_root }}/");
-
-                ui.add_space(6.0);
-                ui.strong("⑥ ${VAR} 系统变量兜底 + run.id 台账");
-                help_mono(ui, "echo JAVA_HOME=${JAVA_HOME}     # 步骤产出 env → 变量表 → 系统环境变量");
-                help_mono(ui, "echo ${{ now.iso }} run=${{ run.id }} >> ${{ targets.prod.work_root }}/release.log");
-
-            });
-
-            help_section(ui, "八、pack 打包格式与排除（映射行的目标扩展名决定格式）", |ui| {
-                help_mono(ui, "target/ -> dist/app.tar.gz --exclude node_modules --exclude *.map");
-                ui.weak(".zip → zip；.tar.gz / .tgz → tar+gzip（tar 保留 +x 权限，Windows 打 zip 到 Linux 解压会丢）；\n\
-                         排除 = rsync --exclude 语义：字面量按目录/文件名分量整棵排除，* ? 通配相对路径与文件名。");
-                help_mono(ui, "dist -> app.tar.gz        # 目录源带目录名根（里面是 dist/...，同 tar -czf / zip -r 习惯）");
-                help_mono(ui, "dist/. -> app.tar.gz      # 源以 /. 结尾 = tar -C dist . 语义：条目不带目录根，解包直接铺文件");
-                ui.weak("单文件 / 通配源条目为裸文件名。");
-
-            });
-
-            help_section(ui, "九、常用命令速查（构建 / 部署高频命令；逐参数说明见 docs/命令速查.md）", |ui| {
-                help_mono(ui, "mvn -B clean package -DskipTests -T 1C   # -B 非交互 -q 静默 -P prod 选 profile -U 刷 SNAPSHOT");
-                help_mono(ui, "mvn -pl 模块 -am clean package           # 只构建指定模块及依赖；-o 离线；timeout 建议 1800");
-                help_mono(ui, "mvn help:evaluate -Dexpression=project.version -q -DforceStdout   # 配 outputs 捕获版本号");
-                help_mono(ui, "gradlew.bat bootJar --no-daemon -x test -Penv=prod   # Windows 本地必须 .bat；远端 Linux 写 ./gradlew");
-                help_mono(ui, "pnpm install --frozen-lockfile && pnpm run build     # CI 标准装依赖（不一致即失败）；creates: node_modules");
-                help_mono(ui, "docker build -t reg/app:${{ env.VER }} . && docker push reg/app:${{ env.VER }}");
-                help_mono(ui, "docker save -o app.tar reg/app:tag       # 离线包走 upload → 目标机 docker load -i（无 registry 链路）");
-                help_mono(ui, "kubectl apply -f deploy.yaml -n ${{ variables.NAMESPACE }}   # k8s 目标自动注入 KUBECONFIG，无需手动指定");
-                help_mono(ui, "kubectl rollout status deployment/app --timeout=120s   # restart / undo 回滚 / logs -f --tail=100");
-                help_mono(ui, "mysqldump -h 主机 -P 3306 -u root --single-transaction 库名 > backup.sql   # 大写 -P；不锁表；密码走 secret_env");
-                help_mono(ui, "mysql -h 主机 -P 3306 -u root -D 库 -e \"SQL\"   # -e 单条 SQL；导入恢复：mysql 库 < dump.sql");
-                help_mono(ui, "pg_dump -h 主机 -p 5432 -U postgres -f backup.sql 库名   # 小写 -p（跟 mysql 相反）；密码 PGPASSWORD");
-                help_mono(ui, "systemctl restart app && systemctl is-active --quiet app   # is-active 退出码 = 判活，可接前置检查");
-                help_mono(ui, "journalctl -u app -n 100 --since \"10 min ago\"   # -f 跟踪日志 -p err 只看错误");
-                help_mono(ui, "tar -xzf app.tar.gz -C /opt/app          # 解包铺目录；-czf 建 --exclude 排除 -tzf 只看不解");
-                help_mono(ui, "find /opt/backup -name \"app-*.jar\" -mtime +7 -delete   # 清 7 天前备份；du -sh /opt/* 看占用");
-                help_mono(ui, "java -Xms512m -Xmx2g -jar app.jar --spring.profiles.active=prod   # JVM 参数在 -jar 前，-- 程序参数在后");
-                help_mono(ui, "netstat -ano | findstr :8080 & taskkill /PID 1234 /F   # Windows 本地查端口占用并强杀（sc query 查服务）");
-                help_mono(ui, "robocopy dist release /MIR /XD node_modules   # Windows 镜像同步；退出码 0-7 都算成功，需接 if %ERRORLEVEL% GEQ 8 判失败");
-                help_mono(ui, "nginx -t && nginx -s reload              # 测配置语法后热加载；502 先看 /var/log/nginx/error.log");
-                help_mono(ui, "sha256sum app.tar.gz                     # 传后校验；Windows 本地 certutil -hashfile 文件 SHA256");
-                ui.weak("【本地】步骤 = 发版机 Windows（cmd 语法：&& | > 可用，$VAR 不可用）；【远端】SSH 步骤 = Linux 全语法。\n\
-                         Shell 片段（判断 / $( ) / xargs / wait 探测模板）、Windows cmd 全套（robocopy / mklink / certutil…）、\n\
-                         Java 运行时与排障（jps / jstack / keytool）、Nginx、apt / yum、7z、redis-cli 等\n\
-                         完整逐参数说明：工具栏「❓ 命令速查」窗口（docs/命令速查.md）。");
-            });
-
+            match main.help_tab {
+                HelpTab::Cmd => help_tab_cmd(ui),
+                HelpTab::Var => help_tab_var(ui),
+            }
         });
-    main.show_var_help = open;
+    main.show_help = open;
+}
+
+/// 变量语法 tab 内容（速查表，与 docs/变量速查.md 内容一致）
+fn help_tab_var(ui: &mut egui::Ui) {
+    ui.weak("可用于步骤命令、步骤 env、工作目录、条件字段、wait 探测目标。执行前一次性替换；未解析的占位符原样保留。");
+    ui.add_space(6.0);
+
+    help_section(ui, "一、取值形态", |ui| {
+        // 不用 Grid：窗口按内容自适应宽度时，Grid 末列宽度 = 剩余空间（受 max_col_width
+        // 封顶），与窗口宽度互相反馈会塌缩成几个字符宽。改为「写法一行 + 来源/示例缩进
+        // 两行」的纵向堆叠，宽度只受窗口约束，永不互相挤压
+        let rows: Vec<(String, &str, &str)> = vec![
+            (
+                "${{ variables.X }}".into(),
+                "project.yaml 的 variables.<组名>（「变量组」下拉选中的表；YAML 字段名仍为 environment）",
+                "选 prod 组时 ${{ variables.DEPLOY_DIR }} → /opt/yudao/prod",
+            ),
+            (
+                "${{ 取值表达式 || 默认值 }}".into(),
+                "左侧未定义时取默认值——|| 适用于所有取值形态（variables / env / targets.* / now* / run.id）；\
+                 默认值可带引号；左侧已定义但为空串仍算已定义（用空串，不取默认）",
+                "${{ variables.PORT || 8080 }} / ${{ run.id || manual-run }}",
+            ),
+            (
+                "${{ env.X }}".into(),
+                "前序步骤产出（往 workspace/.env 写 KEY=VALUE，步骤成功后自动捕获；与 outputs 捕获同命名空间）",
+                "前一步 echo VERSION=1.2.0>.env，本步 docker build -t app:${{ env.VERSION }}",
+            ),
+            (
+                "${{ targets.名.字段 }}".into(),
+                "本项目目标（project.yaml targets 表）的字段：host / port / user / kubeconfig /\ncontext / namespace / registry / work_root / name",
+                "${{ targets.prod.host }} → 192.168.40.198",
+            ),
+            (
+                "${{ now }}".into(),
+                "运行启动时刻（引擎侧生成，一次运行所有步骤同值，备份后缀场景）",
+                "cp app.jar app.jar.${{ now }} → app.jar.20261023153045",
+            ),
+            (
+                "${{ now.date }} / ${{ now.time }} / ${{ now.iso }}".into(),
+                "同上的日期 / 时间 / 可读格式",
+                "20261023 · 153045 · 2026-10-23 15:30:45",
+            ),
+            (
+                "${{ run.id }}".into(),
+                "本次运行唯一标识（与控制台日志文件同名）",
+                "echo ${{ run.id }} >> /opt/release.log",
+            ),
+            (
+                "${VAR}".into(),
+                "步骤产出 env → 环境变量表 → 系统环境变量（依次查找）",
+                "${JAVA_HOME}",
+            ),
+        ];
+        for (syn, src, ex) in rows {
+            ui.add(egui::Label::new(egui::RichText::new(&syn).monospace()));
+            ui.indent("var_help_indent", |ui| {
+                ui.add(egui::Label::new(egui::RichText::new(src).weak()).wrap());
+                ui.add(egui::Label::new(egui::RichText::new(ex).monospace()).wrap());
+            });
+            ui.add_space(4.0);
+        }
+        ui.weak(
+            "⏱ 时区：now 系列 = 发版机本地时间；要以服务器时间为准，远端（SSH）步骤里直接写 \
+             $(date +%Y%m%d%H%M%S)——由远端 shell 求值。跨步骤一致性用 ${{ now }}，服务器侧实时值用 $(date …)。",
+        );
+
+    });
+
+    help_section(ui, "二、条件与状态守卫（步骤的「＋条件」/「＋creates」字段；YAML 里 when: 与 condition: 等价）", |ui| {
+        help_mono(ui, "${{ env.VERSION != '' }}        # 非空才执行本步；为空/未产出/拼错 → 跳过");
+        help_mono(ui, "${{ env.VERSION == '' }}         # 为空才执行（首次构建场景：还没版本号时）");
+        help_mono(ui, "${{ variables.ENV }} == prod    # 与字面量等值比较");
+        help_mono(ui, "${{ variables.ENV }} == 'prod'  # 字面量可带引号（单/双引号成对去除）");
+        help_mono(ui, "${{ variables.ENV }} != prod    # 不等比较；左侧未定义按空串参与");
+        help_mono(ui, "variables.A == variables.B     # 两侧都可为取值表达式（支持 || 默认值）");
+        help_mono(ui, "${{ targets.prod.port }} == 2222 # 数字按文本精确匹配（== 只做字符串比较）");
+        help_mono(ui, "creates: node_modules         # 产物路径已存在 → 跳过本步（重跑秒过）");
+        ui.weak("条件两侧支持 env. / variables. / targets.名.字段 / now / run.id；解析失败按真值执行并警告（fail-open）。");
+        ui.weak("⚠ 仅支持 == / !=，不支持 > < >= <= 数值比较——需要时在命令里用 shell 判断（如 [ \"$N\" -gt 3 ] && exit 1）。");
+        ui.weak("比较右侧的取值表达式未定义时，会按字面量文本参与比较（通常判不等）——两侧都可能未定义时，改用 != '' 判空。");
+        ui.weak("creates 路径：本地步骤相对项目目录（支持 * ? 通配）；SSH 步骤为远端路径（相对 = work_root），远端用 test -e 判定。");
+
+    });
+
+    help_section(ui, "三、关键行为", |ui| {
+        ui.weak("• 执行前一次性替换：不是运行时动态读。命令可预览、可日志、可审计。");
+        ui.weak("• 未解析的占位符原样保留：${{ variables.TYPO }} 拼错会原样出现在命令里，一眼可见（预览会 ⚠）。");
+        ui.weak("• 步骤间传递：前一步往 workspace/.env 追加 KEY=VALUE，或声明 outputs 正则捕获 stdout；后续步骤 ${{ env.KEY }} 引用。");
+        ui.weak("• 注意：本地命令已由引擎包 cmd /C 执行，直接写 echo VERSION=… 即可；手写 cmd /C 嵌套会引入引号残留。");
+
+    });
+
+    help_section(ui, "四、env 注入优先级（后者被前者覆盖）", |ui| {
+        help_mono(ui, "步骤 env > 工具 env > target env > 系统环境变量");
+        ui.weak("JAVA_HOME 这类注入只影响该步骤的子进程，不改系统设置；env.X 特指前序步骤产出，全局配置请走 variables.X。");
+
+    });
+
+    help_section(ui, "五、流程级开关（build.yaml）", |ui| {
+        help_mono(ui, "confirm: prod            # 确认门：运行前弹窗输入 prod 才放行");
+        help_mono(ui, "preconditions:           # 前置检查：发版机本地断言，失败零秒退出（只放检查，别放拉代码/构建等动作）");
+        help_mono(ui, "  - check: java -version");
+        help_mono(ui, "    message: JDK 未安装");
+        help_mono(ui, "timeout: 600             # 流程级总超时（秒；0/不填 = 不限时）；步骤级 timeout: 0 同为不限时");
+        help_mono(ui, "working_dir: sub/dir     # 项目级默认工作目录（相对项目目录）");
+        help_mono(ui, "tools_require:           # 工具版本要求（project.yaml，mise 风格）");
+        help_mono(ui, "  java: \">=21\"           # >= > <= < 数字段比较；\"22\" 前缀匹配 22.x；\"22.1.3\" 精确");
+        ui.weak("运行期自动自检：引擎启动时对本次用到的工具逐个跑 version_check 现算版本，\n未配 version_check 的工具降级为检查 command 是否存在；失败零步失败 + 人话报错。\n同项目运行互斥（GHA concurrency）：新运行自动取消旧运行，无需配置。");
+
+    });
+
+    help_section(ui, "六、运行时变量与变更触发（outputs / notify / handlers / wait）", |ui| {
+        help_mono(ui, "outputs:                 # 步骤 stdout 按正则捕获 → ${{ env.键 }}");
+        help_mono(ui, "  VER: 'VERSION=(\\S+)'   # 有捕获组取组 1，无则取整行匹配；未匹配留空并告警");
+        help_mono(ui, "notify: [重启服务]       # 本步骤真的执行/真传了新内容 → 登记通知");
+        help_mono(ui, "handlers:                # 流程成功收尾后按定义顺序执行被通知到的");
+        help_mono(ui, "  - name: 重启服务");
+        help_mono(ui, "    command: systemctl restart app");
+        ui.weak("creates / when 跳过、上传 hash 未变更 → 不算变更，handler 不执行（Ansible handlers 语义）。");
+        help_mono(ui, "secret_env:               # 凭据注入：环境变量名 → 凭据管理器键");
+        help_mono(ui, "  MYSQL_PWD: db/prod-mysql # 运行时取密码注入子进程 env；先 set-password 存密码");
+        ui.weak("数据库备份（mysqldump / pg_dump）配合 tool 绑定使用——密码不进命令行、不落 YAML。");
+        help_mono(ui, "wait: { mode: tcp, target: 1.2.3.4:8080 }");
+        ui.weak("wait 探测三模式：命令 / tcp 可连 / http 2xx（部署后验证可达，从发版机直连）；interval_seconds 缺省 5。");
+        help_mono(ui, "wait: { mode: command, target: 探测命令, fail_exit_code: 2 }");
+        ui.weak(
+            "fail_exit_code：探测命令返回该退出码 = 任务已死，立即失败不再傻等\n\
+             （长任务配方：远端 nohup 起任务写 status 文件，探测读它，failed 以约定码退出）",
+        );
+
+    });
+
+    help_section(ui, "七、实战示例", |ui| {
+        ui.strong("① 微服务发布最小骨架");
+        help_mono(ui, "# 1. 本地构建（creates 守卫：产物在就跳过）");
+        help_mono(ui, "mvn -B clean package -DskipTests     creates: target/*.jar");
+        help_mono(ui, "# 2. 上传（多 jar 多行映射；内容未变更自动跳过）");
+        help_mono(ui, "target/user.jar -> release/user.jar");
+        help_mono(ui, "target/order.jar -> release/order.jar    notify: [重启服务]");
+        help_mono(ui, "# 3. 远端重启（handler：只有真的传了新包才执行）");
+        help_mono(ui, "systemctl restart app && ${{ now.iso }} >> /opt/release.log");
+        help_mono(ui, "# 4. 等健康（wait tcp 从发版机探测，2 分钟总限）");
+        help_mono(ui, "wait: { mode: tcp, target: ${{ targets.prod.host }}:8080 }   timeout: 120");
+
+        ui.add_space(6.0);
+        ui.strong("② 条件实战（when / condition）");
+        help_mono(ui, "command: systemctl restart app    condition: ${{ variables.ENV }} == prod");
+        help_mono(ui, "#  ↑ 生产才重启；测试环境跑同一流程时本步自动跳过");
+        help_mono(ui, "command: curl -s .../debug/stats  condition: ${{ variables.ENV }} != prod");
+        help_mono(ui, "#  ↑ 非生产才采集调试信息");
+        help_mono(ui, "command: mvn deploy               condition: ${{ env.VERSION != '' }}");
+        help_mono(ui, "#  ↑ 上一步没产出版本号（构建失败/被跳过）→ 部署步也跳过");
+
+        ui.add_space(6.0);
+        ui.strong("③ 默认值实战（|| 适用于所有取值形态）");
+        help_mono(ui, "docker push ${{ variables.REGISTRY || registry.local:5000 }}/app:${{ env.TAG }}");
+        help_mono(ui, "#  ↑ 变量组没配 REGISTRY 时兜底本地仓库");
+        help_mono(ui, "echo 手动触发（run_id=${{ run.id || manual }}）>> /opt/audit.log");
+        help_mono(ui, "#  ↑ run.id 缺省（占位）时兜底固定标记");
+
+        ui.add_space(6.0);
+        ui.strong("④ outputs 捕获 → 后续步骤引用（运行时变量）");
+        help_mono(ui, "# 步骤 A：捕获版本号（正则取 stdout，有捕获组取组 1）");
+        help_mono(ui, "command: mvn help:evaluate -Dexpression=project.version -q -DforceStdout");
+        help_mono(ui, "outputs: { VER: '(\\S+)$' }");
+        help_mono(ui, "# 步骤 B：直接引用（构建镜像并推送）");
+        help_mono(ui, "command: docker build -t registry/app:${{ env.VER }} .");
+        help_mono(ui, "command: docker push registry/app:${{ env.VER }}");
+
+        ui.add_space(6.0);
+        ui.strong("⑤ targets 字段拼装（连接信息不写死在命令里）");
+        help_mono(ui, "echo ssh -p ${{ targets.prod.port }} ${{ targets.prod.user }}@${{ targets.prod.host }}");
+        help_mono(ui, "rsync -av release/ ${{ targets.prod.user }}@${{ targets.prod.host }}:${{ targets.prod.work_root }}/");
+
+        ui.add_space(6.0);
+        ui.strong("⑥ ${VAR} 系统变量兜底 + run.id 台账");
+        help_mono(ui, "echo JAVA_HOME=${JAVA_HOME}     # 步骤产出 env → 变量表 → 系统环境变量");
+        help_mono(ui, "echo ${{ now.iso }} run=${{ run.id }} >> ${{ targets.prod.work_root }}/release.log");
+
+    });
+
+    help_section(ui, "八、pack 打包格式与排除（映射行的目标扩展名决定格式）", |ui| {
+        help_mono(ui, "target/ -> dist/app.tar.gz --exclude node_modules --exclude *.map");
+        ui.weak(".zip → zip；.tar.gz / .tgz → tar+gzip（tar 保留 +x 权限，Windows 打 zip 到 Linux 解压会丢）；\n\
+                 排除 = rsync --exclude 语义：字面量按目录/文件名分量整棵排除，* ? 通配相对路径与文件名。");
+        help_mono(ui, "dist -> app.tar.gz        # 目录源带目录名根（里面是 dist/...，同 tar -czf / zip -r 习惯）");
+        help_mono(ui, "dist/. -> app.tar.gz      # 源以 /. 结尾 = tar -C dist . 语义：条目不带目录根，解包直接铺文件");
+        ui.weak("单文件 / 通配源条目为裸文件名。");
+
+    });
+
+    help_section(ui, "九、常用命令速查（构建 / 部署高频命令；逐参数说明见 docs/命令速查.md）", |ui| {
+        help_mono(ui, "mvn -B clean package -DskipTests -T 1C   # -B 非交互 -q 静默 -P prod 选 profile -U 刷 SNAPSHOT");
+        help_mono(ui, "mvn -pl 模块 -am clean package           # 只构建指定模块及依赖；-o 离线；timeout 建议 1800");
+        help_mono(ui, "mvn help:evaluate -Dexpression=project.version -q -DforceStdout   # 配 outputs 捕获版本号");
+        help_mono(ui, "gradlew.bat bootJar --no-daemon -x test -Penv=prod   # Windows 本地必须 .bat；远端 Linux 写 ./gradlew");
+        help_mono(ui, "pnpm install --frozen-lockfile && pnpm run build     # CI 标准装依赖（不一致即失败）；creates: node_modules");
+        help_mono(ui, "docker build -t reg/app:${{ env.VER }} . && docker push reg/app:${{ env.VER }}");
+        help_mono(ui, "docker save -o app.tar reg/app:tag       # 离线包走 upload → 目标机 docker load -i（无 registry 链路）");
+        help_mono(ui, "kubectl apply -f deploy.yaml -n ${{ variables.NAMESPACE }}   # k8s 目标自动注入 KUBECONFIG，无需手动指定");
+        help_mono(ui, "kubectl rollout status deployment/app --timeout=120s   # restart / undo 回滚 / logs -f --tail=100");
+        help_mono(ui, "mysqldump -h 主机 -P 3306 -u root --single-transaction 库名 > backup.sql   # 大写 -P；不锁表；密码走 secret_env");
+        help_mono(ui, "mysql -h 主机 -P 3306 -u root -D 库 -e \"SQL\"   # -e 单条 SQL；导入恢复：mysql 库 < dump.sql");
+        help_mono(ui, "pg_dump -h 主机 -p 5432 -U postgres -f backup.sql 库名   # 小写 -p（跟 mysql 相反）；密码 PGPASSWORD");
+        help_mono(ui, "systemctl restart app && systemctl is-active --quiet app   # is-active 退出码 = 判活，可接前置检查");
+        help_mono(ui, "journalctl -u app -n 100 --since \"10 min ago\"   # -f 跟踪日志 -p err 只看错误");
+        help_mono(ui, "tar -xzf app.tar.gz -C /opt/app          # 解包铺目录；-czf 建 --exclude 排除 -tzf 只看不解");
+        help_mono(ui, "find /opt/backup -name \"app-*.jar\" -mtime +7 -delete   # 清 7 天前备份；du -sh /opt/* 看占用");
+        help_mono(ui, "java -Xms512m -Xmx2g -jar app.jar --spring.profiles.active=prod   # JVM 参数在 -jar 前，-- 程序参数在后");
+        help_mono(ui, "netstat -ano | findstr :8080 & taskkill /PID 1234 /F   # Windows 本地查端口占用并强杀（sc query 查服务）");
+        help_mono(ui, "robocopy dist release /MIR /XD node_modules   # Windows 镜像同步；退出码 0-7 都算成功，需接 if %ERRORLEVEL% GEQ 8 判失败");
+        help_mono(ui, "nginx -t && nginx -s reload              # 测配置语法后热加载；502 先看 /var/log/nginx/error.log");
+        help_mono(ui, "sha256sum app.tar.gz                     # 传后校验；Windows 本地 certutil -hashfile 文件 SHA256");
+        ui.weak("【本地】步骤 = 发版机 Windows（cmd 语法：&& | > 可用，$VAR 不可用）；【远端】SSH 步骤 = Linux 全语法。\n\
+                 Shell 片段（判断 / $( ) / xargs / wait 探测模板）、Windows cmd 全套（robocopy / mklink / certutil…）、\n\
+                 Java 运行时与排障（jps / jstack / keytool）、Nginx、apt / yum、7z、redis-cli 等\n\
+                 完整逐参数说明：本窗口「命令速查」tab（docs/命令速查.md）。");
+    });
 }
 
 /// 「？ 命令速查」窗口内容行（与 docs/命令速查.md 同源）：
@@ -1604,55 +1654,584 @@ fn cmd_help_lines() -> &'static [CmdHelpLine] {
     ]
 }
 
-/// 「？ 命令速查」帮助窗口（工具栏 ❓ 命令速查 打开；与 docs/命令速查.md 内容一致）。
-/// 内容量大（17 章），用行数组数据驱动渲染（cmd_help_lines），避免几百行重复 UI 调用。
-pub fn show_cmd_help_window(ctx: &egui::Context, main: &mut MainState) {
-    let mut open = main.show_cmd_help;
-    if open {
-        crate::ui::modal_backdrop(ctx, "mask_cmd_help");
+/// 命令速查 tab 内容（与 docs/命令速查.md 内容一致）：内容量大（17 章），
+/// 用行数组数据驱动渲染（cmd_help_lines），避免几百行重复 UI 调用
+fn help_tab_cmd(ui: &mut egui::Ui) {
+    ui.weak("构建 / 部署高频命令速查：每条实例 + 参数说明，与 docs/命令速查.md 同源。先看执行位置：【本地】= 发版机 Windows（cmd），【远端】= SSH 步骤发到远端 Linux。");
+    ui.add_space(6.0);
+    // 分章：H 行切成折叠章头（默认展开），M/W 归入前一个 H；
+    // 首个 H 之前的 W 是全局导读（执行位置 / 工具绑定），留在窗外顶部
+    let mut sections: Vec<(&str, Vec<&CmdHelpLine>)> = Vec::new();
+    for line in cmd_help_lines() {
+        match line {
+            CmdHelpLine::H(t) => sections.push((t, Vec::new())),
+            _ => match sections.last_mut() {
+                Some((_, body)) => body.push(line),
+                None => {
+                    if let CmdHelpLine::W(t) = line {
+                        ui.weak(*t);
+                    }
+                }
+            },
+        }
     }
-    crate::ui::centered_window(egui::Window::new("？ 命令速查"), ctx)
-        .collapsible(false)
-        .open(&mut open)
-        .order(egui::Order::Foreground)
-        .default_width(840.0)
-        .default_height(560.0)
-        .vscroll(true)
-        .show(ctx, |ui| {
-            ui.weak("构建 / 部署高频命令速查：每条实例 + 参数说明，与 docs/命令速查.md 同源。先看执行位置：【本地】= 发版机 Windows（cmd），【远端】= SSH 步骤发到远端 Linux。");
-            ui.add_space(6.0);
-            // 分章：H 行切成折叠章头（默认展开），M/W 归入前一个 H；
-            // 首个 H 之前的 W 是全局导读（执行位置 / 工具绑定），留在窗外顶部
-            let mut sections: Vec<(&str, Vec<&CmdHelpLine>)> = Vec::new();
-            for line in cmd_help_lines() {
+    for (title, body) in &sections {
+        help_section(ui, title, |ui| {
+            ui.add_space(2.0);
+            for &line in body {
                 match line {
-                    CmdHelpLine::H(t) => sections.push((t, Vec::new())),
-                    _ => match sections.last_mut() {
-                        Some((_, body)) => body.push(line),
-                        None => {
-                            if let CmdHelpLine::W(t) = line {
-                                ui.weak(*t);
-                            }
-                        }
-                    },
+                    CmdHelpLine::M(t) => help_mono(ui, *t),
+                    CmdHelpLine::W(t) => {
+                        ui.weak(*t);
+                    }
+                    CmdHelpLine::H(_) => unreachable!("章头已在分章阶段消费"),
                 }
             }
-            for (title, body) in &sections {
-                help_section(ui, title, |ui| {
-                    ui.add_space(2.0);
-                    for &line in body {
-                        match line {
-                            CmdHelpLine::M(t) => help_mono(ui, *t),
-                            CmdHelpLine::W(t) => {
-                                ui.weak(*t);
-                            }
-                            CmdHelpLine::H(_) => unreachable!("章头已在分章阶段消费"),
-                        }
-                    }
-                });
-            }
         });
-    main.show_cmd_help = open;
+    }
+}
+
+// ── 命令输入自动补全（egui 0.37 内置 CompletionPopup）────────────────────────
+// 键盘交互弹层自带：↑↓ 选 / Enter·Tab 上屏 / Esc 关（词变后再现）/ 点击接受，
+// 焦点全程留在输入框；弹层是独立 Area 层，不影响卡片布局。
+
+/// 变量占位符模式：光标落在未闭合的 `${{ …`（Double）或 `${…`（Single）内
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VarMode {
+    Double,
+    Single,
+}
+
+/// 光标前文本是否处于未闭合的取值占位符内（变量解析 §6）：找最后一个 `${`，
+/// 双括号查 `}}` 闭合、单括号查 `}` 闭合，未闭合即在补全变量。
+/// 已闭合的占位符不影响判定（`${{ a }} tail` → None，回到命令模式）。
+fn unclosed_var(before: &str) -> Option<VarMode> {
+    let after = &before[before.rfind("${")? + 2..];
+    if after.starts_with('{') {
+        (!after[1..].contains("}}")).then_some(VarMode::Double)
+    } else {
+        (!after.contains('}')).then_some(VarMode::Single)
+    }
+}
+
+/// egui 光标偏移是字符序号（CharIndex），字符串切片要字节偏移——换算
+/// （含中文等多字节字符：取第 n 个字符的起始字节位）
+fn char_idx_to_byte(text: &str, char_idx: usize) -> usize {
+    text.char_indices()
+        .nth(char_idx)
+        .map_or(text.len(), |(b, _)| b)
+}
+
+/// 命令骨架表：(上屏文本, 中文说明)。骨架带常用参数、路径占位留给用户补；
+/// 匹配 = 骨架首词对输入词不区分大小写前缀。提炼自 docs/命令速查.md
+/// （❓ 命令速查窗口同源），逐参数完整说明在那边。
+const CMD_SUGGESTIONS: &[(&str, &str)] = &[
+    // Linux 远端：文件与目录
+    ("ls -lah ", "列目录：长格式 + 隐藏文件 + 人读大小"),
+    ("cp -a ", "归档复制：保权限/属主/时间戳（备份首选）"),
+    ("mkdir -p ", "多级创建目录，已存在不报错"),
+    ("ln -sfn ", "软链原子切换：ln -sfn 新目标 链接名"),
+    ("find ", "找文件：find 路径 -name 通配 -mtime +N -delete（空格后出参数提示）"),
+    ("chmod +x ", "加可执行权限"),
+    ("chown -R app:app ", "递归改属主（app:组 路径）"),
+    ("rm -rf ", "⚠ 危险删除：路径写全，别用变量拼根目录"),
+    // Linux 远端：查看与文本
+    ("tail -n 100 ", "看文件末 100 行"),
+    ("tail -f ", "跟踪日志新增（Ctrl+C 退出）"),
+    ("grep -in ", "搜文本：忽略大小写 + 行号"),
+    ("ps -ef | grep java | grep -v grep", "查进程（-v 剔除 grep 自身）"),
+    ("sed -i 's/旧/新/g' ", "就地替换（g=全局；不加 -i 只打印）"),
+    ("awk -F: '{print $1}' ", "按分隔符取列（$NF = 末列）"),
+    ("du -sh ", "目录占用汇总（人读；df -h 看磁盘）"),
+    ("df -h ", "磁盘余量"),
+    ("free -h ", "内存余量"),
+    ("wc -l ", "统计行数"),
+    ("which ", "命令实际路径"),
+    // Linux 远端：进程
+    ("pgrep -f ", "按命令行片段查 PID"),
+    ("pkill -f ", "按命令行片段杀进程"),
+    ("kill -9 ", "强杀指定 PID"),
+    ("nohup ", "后台起飞：nohup 命令 > 输出 2>&1 &（长任务）"),
+    // Linux 远端：网络与探测
+    ("ss -tlnp | grep ", "谁在监听端口"),
+    ("lsof -i:", "谁占着端口（含进程命令行；需 lsof 包）"),
+    ("curl -sf ", "健康检查：非 2xx 返回码非零"),
+    ("curl -s -X POST -H 'Content-Type: application/json' -d ", "POST 请求（引号里放 URL 与 JSON 体）"),
+    ("wget -q -O ", "下载到指定文件"),
+    ("ping -c 3 ", "发 3 个包测连通"),
+    ("rsync -avz ", "增量同步（尾随斜杠有语义）"),
+    ("rsync -avn ", "干跑预演：先看会传什么再真跑"),
+    ("firewall-cmd --permanent --add-port=8080/tcp && firewall-cmd --reload", "firewalld 开端口（必须 reload 才生效）"),
+    ("ufw allow ", "Ubuntu 防火墙开端口"),
+    // Linux 远端：压缩
+    ("tar -czf ", "打包 tar.gz：tar -czf x.tar.gz -C 目录 ."),
+    ("tar -xzf ", "解包 tar.gz（-C 指定目录，先 mkdir -p）"),
+    ("unzip -o ", "解压覆盖不问（非交互必须 -o）"),
+    ("7z a -t7z ", "压缩（tool: 7z 绑定；-mx=9 最高压缩率）"),
+    ("7z x ", "解压（-o 后紧跟目录，不加空格）"),
+    // Linux 远端：systemctl / 日志
+    ("systemctl restart ", "重启服务（start / stop / status 同型）"),
+    ("systemctl status ", "看服务状态"),
+    ("systemctl enable --now ", "开机自启 + 立即启动"),
+    ("systemctl is-active --quiet ", "脚本判活（只看退出码）"),
+    ("systemctl daemon-reload", "改过 *.service 文件后先执行"),
+    ("journalctl -u ", "跟服务日志：-f 跟踪 / -n 100 最近行"),
+    ("nginx -t && nginx -s reload", "测语法后热加载（reload 前必 -t）"),
+    // Linux 远端：包管理 / 定时 / 免密
+    ("apt install -y ", "Debian/Ubuntu 装包（-y 免交互必须）"),
+    ("apt list --installed 2>/dev/null | grep ", "查已装包"),
+    ("yum install -y ", "CentOS/RHEL 装包（新系统用 dnf）"),
+    ("crontab -e", "编辑定时任务（分 时 日 月 周）"),
+    ("(crontab -l; echo \"0 2 * * * 命令 >> 日志 2>&1\") | crontab -", "追加定时任务（| crontab - 是整体覆盖，追加要这么写）"),
+    ("ssh-keygen -t ed25519", "生成 ed25519 公钥（免密前置）"),
+    ("ssh-copy-id ", "推公钥免密"),
+    ("ssh -p 2222 用户@主机 ", "远程登录（scp 的端口是大写 -P）"),
+    ("scp -P 2222 文件 用户@host:/dst ", "传文件（端口是大写 -P；upload/download 步骤已覆盖主链路）"),
+    // Windows 本地 cmd
+    ("dir /B ", "列文件名（/B 裸名，配 outputs 捕获产物名）"),
+    ("copy /Y ", "复制覆盖不问"),
+    ("xcopy ", "递归复制：/E 含空目录 /I 目标是目录 /Y 覆盖"),
+    ("robocopy ", "镜像同步：/MIR 镜像 /XD 排除目录；退出码 0-7 都算成功"),
+    ("mklink /J ", "目录 junction（免管理员；跨卷软链对应物）"),
+    ("tasklist | findstr ", "查进程（findstr ≈ grep）"),
+    ("taskkill /PID ", "强杀进程（/IM 名 /F 按映像名）"),
+    ("taskkill /IM 进程名.exe /F ", "按映像名强杀"),
+    ("netstat -ano | findstr ", "查端口占用（末列 = PID）"),
+    ("sc query ", "查 Windows 服务（stop / start 需管理员）"),
+    ("schtasks /Create /SC DAILY /ST 02:00 /TN ", "计划任务（/TR 命令；/Run /TN 手动触发）"),
+    ("where ", "命令实际路径（cmd 版 which）"),
+    ("curl.exe -sf ", "Win10+ 自带真 curl（写 .exe 最稳）"),
+    ("certutil -hashfile ", "算哈希：certutil -hashfile 文件 SHA256"),
+    ("powershell -Command ", "逃生舱：复杂逻辑借 PowerShell"),
+    // git
+    ("git clone --depth 1 ", "浅克隆（只要最新一层）"),
+    ("git pull --ff-only", "只快进合并（有分叉直接失败）"),
+    ("git status -s", "短状态"),
+    ("git log --oneline -5", "最近 5 条提交"),
+    ("git tag -a ", "打标签：git tag -a v1.2.0 -m 说明"),
+    // Maven
+    ("mvn -B clean package -DskipTests", "构建：批处理模式 + 跳测试"),
+    ("mvn -T 1C clean package -P ", "并行构建 + 指定 profile"),
+    ("mvn -pl ", "只构建指定模块及其依赖（-pl 模块 -am）"),
+    ("mvn help:evaluate -Dexpression=project.version -q -DforceStdout", "捕版本号（配 outputs）"),
+    ("mvn dependency:tree -Dincludes=", "查依赖来源"),
+    ("mvn clean deploy -DskipTests", "发私服"),
+    // Gradle
+    ("gradlew.bat clean bootJar --no-daemon", "Windows 本地构建（必须带 .bat）"),
+    ("gradlew.bat build -x test", "跳过 test 构建"),
+    ("gradlew.bat --refresh-dependencies build", "强刷依赖"),
+    // 前端 Node
+    ("corepack enable && corepack prepare pnpm@latest --activate", "按 packageManager 钉 pnpm 版本"),
+    ("pnpm install --frozen-lockfile", "CI 标准装依赖（lock 不一致直接失败）"),
+    ("pnpm run build", "前端构建"),
+    ("npm ci", "干净安装：严格按 lock 装、绝不改 lockfile"),
+    ("npm run build", "前端构建"),
+    // kubectl（k8s-apply / 排障）
+    ("kubectl apply -f ", "应用清单（-n 指命名空间）"),
+    ("kubectl get pods -o wide", "列 Pod（-w 持续 watch）"),
+    ("kubectl logs -f --tail=100 ", "跟 Pod 日志（多容器 -c）"),
+    ("kubectl describe pod ", "排查拉不起 / 镜像失败 / 挂载错误"),
+    ("kubectl rollout restart deployment/", "滚动重启（改了 ConfigMap 后）"),
+    ("kubectl rollout status deployment/", "等滚动完成（--timeout=120s）"),
+    ("kubectl rollout undo deployment/", "回滚上一版"),
+    ("kubectl set image deployment/", "改镜像版本"),
+    // Docker
+    ("docker build -t 名:tag . ", "构建镜像（-f 指定 Dockerfile；版本号用 outputs 捕获）"),
+    ("docker push ", "推镜像到 registry"),
+    ("docker save -o ", "导出离线包（目标机 docker load -i）"),
+    ("docker load -i ", "导入离线包"),
+    ("docker logs -f --tail=100 ", "跟容器日志"),
+    ("docker login ", "登录 registry（-u 用户，密码交互输入）"),
+    // Java 运行时
+    ("java -Xms512m -Xmx2g -jar ", "启动 jar（JVM 参数必须在 -jar 前面）"),
+    ("java -Dfile.encoding=UTF-8 -jar ", "治日志乱码"),
+    ("jps -l", "列 java 进程"),
+    ("jstack ", "线程栈快照（卡死 / 死锁排查）"),
+    ("jar tf ", "看 jar 内容不解包"),
+    ("keytool -importcert -alias ca -keystore trust.jks ", "导证书（默认库口令 changeit）"),
+    // 数据库客户端
+    ("mysql -h ", "MySQL 客户端（-P 大写端口 -u 用户 -D 库 -e SQL）"),
+    ("mysqldump --single-transaction ", "全量备份不锁表（空格后出参数提示）"),
+    ("psql -h ", "PG 客户端（-p 小写端口 -U 用户 -d 库 -c SQL）"),
+    ("pg_dump -Fc ", "pg 备份（自定义压缩格式；空格后出参数提示）"),
+    ("pg_restore -h 主机 -U postgres -d 库名 ", "恢复 pg 备份（-Fc 格式；-j 4 并行）"),
+    ("redis-cli -h ", "redis 客户端（ping 验通）"),
+];
+
+/// 命令模式补全：输入词非空时对骨架表首词做不区分大小写前缀匹配
+fn command_suggestions_for_word(word: &str) -> Vec<egui::Suggestion> {
+    if word.is_empty() {
+        return vec![];
+    }
+    let wl = word.to_lowercase();
+    CMD_SUGGESTIONS
+        .iter()
+        .filter(|(ins, _)| {
+            ins.split_whitespace()
+                .next()
+                .is_some_and(|head| head.to_lowercase().starts_with(&wl))
+        })
+        .map(|(ins, desc)| egui::Suggestion::new((*ins).to_string()).description(*desc))
+        .collect()
+}
+
+/// 参数级提示表：命令头 → 常用参数（上屏骨架, 说明）。命令骨架表只到
+/// 「命令 + 常用组合」，逐参数（mysqldump 的 --single-transaction / --no-data…）
+/// 在这张表里：行首词命中命令头后，参数位（词为空或匹配参数前缀）时弹出。
+/// 提炼自 docs/命令速查.md 的参数说明段
+const CMD_ARG_HINTS: &[(&str, &[(&str, &str)])] = &[
+    (
+        "mysqldump",
+        &[
+            ("-h 主机 -P 3306 -u root ", "主机 / 大写端口 / 用户（密码走 secret_env 注入 MYSQL_PWD）"),
+            ("--single-transaction ", "InnoDB 一致性快照不锁表，生产必备"),
+            ("--routines ", "含存储过程"),
+            ("--triggers ", "含触发器"),
+            ("--events ", "含事件"),
+            ("--no-data ", "只导表结构"),
+            ("--no-create-info ", "只导数据"),
+            ("--where=\"created_at >= '…'\" ", "条件导出单表"),
+            ("--databases db1 db2 ", "备多库且带 CREATE DATABASE"),
+            ("--set-gtid-purged=OFF ", "GTID 库备份导到非 GTID 库报错时加"),
+            ("--max-allowed-packet=512M ", "超大行报包超限时加"),
+            ("--login-path=名 ", "mysql_config_editor 存过的混淆凭据路径"),
+        ],
+    ),
+    (
+        "mysql",
+        &[
+            ("-h 主机 -P 3306 -u root -D 库名 ", "主机 / 大写端口 / 用户 / 默认库"),
+            ("-e \"SELECT COUNT(*) FROM t;\" ", "执行 SQL（-D 选库后不用写库前缀）"),
+            ("-t ", "表格化输出"),
+            ("库表 < backup/mysql.sql", "导入恢复（重定向进 mysql）"),
+        ],
+    ),
+    (
+        "psql",
+        &[
+            ("-h 主机 -p 5432 -U postgres -d 库名 ", "主机 / 小写端口 / 用户 / 库"),
+            ("-c \"\\dt\" ", "执行 SQL / 元命令"),
+        ],
+    ),
+    (
+        "pg_dump",
+        &[
+            ("-h 主机 -p 5432 -U postgres ", "主机 / 小写端口 / 用户（密码走 PGPASSWORD）"),
+            ("-Fc ", "自定义压缩格式（pg_restore 恢复）"),
+            ("-f backup/pg.sql ", "输出到文件"),
+            ("-s ", "只结构"),
+            ("-a ", "只数据"),
+            ("-t 表名 ", "只导指定表"),
+            ("-n schema ", "按 schema 范围导出"),
+        ],
+    ),
+    (
+        "pg_restore",
+        &[("-j 4 ", "并行恢复"), ("-d 库名 ", "目标库")],
+    ),
+    (
+        "redis-cli",
+        &[
+            ("-h 主机 -p 6379 ", "主机 / 端口（密码建议 REDISCLI_AUTH 环境变量）"),
+            ("ping", "PONG = 通"),
+            ("--rdb backup/dump.rdb ", "远程拉 RDB 备份"),
+            ("-n 1 ", "选 db"),
+        ],
+    ),
+    (
+        "curl",
+        &[
+            ("-s ", "静默"),
+            ("-sf ", "静默 + 非 2xx 返回非零（健康检查关键）"),
+            ("-X POST ", "指定方法"),
+            ("-H \"Content-Type: application/json\" ", "请求头"),
+            ("-d '{\"k\":\"v\"}' ", "请求体"),
+            ("-o 文件 ", "输出写文件"),
+            ("-m 10 ", "总超时秒"),
+            ("--connect-timeout 3 ", "连接超时秒"),
+            ("-k ", "自签证书跳过校验"),
+        ],
+    ),
+    (
+        "tar",
+        &[
+            ("-czf 包.tar.gz -C 目录 . ", "打包（-C 进目录，条目不带前缀）"),
+            ("-xzf 包.tar.gz -C 目标目录 ", "解包（目录先 mkdir -p）"),
+            ("-tzf 包.tar.gz ", "只看包里有什么，不解"),
+        ],
+    ),
+    (
+        "grep",
+        &[
+            ("-i ", "忽略大小写"),
+            ("-n ", "显示行号"),
+            ("-v ", "反选（剔除匹配行）"),
+            ("-c ", "只输出计数"),
+            ("-r ", "递归目录"),
+            ("-E ", "扩展正则"),
+            ("-A2 ", "命中行的后 2 行"),
+            ("-B2 ", "命中行的前 2 行"),
+            ("-C2 ", "命中行的上下 2 行"),
+        ],
+    ),
+    (
+        "find",
+        &[
+            ("-name \"*.log\" ", "按通配匹配"),
+            ("-mtime +7 ", "修改时间 7 天前"),
+            ("-size +100M ", "大于 100M"),
+            ("-delete", "删除命中（先不加它干跑看列表）"),
+            ("-exec 命令 {} \\;", "对命中逐个执行"),
+        ],
+    ),
+    (
+        "rsync",
+        &[
+            ("-avz ", "递归保权限 + 压缩（增量）"),
+            ("-avn ", "干跑预演：先看会传什么"),
+            ("--delete ", "镜像同步：目标多出的删掉（想清楚）"),
+            ("--exclude ", "排除（如 --exclude node_modules）"),
+        ],
+    ),
+    (
+        "mvn",
+        &[
+            ("-B ", "批处理：关进度条彩色，日志干净（CI 标配）"),
+            ("-q ", "只输出 ERROR（配 outputs 捕获）"),
+            ("-T 1C ", "每核 1 线程并行构建"),
+            ("-P prod ", "激活 profile"),
+            ("-DskipTests ", "跳测试执行"),
+            ("-Dmaven.test.skip=true ", "连编译都跳"),
+            ("-U ", "强刷 SNAPSHOT 依赖"),
+            ("-o ", "离线模式：只吃本地仓库"),
+            ("-pl 模块 -am ", "只建指定模块及其上游依赖"),
+            ("-s settings.xml ", "指定 settings.xml"),
+            ("-Dmaven.repo.local=路径 ", "指定本地仓库"),
+        ],
+    ),
+    (
+        "kubectl",
+        &[
+            ("-n 命名空间 ", "指定 namespace"),
+            ("-o wide ", "宽输出（IP / 节点）"),
+            ("-f 清单.yaml ", "清单文件"),
+            ("-w ", "持续 watch"),
+            ("--tail=100 ", "日志最近 N 行"),
+            ("--timeout=120s ", "超时（rollout status）"),
+        ],
+    ),
+];
+
+/// 当前输入行的首词（命令头）：参数级提示按它查 CMD_ARG_HINTS
+fn line_head(before: &str) -> &str {
+    before
+        .rsplit('\n')
+        .next()
+        .unwrap_or("")
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+}
+
+/// 参数级提示：词为空列出该命令全部常用参数；词非空按参数骨架前缀过滤
+/// （还在打命令头本身时参数骨架不匹配 → 自然不弹）。
+/// 已出现在当前命令行里的参数不再提示——Tab 上屏后弹层重开还列着刚补全的
+/// 那条很别扭；按词元精确比对（-H 这类可重复参数想要第二个就手敲）
+fn arg_hints_for_word(head: &str, word: &str, line: &str) -> Vec<egui::Suggestion> {
+    let Some((_, args)) = CMD_ARG_HINTS.iter().find(|(h, _)| *h == head) else {
+        return vec![];
+    };
+    let used: std::collections::HashSet<&str> = line.split_whitespace().collect();
+    args.iter()
+        .filter(|(ins, _)| {
+            let fresh = ins
+                .split_whitespace()
+                .next()
+                .is_none_or(|token| !used.contains(token));
+            (word.is_empty() || ins.starts_with(word)) && fresh
+        })
+        .map(|(ins, desc)| egui::Suggestion::new((*ins).to_string()).description(*desc))
+        .collect()
+}
+
+/// 双括号变量补全：word 是 `${{ ` 之后的路径片段（`${{` 后没打空格时 word 会
+/// 整体带上 `${{` 前缀——剥掉再过滤，上屏文本把前缀补回去）。候选 = 变量组
+/// 变量 / env（步骤产出 + 凭据注入）/ targets 字段 / now 系列 / run.id；
+/// insert 自动闭合 ` }}`。
+fn double_brace_suggestions(
+    word: &str,
+    vars: &[(String, String, String)],
+    group_selected: bool,
+    target_names: &[String],
+    env_keys: &[String],
+) -> Vec<egui::Suggestion> {
+    let (path, prefixed) = match word.strip_prefix("${{") {
+        Some(rest) => (rest, true),
+        None => (word, false),
+    };
+    let wrap = |p: &str| {
+        // 手工拼接：`${{`/`}}` 的 format! 转义太绕，push_str 直观且不会数错
+        let mut s = String::new();
+        if prefixed {
+            s.push_str("${{ ");
+        }
+        s.push_str(p);
+        s.push_str(" }}");
+        s
+    };
+    let mut out = Vec::new();
+    // variables.*：流程选了变量组 → 只列该组的键（desc 带现值便于选对，变量表
+    // 面板本就明文展示）；未选组 → 列出全部组的键并在 desc 标注组名 + ⚠
+    //（未选组运行时不替换——先在流程第 2 行选组，或给表达式加 `|| 默认值`）
+    for (group, name, value) in vars {
+        let p = format!("variables.{name}");
+        if p.starts_with(path) {
+            let shown = value.lines().next().unwrap_or("");
+            let shown = if shown.chars().count() > 40 {
+                let t: String = shown.chars().take(40).collect();
+                format!("{t}…")
+            } else {
+                shown.to_string()
+            };
+            let desc = if group_selected {
+                if shown.is_empty() {
+                    "变量组变量".to_string()
+                } else {
+                    format!("变量组变量 = {shown}")
+                }
+            } else {
+                format!("变量组 {group} = {shown}（⚠ 流程未选变量组，运行时不会替换）")
+            };
+            out.push(
+                egui::Suggestion::new(wrap(&p))
+                    .content(p)
+                    .description(desc),
+            );
+        }
+    }
+    // env.*：步骤产出（outputs 捕获）+ 本步骤凭据注入（secret_env）的键
+    //（运行期捕获/注入，编辑期无从取值）
+    for key in env_keys {
+        let p = format!("env.{key}");
+        if p.starts_with(path) {
+            out.push(
+                egui::Suggestion::new(wrap(&p))
+                    .content(p)
+                    .description("运行期 env（步骤产出 / 凭据注入）"),
+            );
+        }
+    }
+    // targets.*：本项目目标的常用字段（host/port/user/work_root）
+    for t in target_names {
+        for (field, desc) in [
+            ("host", "主机"),
+            ("port", "端口"),
+            ("user", "用户"),
+            ("work_root", "工作根目录"),
+        ] {
+            let p = format!("targets.{t}.{field}");
+            if p.starts_with(path) {
+                out.push(
+                    egui::Suggestion::new(wrap(&p))
+                        .content(p)
+                        .description(format!("目标 {t} · {desc}")),
+                );
+            }
+        }
+    }
+    // 内置变量（引擎侧生成，一次运行同值）
+    for (p, desc) in [
+        ("now", "运行启动时刻（一次运行所有步骤同值）"),
+        ("now.date", "运行启动日期 20261023"),
+        ("now.time", "运行启动时刻 153045"),
+        ("now.iso", "可读格式 2026-10-23 15:30:45"),
+        ("run.id", "本次运行唯一标识（与控制台日志同名）"),
+    ] {
+        if p.starts_with(path) {
+            out.push(
+                egui::Suggestion::new(wrap(p))
+                    .content(p)
+                    .description(desc),
+            );
+        }
+    }
+    out
+}
+
+/// 单括号 `${VAR` 补全（兼容 shell 习惯）：word 含 `${` 前缀（无空格边界）。
+/// 候选 = 步骤产出 / 凭据注入键 + 常用环境变量；insert 闭合 `}`。
+fn single_brace_suggestions(word: &str, env_keys: &[String]) -> Vec<egui::Suggestion> {
+    let Some(partial) = word.strip_prefix("${") else {
+        return vec![];
+    };
+    let mut out = Vec::new();
+    for key in env_keys {
+        if key.starts_with(partial) {
+            out.push(
+                egui::Suggestion::new(format!("${{{key}}}"))
+                    .description("步骤产出 / 凭据注入（outputs / secret_env）"),
+            );
+        }
+    }
+    const COMMON: &[(&str, &str)] = &[
+        ("JAVA_HOME", "JDK 路径"),
+        ("PATH", "可执行搜索路径"),
+        ("MYSQL_PWD", "MySQL 密码（secret_env 注入）"),
+        ("PGPASSWORD", "PG 密码（secret_env 注入）"),
+        ("REDISCLI_AUTH", "Redis 密码（secret_env 注入）"),
+        ("KUBECONFIG", "kubectl 配置（引擎注入）"),
+    ];
+    for (name, desc) in COMMON {
+        if name.starts_with(partial) {
+            out.push(
+                egui::Suggestion::new(format!("${{{name}}}"))
+                    .description(*desc),
+            );
+        }
+    }
+    out
+}
+
+/// 命令输入的建议生成（CompletionPopup 的 suggest 回调）：
+/// - 命令模式：输入词对骨架表首词前缀匹配（不区分大小写）；行首词是已知命令
+///   时再叠加参数级提示（空格后列常用参数，参数前缀可过滤）
+/// - 变量模式（光标在未闭合 `${{ ` / `${` 内）：变量组变量 / env / targets /
+///   内置变量；单括号补 `${NAME}`
+fn command_suggestions(
+    query: &egui::CompletionQuery<'_>,
+    vars: &[(String, String, String)],
+    group_selected: bool,
+    target_names: &[String],
+    env_keys: &[String],
+) -> Vec<egui::Suggestion> {
+    // 光标前文本判定模式（query.word_range 是字符序号区间）
+    let before_end = char_idx_to_byte(query.text, query.word_range.end.0);
+    let before = &query.text[..before_end];
+    match unclosed_var(before) {
+        Some(VarMode::Double) => double_brace_suggestions(
+            query.word,
+            vars,
+            group_selected,
+            target_names,
+            env_keys,
+        ),
+        Some(VarMode::Single) => single_brace_suggestions(query.word, env_keys),
+        None => {
+            // 光标所在行：骨架表的「行首词」判定和参数提示的「已用参数」判定都在行内做
+            let line = before.rsplit('\n').next().unwrap_or("");
+            // 命令骨架表只在「行首词」时提示：行中输入词对骨架表的匹配会把
+            // 「systemctl re」提示成整条骨架，接受后变成 systemctl systemctl restart…
+            // （word 恰是行尾词，剥掉它剩下的就是词前文本，全空白 = 在行首）
+            let line_prefix = line.strip_suffix(query.word).unwrap_or(line);
+            let mut out = if line_prefix.trim().is_empty() {
+                command_suggestions_for_word(query.word)
+            } else {
+                Vec::new()
+            };
+            out.extend(arg_hints_for_word(line_head(before), query.word, line));
+            out
+        }
+    }
 }
 
 fn delete_current_job(main: &mut MainState) {
@@ -1692,6 +2271,8 @@ fn edit_step(
     tool_menu: &ToolMenu,
     running: bool,
     target_names: &[String],
+    var_names: &[(String, String, String)],
+    group_selected: bool,
     job_target_display: &str,
     default_timeout: u64,
     state: StepVisualState,
@@ -1705,7 +2286,20 @@ fn edit_step(
         // 这里再按卡片显式包一层，任何布局调整都不会意外放开输入）
         ui.add_enabled_ui(!running, |ui| {
         let steps_len = job.steps.len();
+        // 命令补全数据源：其他步骤 outputs 声明的产出键（${{ env.X }} / ${VAR}）。
+        // 必须在 step 可变借用 job.steps[si] 之前收集；本步骤凭据注入键在拿到
+        // step 之后并入
+        let mut env_keys: Vec<String> = job
+            .steps
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != si)
+            .flat_map(|(_, s)| s.outputs.keys().cloned())
+            .collect();
         let step = &mut job.steps[si];
+        env_keys.extend(step.secret_env.keys().cloned());
+        env_keys.sort();
+        env_keys.dedup();
         ui.horizontal(|ui| {
             ui.checkbox(&mut step.enabled, "");
             ui.label(format!("Step {}:", si + 1));
@@ -1931,12 +2525,28 @@ fn edit_step(
             ),
             StepType::Pack => edit_pack_mapping(ui, step),
             _ => {
-                ui.add(
+                // 命令补全（egui 内置 CompletionPopup）：输入词匹配命令骨架表；
+                // 光标落在未闭合 `${{ ` / `${` 内切换变量模式（变量组变量 /
+                // env 产出 / targets 字段 / 内置变量），↑↓ 选 / Tab·Enter 上屏 / Esc 关
+                egui::CompletionPopup::new(ui.make_persistent_id(("cmdcomplete", si))).show(
+                    ui,
                     egui::TextEdit::multiline(&mut step.command)
                         .desired_rows(2)
                         .desired_width(f32::INFINITY)
                         .font(egui::TextStyle::Monospace)
-                        .hint_text("命令，支持 ${{ variables.X }} / ${{ env.X }} / ${VAR}"),
+                        .hint_text(
+                            "命令，支持 ${{ variables.X }} / ${{ env.X }} / ${VAR}；\
+                             输入有补全：↑↓ 选 / Tab 上屏 / Esc 关",
+                        ),
+                    |query| {
+                        command_suggestions(
+                            query,
+                            var_names,
+                            group_selected,
+                            target_names,
+                            &env_keys,
+                        )
+                    },
                 );
             }
         }
@@ -1965,11 +2575,35 @@ fn edit_step(
                             crate::models::WaitMode::Tcp => "host:port，如 10.0.0.5:8080",
                             crate::models::WaitMode::Http => "http://host[:port]/path",
                         };
-                        ui.add(
-                            egui::TextEdit::singleline(&mut p.target)
-                                .desired_width(220.0)
-                                .hint_text(hint),
-                        );
+                        // 命令模式探测目标同样给补全（tcp/http 是 host:port / URL，不弹命令表）
+                        if matches!(p.mode, crate::models::WaitMode::Command) {
+                            egui::CompletionPopup::new(ui.make_persistent_id((
+                                "waitcomplete",
+                                si,
+                            )))
+                            .max_height(160.0)
+                            .show(
+                                ui,
+                                egui::TextEdit::singleline(&mut p.target)
+                                    .desired_width(220.0)
+                                    .hint_text(hint),
+                                |query| {
+                                    command_suggestions(
+                                        query,
+                                        var_names,
+                                        group_selected,
+                                        target_names,
+                                        &env_keys,
+                                    )
+                                },
+                            );
+                        } else {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut p.target)
+                                    .desired_width(220.0)
+                                    .hint_text(hint),
+                            );
+                        }
                         ui.label("间隔");
                         ui.add(
                             egui::DragValue::new(&mut p.interval_seconds)
@@ -2481,6 +3115,8 @@ mod tests {
                         &tool_menu,
                         false,
                         &target_names,
+                        &[],
+                        false,
                         "无",
                         600,
                         StepVisualState::Idle,
@@ -2616,5 +3252,183 @@ mod tests {
         assert_eq!(cmd, "->\na ->");
         let back = upload_rows(&cmd);
         assert_eq!(back, vec![("".to_string(), "".to_string()), ("a".to_string(), String::new())]);
+    }
+
+    // ── 命令补全（CompletionPopup suggest 回调的纯逻辑）─────────────────────
+
+    /// 手工构造 CompletionQuery：光标在文末、word = 文末最后一词
+    /// （真实调用时由弹层按光标与空白边界切分，这里只喂纯逻辑）
+    fn query_of<'a>(text: &'a str, word: &'a str) -> egui::CompletionQuery<'a> {
+        let cursor = text.chars().count();
+        let word_start = cursor - word.chars().count();
+        egui::CompletionQuery {
+            text,
+            word,
+            word_range: egui::text::CharIndex(word_start)..egui::text::CharIndex(cursor),
+        }
+    }
+
+    #[test]
+    fn unclosed_var_detection() {
+        // 双括号未闭合 → 变量模式；闭合后回到命令模式
+        assert_eq!(unclosed_var("cp -a ${{ var"), Some(VarMode::Double));
+        assert_eq!(unclosed_var("tail -n 100 app.log"), None);
+        assert_eq!(unclosed_var("${{ a }} tail"), None);
+        // 双闭合后又开新单括号
+        assert_eq!(unclosed_var("${{ a }} ${JAV"), Some(VarMode::Single));
+        // 单括号未闭合 / 已闭合
+        assert_eq!(unclosed_var("echo ${JAV"), Some(VarMode::Single));
+        assert_eq!(unclosed_var("echo ${JAVA_HOME} tail"), None);
+        // 无占位符 / 裸 `$` 不算
+        assert_eq!(unclosed_var("echo $VAR"), None);
+        assert_eq!(unclosed_var(""), None);
+        // 中文等多字节字符混排：按字节 rfind 也能找对位置
+        assert_eq!(unclosed_var("备份到 /opt/${{ 备"), Some(VarMode::Double));
+    }
+
+    #[test]
+    fn char_idx_to_byte_multibyte() {
+        // ASCII：字符序号 = 字节偏移
+        assert_eq!(char_idx_to_byte("tail -1", 7), 7);
+        // 中文每字符 3 字节：第 3 个字符（序号 3）起始字节 = 9
+        assert_eq!(char_idx_to_byte("备份到x", 3), 9);
+        // 序号 = 字符总数 → 文本末尾（光标在文末的常见情况）
+        assert_eq!(char_idx_to_byte("备份到x", 4), 10);
+        // 空文本 / 序号超界 → 文本末尾
+        assert_eq!(char_idx_to_byte("", 0), 0);
+        assert_eq!(char_idx_to_byte("ab", 99), 2);
+    }
+
+    #[test]
+    fn command_mode_suggestions() {
+        // 前缀匹配 + 不区分大小写
+        let hits = command_suggestions_for_word("tail");
+        assert!(hits.iter().any(|s| s.insert.starts_with("tail -n 100 ")));
+        let hits = command_suggestions_for_word("TAIL");
+        assert!(hits.iter().any(|s| s.insert.starts_with("tail -f ")));
+        // 多候选：systemctl 列出 restart / status 等形态
+        let hits = command_suggestions_for_word("systemctl");
+        assert!(hits.len() >= 4);
+        // 空词不弹（每打一个空格弹全表会很吵）；无命中不弹
+        assert!(command_suggestions_for_word("").is_empty());
+        assert!(command_suggestions_for_word("zzzz").is_empty());
+    }
+
+    #[test]
+    fn double_brace_suggestions_filter_and_close() {
+        // (组名, 键, 值)：流程选了变量组时只传该组的条目
+        let vars = vec![("prod".to_string(), "REGISTRY".to_string(), "registry:5000".to_string())];
+        let targets = vec!["prod".to_string()];
+        let env_keys = vec!["VERSION".to_string()];
+
+        // word = 路径片段 → 命中 variables.*，insert 自动闭合 ` }}`，desc 带现值
+        let hits = double_brace_suggestions("var", &vars, true, &targets, &env_keys);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].insert, "variables.REGISTRY }}");
+
+        // 命名空间前缀继续过滤；targets 字段命中 host
+        let hits = double_brace_suggestions("variables.REG", &vars, true, &targets, &env_keys);
+        assert_eq!(hits.len(), 1);
+        let hits = double_brace_suggestions("targets.prod.h", &vars, true, &targets, &env_keys);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].insert, "targets.prod.host }}");
+
+        // 空词（`${{ ` 刚打完）→ 全量：变量 + env + targets 字段 + 内置变量
+        let hits = double_brace_suggestions("", &vars, true, &targets, &env_keys);
+        assert!(hits.iter().any(|s| s.insert == "variables.REGISTRY }}"));
+        assert!(hits.iter().any(|s| s.insert == "env.VERSION }}"));
+        assert!(hits.iter().any(|s| s.insert == "now.date }}"));
+        assert!(hits.iter().any(|s| s.insert == "run.id }}"));
+        assert!(hits.iter().any(|s| s.insert == "targets.prod.host }}"));
+
+        // `${{` 后没打空格：word 带前缀 → insert 把前缀补回去（替换范围含前缀）
+        let hits = double_brace_suggestions("${{variables.R", &vars, true, &targets, &env_keys);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].insert, "${{ variables.REGISTRY }}");
+    }
+
+    #[test]
+    fn double_brace_vars_without_group_selected() {
+        // 流程未选变量组：show 层会传入全部组的键，仍然列出（insert 不变），
+        // 由 desc 标注组名 + ⚠ 运行时不替换（desc 文本不好断言，这里锁行为）
+        let vars = vec![("prod".to_string(), "REGISTRY".to_string(), String::new())];
+        let hits = double_brace_suggestions("var", &vars, false, &[], &[]);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].insert, "variables.REGISTRY }}");
+    }
+
+    #[test]
+    fn arg_hints_after_known_command() {
+        // 空格后（word 空）→ 列出该命令全部常用参数（mysqldump 提示不全的补法）
+        let hits = command_suggestions(&query_of("mysqldump ", ""), &[], false, &[], &[]);
+        assert!(hits.iter().any(|s| s.insert == "--single-transaction "));
+        assert!(hits.iter().any(|s| s.insert == "--no-data "));
+        // 参数前缀过滤：--s 只剩 --single-transaction / --set-gtid-purged
+        let hits = command_suggestions(&query_of("mysqldump --s", "--s"), &[], false, &[], &[]);
+        assert!(!hits.is_empty());
+        assert!(hits.iter().all(|s| s.insert.starts_with("--s")));
+        // 行首词不是已知命令 → 不出参数提示（骨架表也不命中 → 无弹层）
+        let hits = command_suggestions(&query_of("echo ", ""), &[], false, &[], &[]);
+        assert!(hits.is_empty());
+        // 还在打命令头本身 → 只出骨架表候选，不混参数
+        let hits = command_suggestions(&query_of("mysq", "mysq"), &[], false, &[], &[]);
+        assert!(!hits.is_empty());
+        assert!(hits.iter().all(|s| s.insert.starts_with("my")));
+        // 多行命令取当前行首词
+        assert_eq!(line_head("tail -n 100\nmysqldump "), "mysqldump");
+        assert_eq!(line_head("mysqldump -h host"), "mysqldump");
+    }
+
+    #[test]
+    fn arg_hints_skip_already_used() {
+        // Tab 上屏过的参数不再提示（用户反馈：已补全的还列在弹层里很别扭）
+        let line = "mysqldump --single-transaction ";
+        let hits = command_suggestions(&query_of(line, ""), &[], false, &[], &[]);
+        assert!(hits.iter().all(|s| s.insert != "--single-transaction "));
+        assert!(hits.iter().any(|s| s.insert == "--no-data "));
+        // 参数都上屏完的场景：tar 只用了 -czf → 它被滤掉，未用过的 -xzf/-tzf
+        // 仍会提示（规则 = 只滤已用；无法可靠判定「命令已写完」，不做猜测）
+        let line = "tar -czf x.tar.gz -C dir . ";
+        let hits = command_suggestions(&query_of(line, ""), &[], false, &[], &[]);
+        assert!(hits.iter().all(|s| s.insert != "-czf 包.tar.gz -C 目录 . "));
+        assert!(hits.iter().any(|s| s.insert.starts_with("-xzf ")));
+    }
+
+    #[test]
+    fn head_suggestions_only_at_line_start() {
+        // 行中输入词不再提示整条骨架：旧行为会把「systemctl re」提示成骨架，
+        // 接受后拼成 systemctl systemctl restart；行中改由参数提示接管
+        let hits = command_suggestions(&query_of("systemctl re", "re"), &[], false, &[], &[]);
+        assert!(hits.is_empty());
+        // 行首（含仅空白前缀）照常出骨架表
+        let hits = command_suggestions(&query_of("  tail", "tail"), &[], false, &[], &[]);
+        assert!(hits.iter().any(|s| s.insert.starts_with("tail -n 100 ")));
+    }
+
+    #[test]
+    fn single_brace_suggestions_close() {
+        let env_keys = vec!["VERSION".to_string()];
+        // 步骤产出/凭据注入键 + 常用环境变量都命中，insert 闭合 `}`
+        let hits = single_brace_suggestions("${", &env_keys);
+        assert!(hits.iter().any(|s| s.insert == "${VERSION}"));
+        assert!(hits.iter().any(|s| s.insert == "${JAVA_HOME}"));
+        let hits = single_brace_suggestions("${JAV", &env_keys);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].insert, "${JAVA_HOME}");
+    }
+
+    #[test]
+    fn suggest_dispatch_by_mode() {
+        let vars = vec![("prod".to_string(), "REGISTRY".to_string(), String::new())];
+        // 命令模式：word 走骨架表（"tail" 不是参数提示命令头，无参数混入）
+        let hits = command_suggestions(&query_of("tail", "tail"), &vars, true, &[], &[]);
+        assert!(!hits.is_empty());
+        // 变量模式（双括号）：word 走变量表
+        let hits = command_suggestions(&query_of("cp ${{ var", "var"), &vars, true, &[], &[]);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].insert, "variables.REGISTRY }}");
+        // 变量模式（单括号）：word 含 `${` 前缀
+        let hits = command_suggestions(&query_of("echo ${JAV", "${JAV"), &vars, true, &[], &[]);
+        assert_eq!(hits[0].insert, "${JAVA_HOME}");
     }
 }

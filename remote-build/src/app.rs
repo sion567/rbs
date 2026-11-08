@@ -198,10 +198,10 @@ pub struct MainState {
     pub target_editor: ui::targets::TargetEditorState,
     /// 设置窗口当前分区 tab
     pub settings_tab: ui::settings::SettingsTab,
-    /// 「？ 变量语法」帮助窗口
-    pub show_var_help: bool,
-    /// 「？ 命令速查」帮助窗口（docs/命令速查.md 的 UI 镜像）
-    pub show_cmd_help: bool,
+    /// 「❓ 帮助」窗口（命令速查 / 变量语法两 tab 合一）
+    pub show_help: bool,
+    /// 帮助窗口当前 tab：开关窗口后还停在上次看的页
+    pub help_tab: ui::job_editor::HelpTab,
     /// 主题是否已在首帧应用（egui ctx 需要在 show 阶段才能设置）
     pub theme_applied: bool,
     pub status_msg: Option<String>,
@@ -369,8 +369,8 @@ impl MainState {
             tree_rename_buf: String::new(),
             target_editor: Default::default(),
             settings_tab: Default::default(),
-            show_var_help: false,
-            show_cmd_help: false,
+            show_help: false,
+            help_tab: Default::default(),
             theme_applied: false,
             status_msg: None,
             run_steps: Vec::new(),
@@ -667,23 +667,17 @@ impl MainState {
                     if ui.add_enabled(!running, egui::Button::new("🎯 目标")).clicked() {
                         self.target_editor.open = !self.target_editor.open;
                     }
-                    // 变量语法速查的全局入口（原先只在流程编辑器工具栏）：编辑步骤 /
-                    // 配目标 / 看历史时都可能要查，放常驻工具栏不挑场景
+                    // 帮助两窗合一（❓ → 命令速查 / 变量语法 tab）：编辑步骤 / 配目标 /
+                    // 看历史时都可能要查，放常驻工具栏不挑场景
                     if ui
-                        .button("❓ 变量语法")
-                        .on_hover_text("变量 / 条件 / outputs / wait / 常用命令写法速查\n（与 docs/变量速查.md、docs/命令速查.md 同源）")
+                        .button("❓ 帮助")
+                        .on_hover_text(
+                            "命令速查（构建/部署高频命令实例 + 参数）+ 变量语法（占位符 / 条件 / outputs）\n\
+                             （与 docs/命令速查.md、docs/变量速查.md 同源）",
+                        )
                         .clicked()
                     {
-                        self.show_var_help = true;
-                    }
-                    // 命令速查独立成窗：变量语法是"怎么写占位符"，命令速查是"命令本体 +
-                    // 参数"（Linux / cmd / Maven / Gradle / Docker / k8s / MySQL 等），内容量大不挤同一窗
-                    if ui
-                        .button("❓ 命令速查")
-                        .on_hover_text("构建 / 部署高频命令速查（实例 + 参数说明）\n（与 docs/命令速查.md 同源）")
-                        .clicked()
-                    {
-                        self.show_cmd_help = true;
+                        self.show_help = true;
                     }
                     // 状态消息截断：right_to_left 布局里文字从右往左长，
                     // 长作业名 / 监听路径 / ⚠ 长提示会无边界延伸，压到 ⟳ Reload
@@ -740,8 +734,7 @@ impl MainState {
 
         ui::new_project::show(&ctx, self);
         ui::job_editor::show_new_job_window(&ctx, self);
-        ui::job_editor::show_var_help_window(&ctx, self);
-        ui::job_editor::show_cmd_help_window(&ctx, self);
+        ui::job_editor::show_help_window(&ctx, self);
         show_confirm_gate_window(&ctx, self);
 
         // 运行中保持帧率：日志流畅上屏 + 蓝黄光圈 1Hz 呼吸动画；更新代码中保持进度上屏；
