@@ -22,6 +22,7 @@
 | v0.3 | 2026-01-15 | **移除** Web UI / Tauri / 中心服务端 / 权限模型 / 审批流；PuTTY 套件改为内置捆绑分发；新增项目本地目录输入框；更新目录结构与打包策略 |
 | v0.4 | 2026-10-19 | 评审修复 10 项：serde 序列化对齐（`EnvironmentVariables` flatten、对外枚举补 `rename_all`）、`build_ssh_args` 解构修复、远端 `cd` 路径引号转义、补 `ValidationIssue` 定义、`FailureAction` 去重、澄清 tools.yaml putty 条目与 `PuttyTransport` 关系、完整性校验覆盖全部捆绑文件、UI 树修正、补充 `cancel_rx` 分发说明 |
 | v0.5 | 2026-10-27 | **传输层换防**：russh + russh-sftp 从 P3 预留升级为**默认传输**（进程内 SSH），PuTTY 套件转为**按目标可选的兜底**；Target 新增 `transport` 字段（旧目标兼容按 putty）；**移除 OpenSshTransport 计划**（占位封存，硬化参数移植进 russh）；上传/下载改走 SFTP；协议级 keepalive；拍板 §19 待确认问题 4 |
+| v0.5.1 | 2026-11-10 | **项目归类层**：`Project.category` 字段 + 任意深度目录布局 `projects/<a>/<b>/<工程>/`；discover 递归扫描（含 project.yaml 即工程并停止下钻，否则视为容器继续下钻，层级不限；category 缺省回填完整父目录链 "a/b"）；UI 树按归类链嵌套渲染多层「🗂 项目」节点；工程右键移入/移出项目（路径可含 / 建多级）、分类右键重命名（改本段，子级跟随）/解散（成员升一级）；工程名全局唯一（重名告警），CLI/历史/锁/凭据不受影响。**跨工程项目运行**：分类节点右键一键把成员工程流程串成流水线（全部/同名分组过滤），复用组运行串行循环失败即停；GroupJob 带所属工程，引擎逐流程解析各自工程的目标/变量/凭据/锁，日志按工程分目录，历史 trigger=category |
 
 ### v0.3 相较 v0.2 的实质性变化
 
@@ -257,6 +258,9 @@ pub struct EnvironmentVariables {
 # projects/payment-service/project.yaml
 name: payment-service
 description: "支付核心服务"
+category: 项目A        # 可选：归类链（UI 树「🗂 项目」嵌套分组），"/" 分隔可多级如 yudao/后台；
+                      # 目录对应 projects/yudao/后台/<工程>/，深度不限；缺省 = 平铺工程。
+                      # 手挪工程目录进分类文件夹后 discover 以完整父目录链回填
 local_path: D:\workspace\payment-service
 variables:
   staging:
@@ -1494,12 +1498,15 @@ pub fn validate_project(project: &Project) -> Vec<ValidationIssue> {
 ├── variables.yaml                      # 全局变量
 ├── projects/                           # 用户自己 git clone 配置仓库到这里
 │   └── build-configs/                  #   git clone <repo> 到这
-│       ├── payment-service/
-│       │   ├── project.yaml            #   local_path 指向实际代码目录
-│       │   ├── build.yaml
-│       │   ├── test.yaml
-│       │   └── deploy-prod.yaml
-│       └── frontend-web/
+│       ├── 项目A/                       #   归类层（可选）：「🗂 项目」树分组
+│       │   ├── payment-service/        #     category: 项目A 的工程
+│       │   │   ├── project.yaml        #   local_path 指向实际代码目录
+│       │   │   ├── build.yaml
+│       │   │   ├── test.yaml
+│       │   │   └── deploy-prod.yaml
+│       │   └── mobile-app/
+│       │       └── project.yaml
+│       └── frontend-web/               #   平铺工程（无 category）：小项目不归类
 │           ├── project.yaml
 │           └── build.yaml
 ├── logs/                               # 运行日志
@@ -1517,6 +1524,15 @@ D:\workspace\payment-service\           ← project.yaml 里的 local_path
 **两层分离**：
 - `~/.remote-build/projects/` → 构建配置（YAML，可 git 管理）
 - `project.yaml` 里的 `local_path` → 实际代码目录（开发者自己的 workspace）
+
+**项目归类层（category）**：`projects/` 支持**任意深度**的目录布局——目录含
+`project.yaml` 即为工程（发现后不再下钻，工程内部如 node_modules 不会被当成工程）；
+不含则视为归类容器，继续向下扫，层级不限（防环路上限 16 层）。工程的 `category`
+是 "/" 分隔的层级链（如 `yudao/后台`），缺省时以相对 projects 根的完整父目录链回填，
+UI 树按链嵌套渲染多层「🗂 项目」分组。分类是纯展示容器：CLI 查找、运行历史、
+锁文件、凭据键全部按工程名工作，工程名要求全局唯一。树里右键工程可
+「移入/移出项目」（路径可含 / 建多级），右键分类节点可重命名（只改本段，子级
+跟随）/解散（成员升到上一级；只挪目录与字段，不删文件）。
 
 ### 10.2 协作流程
 
