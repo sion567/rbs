@@ -8,9 +8,9 @@
 //! 便于脚本化与 CI 使用；GUI 功能与 CLI 共用同一套引擎/配置。
 
 use crate::config;
-use crate::models::{Target, TargetType};
 use crate::engine::{Engine, RunInput};
 use crate::models::LogEvent;
+use crate::models::{Target, TargetType};
 use anyhow::Context as _;
 use tokio::sync::{broadcast, mpsc};
 
@@ -84,7 +84,10 @@ fn set_password(args: &[String]) {
         std::process::exit(2);
     }
     match crate::secrets::set_password(&args[0], &args[1]) {
-        Ok(()) => println!("✅ 密码已写入 Windows Credential Manager（目标: {}）", args[0]),
+        Ok(()) => println!(
+            "✅ 密码已写入 Windows Credential Manager（目标: {}）",
+            args[0]
+        ),
         Err(e) => {
             eprintln!("❌ {e:#}");
             std::process::exit(1);
@@ -101,8 +104,7 @@ fn test_conn(args: &[String]) {
     // 查找顺序：遍历各项目的项目级 targets（§3.5 目标随项目走）
     let mut found: Option<(String, Target)> = None;
 
-    let (projects, _) =
-        crate::storage::files::discover_with_errors(&config::projects_dir());
+    let (projects, _) = crate::storage::files::discover_with_errors(&config::projects_dir());
     for p in projects {
         if let Some(t) = p.project.targets.get(name) {
             let mut t = t.clone();
@@ -162,13 +164,22 @@ fn run(args: &[String]) {
     let Some(je) = entry.jobs.iter().find(|j| j.job.name == job_name).cloned() else {
         eprintln!(
             "❌ 项目 {project_name} 下未找到流程: {job_name}（现有: {:?}）",
-            entry.jobs.iter().map(|j| j.job.name.clone()).collect::<Vec<_>>()
+            entry
+                .jobs
+                .iter()
+                .map(|j| j.job.name.clone())
+                .collect::<Vec<_>>()
         );
         std::process::exit(2);
     };
 
     // 人工确认门（job.confirm）：交互终端输入确认词；非交互终端必须显式 --yes
-    let expected = je.job.confirm.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let expected = je
+        .job
+        .confirm
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
     if let Some(expected) = expected {
         use std::io::IsTerminal as _;
         if yes_flag {
@@ -292,23 +303,42 @@ fn print_cli_event(ev: &LogEvent) {
     match ev {
         LogEvent::Stdout { line, .. } => println!("{line}"),
         LogEvent::Stderr { line, .. } => eprintln!("[stderr] {line}"),
-        LogEvent::StepStart { step_index, name, .. } => {
+        LogEvent::StepStart {
+            step_index, name, ..
+        } => {
             println!("── Step {} ── {name}", step_index + 1)
         }
-        LogEvent::StepEnd { step_index, exit_code, duration_ms } => {
-            println!("── Step {} 退出码 {exit_code} ({duration_ms}ms)", step_index + 1)
+        LogEvent::StepEnd {
+            step_index,
+            exit_code,
+            duration_ms,
+        } => {
+            println!(
+                "── Step {} 退出码 {exit_code} ({duration_ms}ms)",
+                step_index + 1
+            )
         }
         // 退避等待期已有失败告警行，不重复输出
         LogEvent::StepRetryWait { .. } => {}
         LogEvent::Error { message } => eprintln!("[error] {message}"),
         LogEvent::JobEnd { .. } => {}
         // 组运行边界（run-group）
-        LogEvent::GroupJobBegin { job, index, total, .. } => {
+        LogEvent::GroupJobBegin {
+            job, index, total, ..
+        } => {
             // index 0 起：展示 +1（与 GUI 状态栏/控制台同口径）
             println!("──── 组运行 {}/{total} ── 启动流程 {job} ────", index + 1)
         }
-        LogEvent::GroupJobEnd { job, status, duration_ms, .. } => {
-            println!("──── 组流程 {job}: {}（{duration_ms}ms）────", status.short())
+        LogEvent::GroupJobEnd {
+            job,
+            status,
+            duration_ms,
+            ..
+        } => {
+            println!(
+                "──── 组流程 {job}: {}（{duration_ms}ms）────",
+                status.short()
+            )
         }
     }
 }
@@ -335,7 +365,12 @@ fn run_group(args: &[String]) {
         match a.as_str() {
             "--yes" => yes_flag = true,
             "--from" => {
-                from_name = Some(it.next().context("--from 需要流程名").cloned().unwrap_or_default());
+                from_name = Some(
+                    it.next()
+                        .context("--from 需要流程名")
+                        .cloned()
+                        .unwrap_or_default(),
+                );
             }
             _ => positional.push(a),
         }
@@ -350,7 +385,10 @@ fn run_group(args: &[String]) {
     for w in &warnings {
         eprintln!("⚠ {w}");
     }
-    let entry = match projects.into_iter().find(|p| p.project.name == project_name) {
+    let entry = match projects
+        .into_iter()
+        .find(|p| p.project.name == project_name)
+    {
         Some(e) => e,
         None => {
             eprintln!("❌ 未找到项目: {project_name}");
@@ -361,7 +399,11 @@ fn run_group(args: &[String]) {
         .jobs
         .iter()
         .filter(|je| je.job.group.as_deref() == Some(group_name.as_str()))
-        .map(|je| crate::group::GroupJob { name: je.job.name.clone(), job: je.job.clone() })
+        .map(|je| crate::group::GroupJob {
+            project: entry.project.clone(),
+            name: je.job.name.clone(),
+            job: je.job.clone(),
+        })
         .collect();
     if jobs.is_empty() {
         eprintln!("❌ 项目 {project_name} 下没有分组「{group_name}」或分组为空");
@@ -382,11 +424,12 @@ fn run_group(args: &[String]) {
     };
 
     let tools = config::load_tools().map(|t| t.tools).unwrap_or_default();
-    let all_targets = config::effective_targets(&entry.project);
     let default_timeout = config::load_global()
         .map(|g| g.default_timeout)
         .unwrap_or(crate::engine::DEFAULT_STEP_TIMEOUT);
-    let save_history = config::load_global().map(|g| g.save_history).unwrap_or(true);
+    let save_history = config::load_global()
+        .map(|g| g.save_history)
+        .unwrap_or(true);
 
     // 组级预览：剩余流程干跑连展（与 GUI 确认门同一份内容）
     println!(
@@ -394,16 +437,26 @@ fn run_group(args: &[String]) {
         project_name,
         group_name,
         jobs.len() - from,
-        if from > 0 { format!("，从第 {} 个流程继续", from + 1) } else { String::new() }
+        if from > 0 {
+            format!("，从第 {} 个流程继续", from + 1)
+        } else {
+            String::new()
+        }
     );
-    for line in crate::group::plan_lines(&entry.project, &jobs[from..], &tools, &all_targets, default_timeout) {
+    for line in crate::group::plan_lines(&jobs[from..], &tools, default_timeout) {
         println!("{line}");
     }
 
     // 确认门：剩余流程的全部确认词（非交互终端必须 --yes）
     let mut distinct: Vec<String> = Vec::new();
     for gj in &jobs[from..] {
-        if let Some(w) = gj.job.confirm.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(w) = gj
+            .job
+            .confirm
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
             if !distinct.iter().any(|x| x == w) {
                 distinct.push(w.to_string());
             }
@@ -420,7 +473,10 @@ fn run_group(args: &[String]) {
             );
             std::process::exit(1);
         } else {
-            print!("🔒 组确认门：输入确认词（需包含: {}）: ", distinct.join(" "));
+            print!(
+                "🔒 组确认门：输入确认词（需包含: {}）: ",
+                distinct.join(" ")
+            );
             use std::io::Write as _;
             std::io::stdout().flush().ok();
             let mut line = String::new();
@@ -442,11 +498,9 @@ fn run_group(args: &[String]) {
     let agg_run_id = group_id.clone();
     let (cancel_tx, _keepalive) = broadcast::channel(4);
     let spec = crate::group::GroupSpec {
-        project: entry.project.clone(),
         group: group_name.clone(),
         jobs,
         tools,
-        all_targets,
         default_step_timeout: default_timeout,
         group_id,
         cancel_tx: Some(cancel_tx),
@@ -485,7 +539,11 @@ fn run_group(args: &[String]) {
         .iter()
         .map(|(name, st)| format!("{name}={}", st.short()))
         .collect();
-    println!("==== 组运行结束: {}（{}）====", agg.short(), summary.join(", "));
+    println!(
+        "==== 组运行结束: {}（{}）====",
+        agg.short(),
+        summary.join(", ")
+    );
     if !outcome.ok() {
         std::process::exit(1);
     }
@@ -504,7 +562,10 @@ fn preview(args: &[String]) {
     for w in &warnings {
         eprintln!("⚠ {w}");
     }
-    let Some(entry) = projects.into_iter().find(|p| p.project.name == project_name) else {
+    let Some(entry) = projects
+        .into_iter()
+        .find(|p| p.project.name == project_name)
+    else {
         eprintln!("❌ 未找到项目: {project_name}");
         std::process::exit(2);
     };
@@ -529,7 +590,13 @@ fn preview(args: &[String]) {
 
     let previews = crate::engine::preview_job(&input);
     println!("==== 预览（干跑，不执行）: {project_name}/{job_name} ====");
-    if let Some(c) = je.job.confirm.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+    if let Some(c) = je
+        .job
+        .confirm
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         println!("🔒 确认门: 运行前需输入「{c}」");
     }
     for pre in &je.job.preconditions {
@@ -556,7 +623,10 @@ fn preview(args: &[String]) {
         let mut reqs: Vec<(&String, &String)> = entry.project.tools_require.iter().collect();
         reqs.sort();
         for (name, req) in reqs {
-            let detected = tools.get(name).and_then(|t| t.version.clone()).unwrap_or_default();
+            let detected = tools
+                .get(name)
+                .and_then(|t| t.version.clone())
+                .unwrap_or_default();
             match crate::version::version_matches(req, &detected) {
                 Ok(true) => println!("工具版本: {name} {detected} 满足 {req} ✓"),
                 Ok(false) => println!(
@@ -572,7 +642,12 @@ fn preview(args: &[String]) {
         let tgt = p.target.clone().unwrap_or_else(|| "local".to_string());
         if p.skipped {
             skip_n += 1;
-            println!("[{}] {}  ⏭ 跳过：{}", p.index + 1, p.name, p.note.as_deref().unwrap_or(""));
+            println!(
+                "[{}] {}  ⏭ 跳过：{}",
+                p.index + 1,
+                p.name,
+                p.note.as_deref().unwrap_or("")
+            );
         } else {
             exec_n += 1;
             println!("[{}] {}  目标: {}", p.index + 1, p.name, tgt);
@@ -583,7 +658,14 @@ fn preview(args: &[String]) {
                 println!("    🔧 工具 {tname} → {tcmd}（其目录前置 PATH，裸名命令用这个版本）");
             }
             for (l, r, exists) in &p.uploads {
-                println!("    ↑ {l} -> {r}{}", if *exists { "" } else { "（本地缺失 ⚠）" });
+                println!(
+                    "    ↑ {l} -> {r}{}",
+                    if *exists {
+                        ""
+                    } else {
+                        "（本地缺失 ⚠）"
+                    }
+                );
             }
             if let Some((s, d)) = &p.pack {
                 println!("    ⧉ 打包 {s} -> {d}");

@@ -38,10 +38,13 @@ pub struct NewProjectState {
 
     // 共用
     pub project_name: String,
+    /// 所属项目（归类层，可选）：留空 = 平铺工程。派发时随任务带走，
+    /// 避免克隆期间重开弹窗（open_new 重置状态）把分类弄丢
+    pub category: String,
 
-    // 克隆任务（后台线程）
+    // 克隆任务（后台线程）：Ok((工程名, 所属项目))
     pub progress: Option<Arc<Mutex<String>>>,
-    pub result_rx: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
+    pub result_rx: Option<std::sync::mpsc::Receiver<Result<(String, String), String>>>,
     pub message: Option<(bool, String)>,
 }
 
@@ -60,7 +63,7 @@ pub fn show(ctx: &egui::Context, main: &mut MainState) {
     // 回收后台克隆结果
     if let Some(rx) = &main.new_project.result_rx {
         match rx.try_recv() {
-            Ok(Ok(name)) => {
+            Ok(Ok((name, category))) => {
                 main.new_project.result_rx = None;
                 main.new_project.progress = None;
                 main.new_project.message = None;
@@ -68,13 +71,19 @@ pub fn show(ctx: &egui::Context, main: &mut MainState) {
                 // 此前缺这一步：discover 只认有 project.yaml 的目录，
                 // 克隆完成的项目一直不会出现在项目树里
                 let target = main.new_project.git_target.trim().to_string();
-                if let Err(e) = complete_clone(&name, &target) {
+                let cat = category.trim().to_string();
+                let cat_opt = if cat.is_empty() {
+                    None
+                } else {
+                    Some(cat.as_str())
+                };
+                if let Err(e) = complete_clone(cat_opt, &name, &target) {
                     main.status_msg =
-                        Some(format!("项目「{name}」克隆成功，但配置生成失败 ❌ {e:#}"));
+                        Some(format!("工程「{name}」克隆成功，但配置生成失败 ❌ {e:#}"));
                 }
                 main.reload();
                 main.select_project_by_name(&name);
-                main.status_msg = Some(format!("项目「{name}」创建成功 ✅"));
+                main.status_msg = Some(format!("工程「{name}」创建成功 ✅"));
                 main.new_project.open = false;
             }
             Ok(Err(e)) => {
@@ -100,8 +109,8 @@ pub fn show(ctx: &egui::Context, main: &mut MainState) {
         crate::ui::modal_backdrop(ctx, "mask_new_project");
     }
 
-    crate::ui::centered_window(egui::Window::new("＋ 新建项目"), ctx)
-    .collapsible(false)
+    crate::ui::centered_window(egui::Window::new("＋ 新建工程"), ctx)
+        .collapsible(false)
         .open(&mut open)
         .order(egui::Order::Foreground)
         .default_width(600.0)
@@ -126,12 +135,12 @@ pub fn show(ctx: &egui::Context, main: &mut MainState) {
 
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                ui.label("项目名称:");
+                ui.label("工程名称:");
                 let name_resp = ui.add(
                     egui::TextEdit::singleline(&mut main.new_project.project_name)
                         .desired_width(crate::ui::input::MED),
                 );
-                ui.weak("（配置将创建在 ~/.remote-build/projects/<项目名>/ 下）");
+                ui.weak("（配置将创建在 ~/.remote-build/projects/[<项目>/]<工程名>/ 下）");
                 // 项目名变化时联动补默认克隆目录（仅在目标目录还空着时；
                 // 已手动填过 / URL 已推导过的值不覆盖）。Git 模式专属：本地模式无此字段
                 if name_resp.changed()
@@ -140,10 +149,34 @@ pub fn show(ctx: &egui::Context, main: &mut MainState) {
                 {
                     let name = sanitize_name(main.new_project.project_name.trim());
                     if !name.is_empty() {
-                        main.new_project.git_target =
-                            crate::config::default_clone_target(&name).to_string_lossy().to_string();
+                        main.new_project.git_target = crate::config::default_clone_target(&name)
+                            .to_string_lossy()
+                            .to_string();
                     }
                 }
+            });
+
+            // 所属项目（归类层）：留空平铺；可含 / 建多级 projects/<a>/<b>/<工程>/
+            ui.horizontal(|ui| {
+                ui.label("所属项目:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut main.new_project.category)
+                        .desired_width(crate::ui::input::MED),
+                );
+                // 已有分类提示复用，引导归到同档（同名即同项目）
+                let mut cats: Vec<String> = main
+                    .projects
+                    .iter()
+                    .filter_map(|e| e.project.category.clone())
+                    .collect();
+                cats.sort();
+                cats.dedup();
+                let hint = if cats.is_empty() {
+                    "（可选；可含 / 建多级如 yudao/后台，同类工程归到一档）".to_string()
+                } else {
+                    format!("（可选；可含 / 建多级；已有：{}）", cats.join("、"))
+                };
+                ui.weak(hint);
             });
 
             ui.add_space(10.0);
@@ -273,9 +306,10 @@ fn git_form(ui: &mut egui::Ui, main: &mut MainState) {
                 );
                 if ui.small_button("📂").clicked() {
                     // 起点 = 输入框当前路径（所有浏览按钮统一约定）
-                    if let Some(dir) =
-                        crate::ui::pick_folder(&main.new_project.git_target, "选择克隆目标目录（应为空目录）")
-                    {
+                    if let Some(dir) = crate::ui::pick_folder(
+                        &main.new_project.git_target,
+                        "选择克隆目标目录（应为空目录）",
+                    ) {
                         main.new_project.git_target = dir.to_string_lossy().to_string();
                     }
                 }
@@ -305,8 +339,7 @@ fn local_form(ui: &mut egui::Ui, main: &mut MainState) {
                         main.new_project.local_dir = dir.to_string_lossy().to_string();
                         // 目录末节直接作为项目名（覆盖旧值）
                         if let Some(name) = dir.file_name() {
-                            main.new_project.project_name =
-                                sanitize_name(&name.to_string_lossy());
+                            main.new_project.project_name = sanitize_name(&name.to_string_lossy());
                         }
                     }
                 }
@@ -331,8 +364,9 @@ fn auto_fill_from_url(main: &mut MainState) {
     // 地址末段直接作为项目名（地址再变化时以新末段覆盖）
     main.new_project.project_name = derived.clone();
     if main.new_project.git_target.is_empty() {
-        main.new_project.git_target =
-            crate::config::default_clone_target(&derived).to_string_lossy().to_string();
+        main.new_project.git_target = crate::config::default_clone_target(&derived)
+            .to_string_lossy()
+            .to_string();
     }
 }
 
@@ -340,8 +374,7 @@ fn auto_fill_from_url(main: &mut MainState) {
 fn start(main: &mut MainState) -> bool {
     // 弹窗可能在任务进行中被重新打开，防止重复提交
     if main.new_project.result_rx.is_some() {
-        main.new_project.message =
-            Some((false, "已有创建任务进行中，请等待其完成".to_string()));
+        main.new_project.message = Some((false, "已有创建任务进行中，请等待其完成".to_string()));
         return false;
     }
     let name = sanitize_name(main.new_project.project_name.trim());
@@ -363,16 +396,22 @@ fn start_local(main: &mut MainState, name: String) -> bool {
         main.new_project.message = Some((false, format!("本地目录不存在: {dir}")));
         return false;
     }
-    match crate::config::create_project_entry(&name, Path::new(&dir)) {
+    let cat = main.new_project.category.trim().to_string();
+    let cat_opt = if cat.is_empty() {
+        None
+    } else {
+        Some(cat.as_str())
+    };
+    match crate::config::create_project_entry_in(cat_opt, &name, Path::new(&dir)) {
         Ok(_) => {
             main.new_project.message = None;
             main.reload();
             main.select_project_by_name(&name);
-            main.status_msg = Some(format!("项目「{name}」创建成功 ✅"));
+            main.status_msg = Some(format!("工程「{name}」创建成功 ✅"));
             true
         }
         Err(e) => {
-            main.new_project.message = Some((false, format!("创建项目失败: {e}")));
+            main.new_project.message = Some((false, format!("创建工程失败: {e}")));
             false
         }
     }
@@ -396,8 +435,7 @@ fn start_clone(main: &mut MainState, name: String) -> bool {
             .map(|mut it| it.next().is_some())
             .unwrap_or(true);
         if not_empty {
-            main.new_project.message =
-                Some((false, format!("目标目录已存在且非空: {target}")));
+            main.new_project.message = Some((false, format!("目标目录已存在且非空: {target}")));
             return false;
         }
     }
@@ -424,9 +462,12 @@ fn start_clone(main: &mut MainState, name: String) -> bool {
     main.new_project.progress = Some(progress.clone());
     main.new_project.message = None;
 
+    // 分类随任务带走：克隆期间弹窗可能被重开（open_new 重置输入），
+    // 完成回收时读 main.new_project.category 会拿到新弹窗的值
+    let category = main.new_project.category.trim().to_string();
     std::thread::spawn(move || {
         let res = run_clone(&git_cmd, &full_url, &target, &branch, progress, &password);
-        let _ = tx.send(res.map(|_| name));
+        let _ = tx.send(res.map(|_| (name, category)));
     });
     true
 }
@@ -436,10 +477,11 @@ fn start_clone(main: &mut MainState, name: String) -> bool {
 /// 此前克隆路径从未生成配置，克隆出的项目进不了项目树（discover 只认
 /// 有 project.yaml 的目录），第一版起就存在且完全静默。
 pub(crate) fn complete_clone(
+    category: Option<&str>,
     name: &str,
     target: &str,
 ) -> Result<std::path::PathBuf, anyhow::Error> {
-    crate::config::create_project_entry(name, Path::new(target))
+    crate::config::create_project_entry_in(category, name, Path::new(target))
 }
 
 /// 后台线程执行 git clone，进度写入 progress（已脱敏），返回 Ok(())/Err(错误详情)。
@@ -640,9 +682,18 @@ mod tests {
 
     #[test]
     fn derives_name_from_urls() {
-        assert_eq!(derive_name_from_url("https://github.com/org/payment-service.git"), "payment-service");
-        assert_eq!(derive_name_from_url("https://git.internal/team/app/"), "app");
-        assert_eq!(derive_name_from_url("git@host:path/repo-web.git"), "repo-web");
+        assert_eq!(
+            derive_name_from_url("https://github.com/org/payment-service.git"),
+            "payment-service"
+        );
+        assert_eq!(
+            derive_name_from_url("https://git.internal/team/app/"),
+            "app"
+        );
+        assert_eq!(
+            derive_name_from_url("git@host:path/repo-web.git"),
+            "repo-web"
+        );
         assert_eq!(derive_name_from_url(""), "");
     }
 
@@ -659,14 +710,20 @@ mod tests {
             "https://dev:p%40ss%3Aword@git.internal/team/app.git"
         );
         // 凭证为空原样返回
-        assert_eq!(build_url_with_creds("https://x/y.git", "", ""), "https://x/y.git");
+        assert_eq!(
+            build_url_with_creds("https://x/y.git", "", ""),
+            "https://x/y.git"
+        );
         // 首尾空白（粘贴换行被 egui 换成空格、IME 全角空格）不得进 URL
         assert_eq!(
             build_url_with_creds("https://git.internal/team/app.git", "dev", " pw \n"),
             "https://dev:pw@git.internal/team/app.git"
         );
         // 密码仅含空白 → 视同未填凭证
-        assert_eq!(build_url_with_creds("https://x/y.git", "", "  "), "https://x/y.git");
+        assert_eq!(
+            build_url_with_creds("https://x/y.git", "", "  "),
+            "https://x/y.git"
+        );
         // ssh 形式忽略账号密码
         assert_eq!(
             build_url_with_creds("git@host:path/repo.git", "dev", "pw"),
@@ -677,7 +734,11 @@ mod tests {
     #[test]
     fn run_clone_local_repo_end_to_end() {
         // 本机无 git 时跳过
-        if std::process::Command::new("git").arg("--version").output().is_err() {
+        if std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
             return;
         }
         let base = std::env::temp_dir().join(format!("rbs_clone_test_{}", std::process::id()));
@@ -702,7 +763,18 @@ mod tests {
         git(&["init", "-b", "main"], &src);
         std::fs::write(src.join("hello.txt"), "hi").unwrap();
         git(&["add", "."], &src);
-        git(&["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-m", "init"], &src);
+        git(
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-m",
+                "init",
+            ],
+            &src,
+        );
 
         // 正常 clone（指定分支）
         let dst = base.join("cloned");
@@ -738,7 +810,11 @@ mod tests {
     /// 此前的真 bug：完成分支没生成 project.yaml，克隆项目永远进不了项目树。
     #[test]
     fn clone_wizard_produces_discoverable_project() {
-        if std::process::Command::new("git").arg("--version").output().is_err() {
+        if std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
             return;
         }
         let tmp = std::env::temp_dir().join(format!("rbs_wiz_e2e_{}", std::process::id()));
@@ -764,7 +840,18 @@ mod tests {
         git(&["init", "-b", "main"], &src);
         std::fs::write(src.join("a.txt"), "a").unwrap();
         git(&["add", "."], &src);
-        git(&["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-m", "init"], &src);
+        git(
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-m",
+                "init",
+            ],
+            &src,
+        );
 
         // 向导的完整路径：克隆 → 完成分支调用的同一个 complete_clone
         let target = tmp.join("workspace").join("demo");
@@ -777,7 +864,7 @@ mod tests {
             "",
         );
         assert!(res.is_ok(), "{res:?}");
-        complete_clone("demo", target.to_str().unwrap()).expect("克隆后配置必须生成");
+        complete_clone(None, "demo", target.to_str().unwrap()).expect("克隆后配置必须生成");
 
         // 项目可被发现，起步配置 = 1 条 git 前置 + 版本/拉取两条步骤
         let found = crate::storage::files::discover_projects(&crate::config::projects_dir());
@@ -801,7 +888,11 @@ mod tests {
     #[test]
     fn run_pull_picks_up_new_commits_and_rejects_diverged() {
         // 本机无 git 时跳过
-        if std::process::Command::new("git").arg("--version").output().is_err() {
+        if std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
             return;
         }
         let base = std::env::temp_dir().join(format!("rbs_pull_test_{}", std::process::id()));
@@ -826,7 +917,18 @@ mod tests {
         git(&["init", "-b", "main"], &src);
         std::fs::write(src.join("a.txt"), "1").unwrap();
         git(&["add", "."], &src);
-        git(&["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-m", "init"], &src);
+        git(
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-m",
+                "init",
+            ],
+            &src,
+        );
 
         // clone 到工作目录
         let work = base.join("work");
@@ -843,7 +945,18 @@ mod tests {
         // 远端新提交 → pull 拿到（fast-forward，无需 merge 身份配置）
         std::fs::write(src.join("b.txt"), "2").unwrap();
         git(&["add", "."], &src);
-        git(&["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-m", "second"], &src);
+        git(
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-m",
+                "second",
+            ],
+            &src,
+        );
         let (line_tx, line_rx) = std::sync::mpsc::channel();
         let res = run_pull("git", &work, line_tx);
         assert!(res.is_ok(), "pull 应成功: {res:?}");
@@ -859,10 +972,32 @@ mod tests {
         // 本地有分叉提交时 --ff-only 必须拒绝（不产生意外 merge）
         std::fs::write(work.join("local.txt"), "x").unwrap();
         git(&["add", "."], &work);
-        git(&["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-m", "local"], &work);
+        git(
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-m",
+                "local",
+            ],
+            &work,
+        );
         std::fs::write(src.join("c.txt"), "3").unwrap();
         git(&["add", "."], &src);
-        git(&["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-m", "upstream"], &src);
+        git(
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-m",
+                "upstream",
+            ],
+            &src,
+        );
         let res = run_pull("git", &work, std::sync::mpsc::channel().0);
         assert!(res.is_err(), "分叉时 --ff-only 应失败: {res:?}");
 

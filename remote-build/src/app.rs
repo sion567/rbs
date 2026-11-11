@@ -34,10 +34,9 @@ impl RemoteBuildApp {
         // 校验失败直接把整个进程带崩、未保存的编辑全丢。这里改为记日志 + 本帧跳过：
         // 下一帧尺寸正常即恢复（上游 eframe 0.37 没有暴露更细的钩子）。
         if let Some(rs) = &cc.wgpu_render_state {
-            rs.device
-                .on_uncaptured_error(std::sync::Arc::new(|err| {
-                    log::error!("wgpu uncaptured error（已忽略本帧，窗口继续运行）: {err}");
-                }));
+            rs.device.on_uncaptured_error(std::sync::Arc::new(|err| {
+                log::error!("wgpu uncaptured error（已忽略本帧，窗口继续运行）: {err}");
+            }));
         }
         // 排查开关：RBS_NO_CJK=1 跳过 CJK 字体加载（隔离字体/渲染层问题用）
         if std::env::var("RBS_NO_CJK").unwrap_or_default() != "1" {
@@ -48,7 +47,10 @@ impl RemoteBuildApp {
             Self { runtime, page }
         } else {
             let main = MainState::new(runtime.clone());
-            Self { runtime, page: Page::Main(main) }
+            Self {
+                runtime,
+                page: Page::Main(main),
+            }
         }
     }
 }
@@ -132,7 +134,7 @@ pub(crate) fn load_cjk_font(ctx: &egui::Context) {
     // 会直接段错误（升级实测），TTC 仅作最后兜底
     const CANDIDATES: &[&str] = &[
         "C:/Windows/Fonts/msyh.ttf",
-        "C:/Windows/Fonts/Deng.ttf",   // 等线，Win10/11 标配
+        "C:/Windows/Fonts/Deng.ttf", // 等线，Win10/11 标配
         "C:/Windows/Fonts/simhei.ttf",
         "C:/Windows/Fonts/DENG.TTF",
         "C:/Windows/Fonts/msyh.ttc",
@@ -141,7 +143,10 @@ pub(crate) fn load_cjk_font(ctx: &egui::Context) {
     for path in CANDIDATES {
         if let Ok(bytes) = std::fs::read(path) {
             let mut fonts = egui::FontDefinitions::default();
-            fonts.font_data.insert("cjk".to_string(), Arc::new(egui::FontData::from_owned(bytes)));
+            fonts.font_data.insert(
+                "cjk".to_string(),
+                Arc::new(egui::FontData::from_owned(bytes)),
+            );
             fonts
                 .families
                 .entry(egui::FontFamily::Proportional)
@@ -195,6 +200,9 @@ pub struct MainState {
     /// 项目树右键菜单：改名目标 + 输入缓冲
     pub tree_rename: Option<ui::project_tree::TreeRenameTarget>,
     pub tree_rename_buf: String,
+    /// 项目树右键菜单：归类操作目标（工程移入项目 / 分类重命名）+ 输入缓冲
+    pub tree_move: Option<ui::project_tree::TreeMoveTarget>,
+    pub tree_move_buf: String,
     pub target_editor: ui::targets::TargetEditorState,
     /// 设置窗口当前分区 tab
     pub settings_tab: ui::settings::SettingsTab,
@@ -232,11 +240,19 @@ pub struct MainState {
     pub run_step_retries: Vec<u32>,
     /// 上次组运行失败位置（「↪ 从失败处继续」的依据；组成功后清除）
     pub last_group_failure: Option<GroupResume>,
+    /// 上次跨工程项目运行失败位置（分类节点「↪ 从失败处继续」的依据）
+    pub last_category_failure: Option<CategoryResume>,
     /// 组运行的通知标签（JobEnd toast 显示「项目/组·名」而非最后一个流程名）
     pub run_group_label: Option<String>,
     /// 组运行实时进度（树上分组头显示 ▶ N/总数）：(组名, 当前第几个 1 起, 总数)。
     /// GroupJobBegin 推进 / 流程级 JobEnd 清除；单流程运行不设置
     pub group_run_progress: Option<(String, usize, usize)>,
+    /// 跨工程项目运行实时进度（树上分类头显示 ▶ N/总数）：(归类链, 当前第几个, 总数)。
+    /// 与 group_run_progress 互斥：run_category 有值 = 当前运行是项目级
+    pub category_run_progress: Option<(String, usize, usize)>,
+    /// 进行中的跨工程项目运行的归类链（None = 不是项目级运行）。
+    /// GroupJobBegin/End 靠它路由进度与续跑登记
+    pub run_category: Option<String>,
     /// 未保存修改检测基线：(项目名, 流程名, 保存/重选时的指纹)。
     /// 每帧对比当前指纹：换了选中项静默重设基线；同一项指纹变了 = 有未保存修改。
     /// reload / 保存成功都会重设基线
@@ -293,6 +309,8 @@ pub struct ConfirmGate {
     pub pending: Option<(usize, Option<usize>)>,
     /// 组运行的待启动参数（与 pending 互斥；Some = 组确认门）
     pub pending_group: Option<GroupPending>,
+    /// 跨工程项目运行的待启动参数（与 pending/pending_group 互斥）
+    pub pending_category: Option<CategoryPending>,
 }
 
 /// 组确认门通过后要启动的组运行
@@ -303,11 +321,29 @@ pub struct GroupPending {
     pub from_job: Option<usize>,
 }
 
+/// 跨工程项目运行（项目归类层一键串行）：确认门通过后要启动的参数
+pub struct CategoryPending {
+    /// 归类链（"a/b" 形式）
+    pub chain: String,
+    /// 同名分组过滤（Some = 只跑各工程里该分组的流程；None = 全部流程）
+    pub group: Option<String>,
+    /// 从第几个流程续跑（展平后的全局下标；None = 从头）
+    pub from_job: Option<usize>,
+}
+
 /// 上次组运行失败的位置（GUI 会话内记忆，供「↪ 从失败处继续」）
 #[derive(Clone)]
 pub struct GroupResume {
     pub project: String,
     pub group: String,
+    pub job: String,
+}
+
+/// 上次跨工程项目运行失败的位置（同上，登记在分类节点上）
+#[derive(Clone)]
+pub struct CategoryResume {
+    pub chain: String,
+    pub project: String,
     pub job: String,
 }
 
@@ -367,6 +403,8 @@ impl MainState {
             tree_delete: None,
             tree_rename: None,
             tree_rename_buf: String::new(),
+            tree_move: None,
+            tree_move_buf: String::new(),
             target_editor: Default::default(),
             settings_tab: Default::default(),
             show_help: false,
@@ -386,8 +424,11 @@ impl MainState {
             run_step_durations: Vec::new(),
             run_step_retries: Vec::new(),
             last_group_failure: None,
+            last_category_failure: None,
             run_group_label: None,
             group_run_progress: None,
+            category_run_progress: None,
+            run_category: None,
         };
         s.reload();
         // 历史保留期清理（后台，log_retention_days 天前的 runs 删除；失败只提示不阻塞启动）
@@ -417,6 +458,8 @@ impl MainState {
             self.run_job = None;
             self.stop_requested = None;
             self.group_run_progress = None;
+            self.category_run_progress = None;
+            self.run_category = None;
             self.run_steps.clear();
             self.run_step_wait.clear();
         }
@@ -445,7 +488,12 @@ impl MainState {
         self.validation = self
             .projects
             .iter()
-            .map(|e| (e.project.name.clone(), crate::config::validate_project(&e.project)))
+            .map(|e| {
+                (
+                    e.project.name.clone(),
+                    crate::config::validate_project(&e.project),
+                )
+            })
             .collect();
         // 当前分支随 reload 刷新：clone / 更新代码完成都会走 reload；
         // 与 validation 同理，不在悬停时每帧读 .git/HEAD
@@ -468,7 +516,10 @@ impl MainState {
             self.selected_project = None;
             self.selected_job = None;
         } else {
-            let pi = self.selected_project.unwrap_or(0).min(self.projects.len() - 1);
+            let pi = self
+                .selected_project
+                .unwrap_or(0)
+                .min(self.projects.len() - 1);
             let ji = self
                 .selected_job
                 .unwrap_or(0)
@@ -480,7 +531,11 @@ impl MainState {
             self.status_msg = Some(format!(
                 "已加载 {} 个项目{}",
                 self.projects.len(),
-                if had_stale_run { "（已复位上次运行状态）" } else { "" }
+                if had_stale_run {
+                    "（已复位上次运行状态）"
+                } else {
+                    ""
+                }
             ));
         } else {
             self.status_msg = Some(format!(
@@ -757,7 +812,9 @@ impl MainState {
         let (Some(pi), Some(ji)) = (self.selected_project, self.selected_job) else {
             return;
         };
-        let Some(entry) = self.projects.get(pi) else { return };
+        let Some(entry) = self.projects.get(pi) else {
+            return;
+        };
         let Some(je) = entry.jobs.get(ji) else { return };
         let dir = entry.project.local_path.trim().to_string();
         if dir.is_empty() || !std::path::Path::new(&dir).is_dir() {
@@ -845,9 +902,10 @@ impl MainState {
             w.last_poll = std::time::Instant::now();
         }
         // 目标流程可能已被删除 → 顺势停止监听
-        let target_exists = self.projects.iter().any(|p| {
-            p.project.name == w.project && p.jobs.iter().any(|j| j.job.name == w.job)
-        });
+        let target_exists = self
+            .projects
+            .iter()
+            .any(|p| p.project.name == w.project && p.jobs.iter().any(|j| j.job.name == w.job));
         if !target_exists {
             self.stop_watch();
             return;
@@ -871,7 +929,11 @@ impl MainState {
             self.stop_watch();
             return;
         };
-        let Some(ji) = self.projects[pi].jobs.iter().position(|j| j.job.name == w.job) else {
+        let Some(ji) = self.projects[pi]
+            .jobs
+            .iter()
+            .position(|j| j.job.name == w.job)
+        else {
             self.stop_watch();
             return;
         };
@@ -893,7 +955,9 @@ impl MainState {
             self.status_msg = Some("⚠ 有流程运行中，先停止再更新代码".to_string());
             return;
         }
-        let Some(entry) = self.projects.get(pi) else { return };
+        let Some(entry) = self.projects.get(pi) else {
+            return;
+        };
         let name = entry.project.name.clone();
         let dir = entry.project.local_path.trim().to_string();
         let dir_path = std::path::PathBuf::from(&dir);
@@ -906,8 +970,9 @@ impl MainState {
             return;
         }
         if !dir_path.join(".git").exists() {
-            self.status_msg =
-                Some(format!("⚠ {dir} 不是 Git 仓库（本地目录模式），无法自动更新"));
+            self.status_msg = Some(format!(
+                "⚠ {dir} 不是 Git 仓库（本地目录模式），无法自动更新"
+            ));
             return;
         }
         // git 优先用 tools.yaml 里探测到的，否则回退 PATH（与 clone 同一策略）
@@ -938,7 +1003,8 @@ impl MainState {
     fn drain_pull(&mut self) {
         if let Some(rx) = &self.pull_lines {
             while let Ok(line) = rx.try_recv() {
-                self.console.push_line(line, crate::ui::console::Role::Stdout);
+                self.console
+                    .push_line(line, crate::ui::console::Role::Stdout);
             }
         }
         let mut finished = None;
@@ -1018,11 +1084,20 @@ impl MainState {
         for ev in &events {
             // 步骤状态机（run / run_steps / console 为不同字段，可拆分借用）
             match ev {
-                LogEvent::StepStart { step_index, skipped, .. } => {
+                LogEvent::StepStart {
+                    step_index,
+                    skipped,
+                    ..
+                } => {
                     if let Some(st) = self.run_steps.get_mut(*step_index) {
                         *st = if *skipped {
                             StepVisualState::Skipped
-                        } else if self.run_step_wait.get(*step_index).copied().unwrap_or(false) {
+                        } else if self
+                            .run_step_wait
+                            .get(*step_index)
+                            .copied()
+                            .unwrap_or(false)
+                        {
                             // wait 类型步骤整个执行期都在轮询等待，直接进入黄色等待态
                             StepVisualState::Waiting
                         } else {
@@ -1030,7 +1105,11 @@ impl MainState {
                         };
                     }
                 }
-                LogEvent::StepEnd { step_index, exit_code, duration_ms } => {
+                LogEvent::StepEnd {
+                    step_index,
+                    exit_code,
+                    duration_ms,
+                } => {
                     // 耗时时间线数据（handlers 的 step_index 超出主流程长度 → 忽略）
                     if let Some(d) = self.run_step_durations.get_mut(*step_index) {
                         *d = Some(*duration_ms);
@@ -1053,7 +1132,12 @@ impl MainState {
                         *st = StepVisualState::Waiting;
                     }
                 }
-                LogEvent::JobEnd { status, total_duration_ms, run_id, .. } => {
+                LogEvent::JobEnd {
+                    status,
+                    total_duration_ms,
+                    run_id,
+                    ..
+                } => {
                     run.finished = Some(status.clone());
                     // 引擎正常收尾（含响应 ⏹ 停止后的取消终态）：退出"停止中"状态
                     self.stop_requested = None;
@@ -1072,8 +1156,10 @@ impl MainState {
                     }
                     // 状态栏同步落终态：否则单流程结束后右上角一直残留「运行中: xxx」
                     // （组运行随后由 GroupJobBegin/GroupJobEnd 覆盖，监听模式见下方分支）
-                    self.status_msg =
-                        Some(format!("流程结束: {}", crate::ui::console::job_label_public(status)));
+                    self.status_msg = Some(format!(
+                        "流程结束: {}",
+                        crate::ui::console::job_label_public(status)
+                    ));
                     // 取消/超时：被中断的步骤等不到 StepEnd，兜底落终态，避免永远闪蓝
                     if matches!(status, JobStatus::Cancelled | JobStatus::Timeout) {
                         mark_interrupted_cancelled(&mut self.run_steps);
@@ -1082,11 +1168,7 @@ impl MainState {
                     let label = self
                         .run_group_label
                         .take()
-                        .or_else(|| {
-                            self.run_job
-                                .as_ref()
-                                .map(|(p, j)| format!("{p}/{j}"))
-                        })
+                        .or_else(|| self.run_job.as_ref().map(|(p, j)| format!("{p}/{j}")))
                         .unwrap_or_default();
                     // 桌面通知（toast）：最小化在干别的也能看到结果；watch 自动重跑尤其需要。
                     if self.global.desktop_notify {
@@ -1106,10 +1188,13 @@ impl MainState {
                     // 组运行全部通过：清除续跑指针
                     if status.ok() {
                         self.last_group_failure = None;
+                        self.last_category_failure = None;
                     }
-                    // 树上分组头的运行进度随任何流程级 JobEnd 清除
+                    // 树上分组/分类头的运行进度随任何流程级 JobEnd 清除
                     //（组运行自己的聚合 JobEnd 也走这里；单流程运行本就不设它）
                     self.group_run_progress = None;
+                    self.category_run_progress = None;
+                    self.run_category = None;
                     // 监听模式：结束即进入等待文件变化的待命态
                     if let Some(w) = &self.watch {
                         if self
@@ -1123,15 +1208,32 @@ impl MainState {
                         }
                     }
                 }
-                LogEvent::GroupJobBegin { project, job, index, total, group, .. } => {
+                LogEvent::GroupJobBegin {
+                    project,
+                    job,
+                    index,
+                    total,
+                    group,
+                    ..
+                } => {
                     // 组运行逐流程推进：自动切到正在运行的流程并复位步骤可视化，
                     // 步骤光圈 / 耗时条 / 重试标注全部对准当前流程
-                    // 树上分组头的实时进度（index 0 起，展示 +1）
-                    self.group_run_progress =
-                        Some((group.clone(), index + 1, *total));
-                    if let Some(pi) = self.projects.iter().position(|p| p.project.name == *project) {
-                        if let Some(ji) =
-                            self.projects[pi].jobs.iter().position(|j| j.job.name == *job)
+                    // 树上分组/分类头的实时进度（index 0 起，展示 +1）；
+                    // 项目级运行（run_category 有值）进度挂分类头，键 = 归类链
+                    if let Some(chain) = self.run_category.clone() {
+                        self.category_run_progress = Some((chain, index + 1, *total));
+                    } else {
+                        self.group_run_progress = Some((group.clone(), index + 1, *total));
+                    }
+                    if let Some(pi) = self
+                        .projects
+                        .iter()
+                        .position(|p| p.project.name == *project)
+                    {
+                        if let Some(ji) = self.projects[pi]
+                            .jobs
+                            .iter()
+                            .position(|j| j.job.name == *job)
                         {
                             self.selected_project = Some(pi);
                             self.selected_job = Some(ji);
@@ -1151,14 +1253,31 @@ impl MainState {
                         index + 1
                     ));
                 }
-                LogEvent::GroupJobEnd { project, group, job, status, index, total, .. } => {
-                    // 未通过（含取消）→ 登记续跑位置；整个组结束时若成功会清除
+                LogEvent::GroupJobEnd {
+                    project,
+                    group,
+                    job,
+                    status,
+                    index,
+                    total,
+                    ..
+                } => {
+                    // 未通过（含取消）→ 登记续跑位置；整个组/项目运行结束时若成功会清除。
+                    // 项目级运行登记到分类（chain+工程+流程），组运行登记到分组
                     if !status.ok() {
-                        self.last_group_failure = Some(GroupResume {
-                            project: project.clone(),
-                            group: group.clone(),
-                            job: job.clone(),
-                        });
+                        if let Some(chain) = self.run_category.clone() {
+                            self.last_category_failure = Some(CategoryResume {
+                                chain,
+                                project: project.clone(),
+                                job: job.clone(),
+                            });
+                        } else {
+                            self.last_group_failure = Some(GroupResume {
+                                project: project.clone(),
+                                group: group.clone(),
+                                job: job.clone(),
+                            });
+                        }
                     }
                     self.status_msg = Some(format!(
                         "组运行[{group}] {}/{total} {}: {}",
@@ -1187,7 +1306,9 @@ impl MainState {
         let (Some(pi), Some(ji)) = (self.selected_project, self.selected_job) else {
             return;
         };
-        let Some(entry) = self.projects.get(pi) else { return };
+        let Some(entry) = self.projects.get(pi) else {
+            return;
+        };
         let Some(je) = entry.jobs.get(ji) else { return };
         let project = entry.project.clone();
         let job = je.job.clone();
@@ -1209,11 +1330,19 @@ impl MainState {
         use crate::ui::console::Role;
         let workspace = std::path::PathBuf::from(&project.local_path);
         self.console.push_line(
-            format!("==== 预览（干跑，不执行）: {}/{} ====", project.name, job.name),
+            format!(
+                "==== 预览（干跑，不执行）: {}/{} ====",
+                project.name, job.name
+            ),
             Role::Info,
         );
         // 作业级信息：确认门 / 前置检查
-        if let Some(c) = job.confirm.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(c) = job
+            .confirm
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
             self.console
                 .push_line(format!("🔒 确认门: 运行前需输入「{c}」"), Role::Info);
         }
@@ -1287,7 +1416,9 @@ impl MainState {
                 }
                 if let Some((tname, tcmd)) = &p.tool {
                     self.console.push_line(
-                        format!("    🔧 工具 {tname} → {tcmd}（其目录前置 PATH，裸名命令用这个版本）"),
+                        format!(
+                            "    🔧 工具 {tname} → {tcmd}（其目录前置 PATH，裸名命令用这个版本）"
+                        ),
                         Role::Stdout,
                     );
                 }
@@ -1295,7 +1426,11 @@ impl MainState {
                     self.console.push_line(
                         format!(
                             "    ↑ {l} -> {r}{}",
-                            if *exists { "" } else { "（本地缺失 ⚠）" }
+                            if *exists {
+                                ""
+                            } else {
+                                "（本地缺失 ⚠）"
+                            }
                         ),
                         Role::Stdout,
                     );
@@ -1309,8 +1444,10 @@ impl MainState {
                         .push_line(format!("    ⇩ 捕获输出 {k} ← /{pat}/"), Role::Stdout);
                 }
                 if !p.notify.is_empty() {
-                    self.console
-                        .push_line(format!("    ⇮ notify: {}", p.notify.join(",")), Role::Stdout);
+                    self.console.push_line(
+                        format!("    ⇮ notify: {}", p.notify.join(",")),
+                        Role::Stdout,
+                    );
                 }
                 for (env_name, cred_key) in &p.secret_env {
                     self.console.push_line(
@@ -1370,6 +1507,7 @@ impl MainState {
                     plan_lines: Vec::new(),
                     pending: Some((from_step, only_step)),
                     pending_group: None,
+                    pending_category: None,
                 };
             }
             return;
@@ -1380,12 +1518,18 @@ impl MainState {
     /// 组运行入口（第五批）：组内流程按树中顺序串行、失败即停。
     /// 确认门统一收口：组内（续跑则剩余）流程的确认词全部列出，一次输入包含全部才放行。
     pub(crate) fn start_group_run(&mut self, pi: usize, group_name: &str, from_job: Option<usize>) {
-        let Some(entry) = self.projects.get(pi) else { return };
+        let Some(entry) = self.projects.get(pi) else {
+            return;
+        };
         let jobs: Vec<crate::group::GroupJob> = entry
             .jobs
             .iter()
             .filter(|je| je.job.group.as_deref() == Some(group_name))
-            .map(|je| crate::group::GroupJob { name: je.job.name.clone(), job: je.job.clone() })
+            .map(|je| crate::group::GroupJob {
+                project: entry.project.clone(),
+                name: je.job.name.clone(),
+                job: je.job.clone(),
+            })
             .collect();
         if jobs.is_empty() {
             self.status_msg = Some(format!("分组「{group_name}」没有流程"));
@@ -1397,7 +1541,9 @@ impl MainState {
         }
         let from = from_job.unwrap_or(0).min(jobs.len());
         if from >= jobs.len() {
-            self.status_msg = Some(format!("分组「{group_name}」没有可执行的流程（续跑位置超出范围）"));
+            self.status_msg = Some(format!(
+                "分组「{group_name}」没有可执行的流程（续跑位置超出范围）"
+            ));
             return;
         }
         // 确认门已在等待输入（单流程或另一组）→ 不叠加，先处理当前的
@@ -1408,8 +1554,12 @@ impl MainState {
         // 确认词收集（续跑只看剩余流程；按出现顺序去重）
         let mut distinct: Vec<String> = Vec::new();
         for gj in &jobs[from..] {
-            if let Some(w) =
-                gj.job.confirm.as_deref().map(str::trim).filter(|s| !s.is_empty())
+            if let Some(w) = gj
+                .job
+                .confirm
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
             {
                 if !distinct.iter().any(|x| x == w) {
                     distinct.push(w.to_string());
@@ -1418,13 +1568,8 @@ impl MainState {
         }
         if !distinct.is_empty() {
             let project = entry.project.clone();
-            let plan_lines = crate::group::plan_lines(
-                &project,
-                &jobs[from..],
-                &self.tools,
-                &crate::config::effective_targets(&project),
-                self.global.default_timeout,
-            );
+            let plan_lines =
+                crate::group::plan_lines(&jobs[from..], &self.tools, self.global.default_timeout);
             self.confirm_gate = ConfirmGate {
                 open: true,
                 input: String::new(),
@@ -1433,7 +1578,12 @@ impl MainState {
                 job_label: format!("{}/组·{}", project.name, group_name),
                 plan_lines,
                 pending: None,
-                pending_group: Some(GroupPending { pi, group: group_name.to_string(), from_job }),
+                pending_group: Some(GroupPending {
+                    pi,
+                    group: group_name.to_string(),
+                    from_job,
+                }),
+                pending_category: None,
             };
             return;
         }
@@ -1443,7 +1593,10 @@ impl MainState {
     /// 确认门通过：按 pending 参数真正启动
     fn confirm_gate_pass(&mut self) {
         let pass = if self.confirm_gate.pending_group.is_some() {
-            crate::group::confirm_words_match(&self.confirm_gate.input, &self.confirm_gate.expected_words)
+            crate::group::confirm_words_match(
+                &self.confirm_gate.input,
+                &self.confirm_gate.expected_words,
+            )
         } else {
             self.confirm_gate.input.trim() == self.confirm_gate.expected
         };
@@ -1457,6 +1610,10 @@ impl MainState {
         self.confirm_gate.open = false;
         if let Some(g) = self.confirm_gate.pending_group.take() {
             self.launch_group_run(g.pi, &g.group, g.from_job);
+            return;
+        }
+        if let Some(c) = self.confirm_gate.pending_category.take() {
+            self.launch_category_run(&c.chain, c.group.as_deref(), c.from_job);
             return;
         }
         if let Some((from, only)) = self.confirm_gate.pending.take() {
@@ -1550,7 +1707,11 @@ impl MainState {
         let run_id_for_end = run_id.clone();
         #[cfg(feature = "sqlite")]
         let save_history = self.global.save_history;
-        let trigger: &'static str = if self.run_trigger_watch { "watch" } else { "manual" };
+        let trigger: &'static str = if self.run_trigger_watch {
+            "watch"
+        } else {
+            "manual"
+        };
         #[cfg(not(feature = "sqlite"))]
         let _ = trigger;
         // 监听标记复位与 feature 无关，必须无条件执行
@@ -1575,14 +1736,16 @@ impl MainState {
         let started = Instant::now();
         let inner = {
             let tok_tx = tok_tx.clone();
-            self.runtime.spawn(async move { engine.run_job(input, cancel_rx, tok_tx).await })
+            self.runtime
+                .spawn(async move { engine.run_job(input, cancel_rx, tok_tx).await })
         };
         // 强制结束兜底：先取 abort 句柄再把它移进包装任务（JoinHandle 不可克隆）
         let engine_abort = inner.abort_handle();
         let join = self.runtime.spawn(async move {
-            let status = inner
-                .await
-                .unwrap_or(JobStatus::Failed { step_index: 0, reason: "引擎任务异常".to_string() });
+            let status = inner.await.unwrap_or(JobStatus::Failed {
+                step_index: 0,
+                reason: "引擎任务异常".to_string(),
+            });
             let _ = tok_tx
                 .send(LogEvent::JobEnd {
                     run_id: run_id_for_end,
@@ -1605,12 +1768,8 @@ impl MainState {
         self.runtime.spawn(async move {
             #[cfg(feature = "sqlite")]
             let recorder = if save_history {
-                crate::storage::sqlite::RunRecorder::start(
-                    &history_meta,
-                    &job_snapshot,
-                    steps_len,
-                )
-                .await
+                crate::storage::sqlite::RunRecorder::start(&history_meta, &job_snapshot, steps_len)
+                    .await
             } else {
                 None
             };
@@ -1668,6 +1827,8 @@ impl MainState {
         self.status_msg = Some(format!("运行中: {label}"));
         self.stop_requested = None;
         self.group_run_progress = None;
+        self.category_run_progress = None;
+        self.run_category = None;
         self.run = Some(RunHandle {
             cancel_tx,
             engine_abort: Some(engine_abort),
@@ -1683,9 +1844,7 @@ impl MainState {
     /// 整树终止；SSH 连接随 future 丢弃断开；组运行未开始的流程不再启动。
     /// 卡在阻塞段里的任务本身无法被杀（Rust 限制），会在后台做完后被丢弃。
     fn force_finish_run(&mut self) {
-        let had_group = self
-            .run_group_label
-            .is_some();
+        let had_group = self.run_group_label.is_some();
         if let Some(run) = &self.run {
             let _ = run.cancel_tx.send(());
             if let Some(abort) = &run.engine_abort {
@@ -1697,11 +1856,12 @@ impl MainState {
         self.run_job = None;
         self.run_group_label = None;
         self.group_run_progress = None;
+        self.category_run_progress = None;
+        self.run_category = None;
         self.stop_requested = None;
         mark_interrupted_cancelled(&mut self.run_steps);
         self.console.push_line(
-            "==== ⛔ 已强制结束本次任务（引擎任务被中止；未开始的组流程不再执行）===="
-                .to_string(),
+            "==== ⛔ 已强制结束本次任务（引擎任务被中止；未开始的组流程不再执行）====".to_string(),
             crate::ui::console::Role::Error,
         );
         self.status_msg = Some(if had_group {
@@ -1719,12 +1879,18 @@ impl MainState {
             self.status_msg = Some("⚠ 正在更新代码，请稍候再运行".to_string());
             return;
         }
-        let Some(entry) = self.projects.get(pi) else { return };
+        let Some(entry) = self.projects.get(pi) else {
+            return;
+        };
         let jobs: Vec<crate::group::GroupJob> = entry
             .jobs
             .iter()
             .filter(|je| je.job.group.as_deref() == Some(group_name))
-            .map(|je| crate::group::GroupJob { name: je.job.name.clone(), job: je.job.clone() })
+            .map(|je| crate::group::GroupJob {
+                project: entry.project.clone(),
+                name: je.job.name.clone(),
+                job: je.job.clone(),
+            })
             .collect();
         if jobs.is_empty() {
             self.status_msg = Some(format!("分组「{group_name}」没有流程"));
@@ -1782,7 +1948,6 @@ impl MainState {
         }
 
         let from = from_job.unwrap_or(0);
-        let effective = crate::config::effective_targets(&project);
         // 组运行唯一标识：成员流程 run_id = {group_id}-{序号}，历史同前缀 = 同一次组发布
         let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S%3f");
         let group_id = format!("{}-grp-{}", project.name, stamp);
@@ -1791,17 +1956,16 @@ impl MainState {
 
         let run_count = jobs.len() - from.min(jobs.len());
         let spec = crate::group::GroupSpec {
-            project: project.clone(),
             group: group_name.to_string(),
             jobs,
             tools: self.tools.clone(),
-            all_targets: effective,
             default_step_timeout: self.global.default_timeout,
             group_id: group_id.clone(),
             cancel_tx: Some(cancel_tx.clone()),
             from_job: from,
             save_history: self.global.save_history,
-            log_dir: Some(crate::config::logs_dir().join(&project.name)),
+            // 日志根目录：循环内按各流程所属工程分目录（单工程 = 原路径不变）
+            log_dir: Some(crate::config::logs_dir()),
             trigger: "group",
         };
 
@@ -1814,13 +1978,19 @@ impl MainState {
         self.run_group_label = Some(format!("{}/{}", project.name, group_label));
         self.group_run_progress = None; // 首个 GroupJobBegin 会设置实时进度
         self.last_group_failure = None; // 新组运行重置续跑指针（失败会重新登记）
+        self.category_run_progress = None;
+        self.run_category = None; // 组运行与项目级运行互斥，路由复位到分组字段
         self.console.push_line(
             format!(
                 "==== 启动组运行 {}/{}（{} 个流程，串行·失败即停{}）====",
                 project.name,
                 group_label,
                 run_count,
-                if from > 0 { format!("，从第 {} 个流程继续", from + 1) } else { String::new() }
+                if from > 0 {
+                    format!("，从第 {} 个流程继续", from + 1)
+                } else {
+                    String::new()
+                }
             ),
             crate::ui::console::Role::Info,
         );
@@ -1849,8 +2019,212 @@ impl MainState {
             join,
             finished: None,
         });
-        self.status_msg =
-            Some(format!("组运行中: {}/{}（{} 个流程）", project.name, group_label, run_count));
+        self.status_msg = Some(format!(
+            "组运行中: {}/{}（{} 个流程）",
+            project.name, group_label, run_count
+        ));
+    }
+
+    /// 跨工程项目运行入口：右键分类节点 → 把成员工程的流程展平成一条串行流水线。
+    /// group = Some(分组名) 只跑各工程里该分组的流程（同名分组，如所有工程的「发布」）；
+    /// None 跑全部流程。顺序 = 成员工程树中顺序 × 各自 jobs 列表顺序。
+    /// 任一流程失败即停（金丝雀语义），每个流程用自己工程的目标/变量/凭据/锁。
+    pub(crate) fn start_category_run(
+        &mut self,
+        chain: &str,
+        group: Option<&str>,
+        from_job: Option<usize>,
+    ) {
+        let jobs = crate::ui::project_tree::build_category_pipeline(&self.projects, chain, group);
+        let label = match group {
+            Some(g) => format!("项目·{chain}/组·{g}"),
+            None => format!("项目·{chain}"),
+        };
+        if jobs.is_empty() {
+            self.status_msg = Some(match group {
+                Some(g) => format!("项目「{chain}」下没有工程含分组「{g}」"),
+                None => format!("项目「{chain}」下没有可运行的流程"),
+            });
+            return;
+        }
+        if self.pull_done.is_some() {
+            self.status_msg = Some("⚠ 正在更新代码，请稍候再运行".to_string());
+            return;
+        }
+        let from = from_job.unwrap_or(0).min(jobs.len());
+        if from >= jobs.len() {
+            self.status_msg = Some(format!("「{label}」没有可执行的流程（续跑位置超出范围）"));
+            return;
+        }
+        if self.confirm_gate.open {
+            self.status_msg = Some("⚠ 有确认门待处理，请先完成或取消".to_string());
+            return;
+        }
+        // 确认词收集：与组运行同规则（剩余流程、按出现顺序去重）
+        let mut distinct: Vec<String> = Vec::new();
+        for gj in &jobs[from..] {
+            if let Some(w) = gj
+                .job
+                .confirm
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                if !distinct.iter().any(|x| x == w) {
+                    distinct.push(w.to_string());
+                }
+            }
+        }
+        if !distinct.is_empty() {
+            let plan_lines =
+                crate::group::plan_lines(&jobs[from..], &self.tools, self.global.default_timeout);
+            self.confirm_gate = ConfirmGate {
+                open: true,
+                input: String::new(),
+                expected: distinct.join(" "),
+                expected_words: distinct,
+                job_label: label,
+                plan_lines,
+                pending: None,
+                pending_group: None,
+                pending_category: Some(CategoryPending {
+                    chain: chain.to_string(),
+                    group: group.map(str::to_string),
+                    from_job,
+                }),
+            };
+            return;
+        }
+        self.launch_category_run(chain, group, from_job);
+    }
+
+    /// 确认门通过后真正启动跨工程项目运行
+    fn launch_category_run(&mut self, chain: &str, group: Option<&str>, from_job: Option<usize>) {
+        if self.pull_done.is_some() {
+            self.status_msg = Some("⚠ 正在更新代码，请稍候再运行".to_string());
+            return;
+        }
+        let jobs = crate::ui::project_tree::build_category_pipeline(&self.projects, chain, group);
+        if jobs.is_empty() {
+            self.status_msg = Some(format!("项目「{chain}」下没有可运行的流程"));
+            return;
+        }
+        let label = match group {
+            Some(g) => format!("项目·{chain}/组·{g}"),
+            None => format!("项目·{chain}"),
+        };
+        // 运行互斥：项目级运行横跨多个工程的锁，不做同项目接管（比组运行更保守）——
+        // 有任何运行在跑都先阻止，避免半条流水线被顶掉的歧义
+        if self.run_active() {
+            self.status_msg = Some("⚠ 有流程运行中，项目级运行请先停止当前运行".to_string());
+            return;
+        }
+
+        // 运行前自动保存：参与成员工程的 project.yaml + 流程 yaml 各存一份
+        {
+            let mut failure: Option<String> = None;
+            let mut saved_projects: Vec<&str> = Vec::new();
+            for gj in &jobs {
+                let Some(entry) = self
+                    .projects
+                    .iter()
+                    .find(|e| e.project.name == gj.project.name)
+                else {
+                    continue;
+                };
+                if !saved_projects.contains(&entry.project.name.as_str()) {
+                    if let Err(e) =
+                        files::save_yaml(&entry.dir.join("project.yaml"), &entry.project)
+                    {
+                        failure = Some(format!("{} project.yaml: {e}", entry.project.name));
+                    }
+                    saved_projects.push(&entry.project.name);
+                }
+                if let Some(je) = entry.jobs.iter().find(|j| j.job.name == gj.name) {
+                    if let Err(e) = files::save_yaml(&je.path, &je.job) {
+                        failure = Some(format!("{}/{}: {e}", entry.project.name, gj.name));
+                    }
+                }
+            }
+            match failure {
+                None => self.console.push_line(
+                    "（运行前已自动保存各成员工程的 project.yaml 与流程）",
+                    crate::ui::console::Role::Info,
+                ),
+                Some(e) => self.console.push_line(
+                    format!("⚠ 运行前自动保存失败: {e}（本次按内存内容执行）"),
+                    crate::ui::console::Role::Info,
+                ),
+            }
+        }
+
+        let from = from_job.unwrap_or(0);
+        // 唯一标识：{链净化}-cat-时间戳；成员流程 run_id = {group_id}-{序号}
+        let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S%3f");
+        let group_id = format!("{}-cat-{}", crate::config::sanitize_filename(chain), stamp);
+        let (cancel_tx, _cancel_keepalive) = broadcast::channel(4);
+        let (std_tx, std_rx) = std_mpsc::channel();
+
+        let run_count = jobs.len() - from.min(jobs.len());
+        let spec = crate::group::GroupSpec {
+            group: label.clone(),
+            jobs,
+            tools: self.tools.clone(),
+            default_step_timeout: self.global.default_timeout,
+            group_id: group_id.clone(),
+            cancel_tx: Some(cancel_tx.clone()),
+            from_job: from,
+            save_history: self.global.save_history,
+            log_dir: Some(crate::config::logs_dir()),
+            trigger: "category",
+        };
+
+        self.run_steps = Vec::new();
+        self.run_step_wait = Vec::new();
+        self.run_step_durations = Vec::new();
+        self.run_step_retries = Vec::new();
+        self.run_job = None; // GroupJobBegin 逐流程设置（各流程工程不同）
+        self.run_group_label = Some(label.clone());
+        self.run_category = Some(chain.to_string()); // 事件路由：进度/续跑登记走 category 字段
+        self.category_run_progress = None;
+        self.last_category_failure = None;
+        self.console.push_line(
+            format!(
+                "==== 启动项目运行 {label}（{} 个流程，串行·失败即停{}）====",
+                run_count,
+                if from > 0 {
+                    format!("，从第 {} 个流程继续", from + 1)
+                } else {
+                    String::new()
+                }
+            ),
+            crate::ui::console::Role::Info,
+        );
+
+        let join = {
+            use crate::group::GroupSink as _;
+            let sink = UiSink { tx: std_tx };
+            let group_id = group_id.clone();
+            self.runtime.spawn(async move {
+                let outcome = crate::group::run_group_serial(spec, &sink).await;
+                let _ = sink
+                    .on_event(LogEvent::JobEnd {
+                        run_id: group_id,
+                        status: outcome.status(),
+                        total_duration_ms: outcome.total_duration_ms,
+                    })
+                    .await;
+            })
+        };
+        self.stop_requested = None;
+        self.run = Some(RunHandle {
+            cancel_tx,
+            engine_abort: None,
+            events: std_rx,
+            join,
+            finished: None,
+        });
+        self.status_msg = Some(format!("项目运行中: {label}（{} 个流程）", run_count));
     }
 
     fn save_selected(&mut self) {
@@ -1858,7 +2232,9 @@ impl MainState {
             (Some(a), Some(b)) => (a, b),
             _ => return,
         };
-        let Some(entry) = self.projects.get_mut(pi) else { return };
+        let Some(entry) = self.projects.get_mut(pi) else {
+            return;
+        };
 
         let project_result = files::save_yaml(&entry.dir.join("project.yaml"), &entry.project);
         let job_result = match entry.jobs.get(ji) {
@@ -1872,7 +2248,11 @@ impl MainState {
                 let fp = config_fingerprint(&entry.project, entry.jobs.get(ji).map(|j| &j.job));
                 self.dirty_baseline = Some((
                     entry.project.name.clone(),
-                    entry.jobs.get(ji).map(|j| j.job.name.clone()).unwrap_or_default(),
+                    entry
+                        .jobs
+                        .get(ji)
+                        .map(|j| j.job.name.clone())
+                        .unwrap_or_default(),
                     fp,
                 ));
                 self.job_dirty = false;
@@ -1889,7 +2269,9 @@ impl MainState {
         let (Some(pi), Some(ji)) = (self.selected_project, self.selected_job) else {
             return;
         };
-        let Some(entry) = self.projects.get(pi) else { return };
+        let Some(entry) = self.projects.get(pi) else {
+            return;
+        };
         let fp = config_fingerprint(&entry.project, entry.jobs.get(ji).map(|j| &j.job));
         let sel = (
             entry.project.name.clone(),
@@ -2019,7 +2401,14 @@ $t = [Windows.UI.Notifications.ToastNotification]::new($x)
 "#
     );
     let mut cmd = std::process::Command::new("powershell");
-    cmd.args(["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", &script]);
+    cmd.args([
+        "-NoProfile",
+        "-NonInteractive",
+        "-WindowStyle",
+        "Hidden",
+        "-Command",
+        &script,
+    ]);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -2030,8 +2419,18 @@ $t = [Windows.UI.Notifications.ToastNotification]::new($x)
 
 /// 监听扫描时跳过的目录（构建产物 / 依赖 / IDE 元数据——它们变化不代表源码变了）
 const WATCH_SKIP_DIRS: &[&str] = &[
-    ".git", ".svn", ".idea", ".vscode", "node_modules", "target", "dist", "build", "out",
-    ".next", "coverage", "__pycache__",
+    ".git",
+    ".svn",
+    ".idea",
+    ".vscode",
+    "node_modules",
+    "target",
+    "dist",
+    "build",
+    "out",
+    ".next",
+    "coverage",
+    "__pycache__",
 ];
 
 /// 递归取目录下最新文件 mtime（depth 为递归层级，防符号链接环 / 异常深树）
@@ -2098,7 +2497,10 @@ mod tests {
         // （18 位 = yyyyMMdd(8) + '-' + HHmmss(6) + 毫秒(3)）
         let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S%3f").to_string();
         assert_eq!(stamp.len(), 18, "stamp: {stamp}");
-        assert!(stamp.chars().all(|c| c.is_ascii_digit() || c == '-'), "stamp: {stamp}");
+        assert!(
+            stamp.chars().all(|c| c.is_ascii_digit() || c == '-'),
+            "stamp: {stamp}"
+        );
     }
 
     #[test]

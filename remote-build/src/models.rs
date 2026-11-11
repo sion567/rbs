@@ -60,6 +60,12 @@ macro_rules! kebab_string_enum {
 pub struct Project {
     pub name: String,
     pub description: Option<String>,
+    /// 归类链（项目层）："/" 分隔的层级路径（如 "yudao/后台"），对应磁盘
+    /// projects/<a>/<b>/<工程>/ 的父目录链，层级深度不限。None = 平铺工程
+    /// （projects/<工程>/，旧布局默认如此）。手动挪工程目录后，discover
+    /// 以相对 projects 根的完整父目录链回填此字段；单段值 = 一层（兼容旧配置）。
+    #[serde(default)]
+    pub category: Option<String>,
     /// 本地代码目录（UI 输入框绑定）
     pub local_path: String,
     /// 环境 → 变量表
@@ -432,7 +438,12 @@ struct KubernetesTargetFields {
 
 impl Default for KubernetesTargetFields {
     fn default() -> Self {
-        Self { kubeconfig: String::new(), context: None, namespace: None, registry: None }
+        Self {
+            kubeconfig: String::new(),
+            context: None,
+            namespace: None,
+            registry: None,
+        }
     }
 }
 
@@ -440,7 +451,13 @@ impl serde::Serialize for TargetType {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         match self {
             TargetType::Local => serializer.serialize_str("local"),
-            TargetType::Ssh { host, port, user, auth, host_key } => {
+            TargetType::Ssh {
+                host,
+                port,
+                user,
+                auth,
+                host_key,
+            } => {
                 let mut map = serializer.serialize_map(Some(1))?;
                 map.serialize_entry(
                     "ssh",
@@ -454,7 +471,12 @@ impl serde::Serialize for TargetType {
                 )?;
                 map.end()
             }
-            TargetType::Kubernetes { kubeconfig, context, namespace, registry } => {
+            TargetType::Kubernetes {
+                kubeconfig,
+                context,
+                namespace,
+                registry,
+            } => {
                 let mut map = serializer.serialize_map(Some(1))?;
                 map.serialize_entry(
                     "kubernetes",
@@ -528,8 +550,12 @@ impl<'de> Deserialize<'de> for TargetType {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub enum AuthMethod {
     // YAML 双形态：auth: { key: { path: ... } } 或 auth: agent / none
-    Key { path: String },
-    Password { encrypted: String },
+    Key {
+        path: String,
+    },
+    Password {
+        encrypted: String,
+    },
     /// pageant / ssh-agent
     Agent,
     #[default]
@@ -558,7 +584,12 @@ impl serde::Serialize for AuthMethod {
             }
             AuthMethod::Password { encrypted } => {
                 let mut map = serializer.serialize_map(Some(1))?;
-                map.serialize_entry("password", &PasswordAuthFields { encrypted: encrypted.clone() })?;
+                map.serialize_entry(
+                    "password",
+                    &PasswordAuthFields {
+                        encrypted: encrypted.clone(),
+                    },
+                )?;
                 map.end()
             }
         }
@@ -574,14 +605,18 @@ impl<'de> Deserialize<'de> for AuthMethod {
                 // password 简写合法：密码值存 Credential Manager（按目标名），YAML 里不带值
                 "agent" => Ok(AuthMethod::Agent),
                 "none" => Ok(AuthMethod::None),
-                "password" => Ok(AuthMethod::Password { encrypted: String::new() }),
+                "password" => Ok(AuthMethod::Password {
+                    encrypted: String::new(),
+                }),
                 other => Err(serde::de::Error::custom(format!(
                     "未知 auth: {other}（期望 key / password / agent / none）"
                 ))),
             },
             yaml_serde::Value::Mapping(m) => {
                 if m.len() != 1 {
-                    return Err(serde::de::Error::custom("auth 映射只允许一个键（key / password）"));
+                    return Err(serde::de::Error::custom(
+                        "auth 映射只允许一个键（key / password）",
+                    ));
                 }
                 let (k, v) = m.into_iter().next().expect("len checked");
                 let key = k
@@ -589,13 +624,16 @@ impl<'de> Deserialize<'de> for AuthMethod {
                     .ok_or_else(|| serde::de::Error::custom("auth 键必须是字符串"))?;
                 match key {
                     "key" => {
-                        let f: KeyAuthFields = yaml_serde::from_value(v).map_err(serde::de::Error::custom)?;
+                        let f: KeyAuthFields =
+                            yaml_serde::from_value(v).map_err(serde::de::Error::custom)?;
                         Ok(AuthMethod::Key { path: f.path })
                     }
                     "password" => {
                         let f: PasswordAuthFields =
                             yaml_serde::from_value(v).map_err(serde::de::Error::custom)?;
-                        Ok(AuthMethod::Password { encrypted: f.encrypted })
+                        Ok(AuthMethod::Password {
+                            encrypted: f.encrypted,
+                        })
                     }
                     other => Err(serde::de::Error::custom(format!(
                         "未知 auth: {other}（期望 key / password / agent / none）"
@@ -648,9 +686,7 @@ impl Default for GlobalConfig {
             desktop_notify: true,
             projects_root: String::new(), // 由 config::default_global() 填充实际路径
             theme: Theme::Dark,
-            putty: PuttyConfig {
-                custom_path: None,
-            },
+            putty: PuttyConfig { custom_path: None },
             notify: NotifyConfig::default(),
         }
     }
@@ -773,19 +809,58 @@ pub struct VariablesFile {
 pub enum LogEvent {
     /// skipped = 跳过（未启用 / condition 不满足）：引擎随后仍补一条 StepEnd(0)，
     /// UI 据此显示灰色"跳过"而非绿色"成功"
-    StepStart { step_index: usize, name: String, skipped: bool },
-    Stdout { step_index: usize, line: String },
-    Stderr { step_index: usize, line: String },
-    StepEnd { step_index: usize, exit_code: i32, duration_ms: u64 },
+    StepStart {
+        step_index: usize,
+        name: String,
+        skipped: bool,
+    },
+    Stdout {
+        step_index: usize,
+        line: String,
+    },
+    Stderr {
+        step_index: usize,
+        line: String,
+    },
+    StepEnd {
+        step_index: usize,
+        exit_code: i32,
+        duration_ms: u64,
+    },
     /// 失败重试的退避等待开始（UI 显示黄色等待态；退避结束引擎补一条 StepStart 表示恢复执行）
-    StepRetryWait { step_index: usize, attempt: u32 },
-    JobEnd { run_id: String, status: JobStatus, total_duration_ms: u64 },
-    Error { message: String },
+    StepRetryWait {
+        step_index: usize,
+        attempt: u32,
+    },
+    JobEnd {
+        run_id: String,
+        status: JobStatus,
+        total_duration_ms: u64,
+    },
+    Error {
+        message: String,
+    },
     /// 组运行（第五批）：组内一个流程开始——UI 自动切到该流程并复位步骤可视化。
     /// 整个组结束才发 JobEnd（聚合状态），单流程结束只发 GroupJobEnd。
-    GroupJobBegin { run_id: String, group: String, project: String, job: String, index: usize, total: usize },
+    GroupJobBegin {
+        run_id: String,
+        group: String,
+        project: String,
+        job: String,
+        index: usize,
+        total: usize,
+    },
     /// 组运行：组内一个流程结束（UI 更新汇总与续跑指针，不置 run.finished）
-    GroupJobEnd { run_id: String, group: String, project: String, job: String, index: usize, total: usize, status: JobStatus, duration_ms: u64 },
+    GroupJobEnd {
+        run_id: String,
+        group: String,
+        project: String,
+        job: String,
+        index: usize,
+        total: usize,
+        status: JobStatus,
+        duration_ms: u64,
+    },
 }
 
 /// 落 SQLite 时用 `.short()` 转字符串：running / success / failed / cancelled / timeout。
@@ -798,8 +873,13 @@ pub enum JobStatus {
     Success,
     /// 成功但有 continue_on_error / on_failure=continue 的步骤失败被跳过
     /// （GHA 黄灯语义：结论成功，汇总里标注哪些步骤失败过）
-    SucceededWithFailures { failed_steps: Vec<usize> },
-    Failed { step_index: usize, reason: String },
+    SucceededWithFailures {
+        failed_steps: Vec<usize>,
+    },
+    Failed {
+        step_index: usize,
+        reason: String,
+    },
     Cancelled,
     Timeout,
 }
@@ -834,7 +914,10 @@ impl JobStatus {
     }
 
     pub fn ok(&self) -> bool {
-        matches!(self, JobStatus::Success | JobStatus::SucceededWithFailures { .. })
+        matches!(
+            self,
+            JobStatus::Success | JobStatus::SucceededWithFailures { .. }
+        )
     }
 }
 
@@ -942,7 +1025,10 @@ env_file: null
         struct Wrap {
             step_type: StepType,
         }
-        let yaml = yaml_serde::to_string(&Wrap { step_type: StepType::Exec }).unwrap();
+        let yaml = yaml_serde::to_string(&Wrap {
+            step_type: StepType::Exec,
+        })
+        .unwrap();
         assert_eq!(yaml.trim(), "step_type: exec");
     }
 
@@ -952,7 +1038,10 @@ env_file: null
         assert!(matches!(f, FailureAction::Stop));
         let f: FailureAction = yaml_serde::from_str("continue").unwrap();
         assert!(matches!(f, FailureAction::Continue));
-        assert_eq!(yaml_serde::to_string(&FailureAction::Retry).unwrap().trim(), "retry");
+        assert_eq!(
+            yaml_serde::to_string(&FailureAction::Retry).unwrap().trim(),
+            "retry"
+        );
 
         // 未知值给出可读错误
         let err = yaml_serde::from_str::<FailureAction>("halt").unwrap_err();
@@ -1000,7 +1089,10 @@ steps:
     creates: node_modules
 "#;
         let j: Job = yaml_serde::from_str(yaml).unwrap();
-        assert_eq!(j.steps[0].condition.as_deref(), Some("${{ variables.ENV }} == prod"));
+        assert_eq!(
+            j.steps[0].condition.as_deref(),
+            Some("${{ variables.ENV }} == prod")
+        );
         assert_eq!(j.steps[0].creates.as_deref(), Some("node_modules"));
     }
 
@@ -1047,7 +1139,8 @@ steps:
         assert_eq!(probe.interval_seconds, 3);
 
         // 旧流程（无新字段）→ 全部默认
-        let old: Job = yaml_serde::from_str("name: o\nproject: p\nsteps:\n  - command: echo hi\n").unwrap();
+        let old: Job =
+            yaml_serde::from_str("name: o\nproject: p\nsteps:\n  - command: echo hi\n").unwrap();
         assert!(old.steps[0].outputs.is_empty());
         assert!(old.steps[0].notify.is_empty());
         assert!(old.steps[0].wait.is_none());
@@ -1092,7 +1185,13 @@ targets:
         let targets = &p.targets;
         let ssh = &targets["build-server-01"];
         match &ssh.target_type {
-            TargetType::Ssh { host, port, user, auth, .. } => {
+            TargetType::Ssh {
+                host,
+                port,
+                user,
+                auth,
+                ..
+            } => {
                 assert_eq!(host, "192.168.1.100");
                 assert_eq!(*port, 22);
                 assert_eq!(user, "builder");
@@ -1163,7 +1262,10 @@ targets:
         let yaml = yaml_serde::to_string(&g).unwrap();
         assert!(yaml.contains("notify:"), "有配置应序列化 notify 块: {yaml}");
         assert!(yaml.contains("smtp.corp.local"));
-        assert!(yaml.contains("starttls") || yaml.contains("ssl"), "ssl 模式应落盘: {yaml}");
+        assert!(
+            yaml.contains("starttls") || yaml.contains("ssl"),
+            "ssl 模式应落盘: {yaml}"
+        );
         let back: GlobalConfig = yaml_serde::from_str(&yaml).unwrap();
         assert_eq!(back.notify, g.notify);
         assert_eq!(back.notify.email.to.len(), 2);

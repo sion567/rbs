@@ -7,25 +7,27 @@
 //! （事件出口），调度、历史入库、日志落盘、取消传播都在 run_group_serial。
 
 use crate::engine::{Engine, RunInput};
-use crate::models::{Job, JobStatus, LogEvent, Project, Target, Tool};
+use crate::models::{Job, JobStatus, LogEvent, Project, Tool};
 use async_trait::async_trait;
 use std::collections::HashMap;
 use tokio::sync::broadcast;
 
-/// 组内一个待执行流程（顺序 = 项目树顺序，即 jobs 列表过滤后的相对顺序）
+/// 组内一个待执行流程（顺序 = 项目树顺序，即 jobs 列表过滤后的相对顺序）。
+/// project = 所属工程：跨工程组运行（项目归类层串行）时各流程可属不同工程，
+/// 引擎按各自的工程解析目标/变量/凭据，运行锁也按各自工程名取
 #[derive(Clone)]
 pub struct GroupJob {
+    pub project: Project,
     pub name: String,
     pub job: Job,
 }
 
 /// 组运行参数（GUI / CLI 各自组装）
 pub struct GroupSpec {
-    pub project: Project,
+    /// 标签：单工程组运行 = 分组名；跨工程项目运行 = 「项目·链」标签（进状态行/边界事件）
     pub group: String,
     pub jobs: Vec<GroupJob>,
     pub tools: HashMap<String, Tool>,
-    pub all_targets: HashMap<String, Target>,
     pub default_step_timeout: u64,
     /// 组运行唯一标识（{项目}-grp-时间戳）：成员流程 run_id = {group_id}-{序号}，
     /// 历史里同前缀 = 同一次组发布
@@ -38,9 +40,9 @@ pub struct GroupSpec {
     /// 仅 sqlite 历史入库使用（no-default-features 构建下未读）
     #[cfg_attr(not(feature = "sqlite"), allow(dead_code))]
     pub save_history: bool,
-    /// GUI 落日志文件的目录（{run_id}.log）；None = 不落（CLI 现状）
+    /// 日志根目录（循环内按各流程所属工程分子目录 {run_id}.log）；None = 不落（CLI 现状）
     pub log_dir: Option<std::path::PathBuf>,
-    /// 历史入库的触发来源（RunMeta.trigger：manual / watch / cli / group）
+    /// 历史入库的触发来源（RunMeta.trigger：manual / watch / cli / group / category）
     /// 仅 sqlite 历史入库使用（no-default-features 构建下未读）
     #[cfg_attr(not(feature = "sqlite"), allow(dead_code))]
     pub trigger: &'static str,
@@ -119,20 +121,23 @@ pub async fn run_group_serial(spec: GroupSpec, sink: &dyn GroupSink) -> GroupOut
         #[cfg(feature = "sqlite")]
         let meta = crate::storage::sqlite::RunMeta {
             run_id: run_id.clone(),
-            project: spec.project.name.clone(),
+            project: gj.project.name.clone(),
             job: gj.job.name.clone(),
             target: gj.job.target.clone(),
             trigger: spec.trigger,
-            log_path: spec
-                .log_dir
-                .as_ref()
-                .map(|d| d.join(format!("{run_id}.log")).to_string_lossy().to_string()),
+            log_path: spec.log_dir.as_ref().map(|d| {
+                // 日志按工程分目录：跨工程运行时各流程落在各自工程名下
+                d.join(&gj.project.name)
+                    .join(format!("{run_id}.log"))
+                    .to_string_lossy()
+                    .to_string()
+            }),
         };
         let _ = sink
             .on_event(LogEvent::GroupJobBegin {
                 run_id: run_id.clone(),
                 group: spec.group.clone(),
-                project: spec.project.name.clone(),
+                project: gj.project.name.clone(),
                 job: gj.job.name.clone(),
                 index: i,
                 total,
@@ -153,10 +158,12 @@ pub async fn run_group_serial(spec: GroupSpec, sink: &dyn GroupSink) -> GroupOut
 
         let (tok_tx, mut tok_rx) = tokio::sync::mpsc::channel(8192);
         let input = RunInput {
-            project: spec.project.clone(),
+            // 各流程用自己的工程：目标/变量/凭据/运行锁都跟随所属工程
+            //（单工程组运行 = 全部同工程，行为与从前一致）
+            project: gj.project.clone(),
             job: gj.job.clone(),
             tools: spec.tools.clone(),
-            all_targets: spec.all_targets.clone(),
+            all_targets: crate::config::effective_targets(&gj.project),
             from_step: 0,
             only_step: None,
             run_id: run_id.clone(),
@@ -185,16 +192,17 @@ pub async fn run_group_serial(spec: GroupSpec, sink: &dyn GroupSink) -> GroupOut
             }
             sink.on_event(ev).await;
         }
-        let status = handle
-            .await
-            .unwrap_or(JobStatus::Failed { step_index: 0, reason: "引擎任务异常".to_string() });
+        let status = handle.await.unwrap_or(JobStatus::Failed {
+            step_index: 0,
+            reason: "引擎任务异常".to_string(),
+        });
         let duration_ms = job_started.elapsed().as_millis() as u64;
 
         let _ = sink
             .on_event(LogEvent::GroupJobEnd {
                 run_id,
                 group: spec.group.clone(),
-                project: spec.project.name.clone(),
+                project: gj.project.name.clone(),
                 job: gj.job.name.clone(),
                 index: i,
                 total,
@@ -237,20 +245,21 @@ pub async fn run_group_serial(spec: GroupSpec, sink: &dyn GroupSink) -> GroupOut
 /// 同步无副作用（preview_job 不执行命令、不发网络请求）。
 /// GUI 确认门窗口与 CLI run-group 共用；续跑场景传 `&jobs[from..]` 只展剩余。
 pub fn plan_lines(
-    project: &Project,
     jobs: &[GroupJob],
     tools: &HashMap<String, Tool>,
-    all_targets: &HashMap<String, Target>,
     default_step_timeout: u64,
 ) -> Vec<String> {
     let total = jobs.len();
+    // 跨工程运行（各流程工程名不全相同）时，预览行带工程名前缀区分；
+    // 单工程组运行保持原样只显流程名
+    let multi = jobs.iter().any(|g| g.project.name != jobs[0].project.name);
     let mut lines = Vec::new();
     for (i, gj) in jobs.iter().enumerate() {
         let input = RunInput {
-            project: project.clone(),
+            project: gj.project.clone(),
             job: gj.job.clone(),
             tools: tools.clone(),
-            all_targets: all_targets.clone(),
+            all_targets: crate::config::effective_targets(&gj.project),
             from_step: 0,
             only_step: None,
             run_id: String::new(),
@@ -258,18 +267,24 @@ pub fn plan_lines(
             cancel_tx: None,
         };
         let previews = crate::engine::preview_job(&input);
-        let target = gj
-            .job
-            .target
-            .clone()
-            .unwrap_or_else(|| "local".to_string());
+        let target = gj.job.target.clone().unwrap_or_else(|| "local".to_string());
+        let label = if multi {
+            format!("{}/{}", gj.project.name, gj.name)
+        } else {
+            gj.name.clone()
+        };
         lines.push(format!(
-            "【{}/{total}】{}（目标 {target}，{} 步）",
+            "【{}/{total}】{label}（目标 {target}，{} 步）",
             i + 1,
-            gj.name,
             previews.len()
         ));
-        if let Some(c) = gj.job.confirm.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(c) = gj
+            .job
+            .confirm
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
             lines.push(format!("  🔒 确认门: 「{c}」"));
         }
         for pre in &gj.job.preconditions {
@@ -282,7 +297,12 @@ pub fn plan_lines(
         }
         for p in &previews {
             if p.skipped {
-                lines.push(format!("  [{}] {} ⏭ 跳过：{}", p.index + 1, p.name, p.note.as_deref().unwrap_or("")));
+                lines.push(format!(
+                    "  [{}] {} ⏭ 跳过：{}",
+                    p.index + 1,
+                    p.name,
+                    p.note.as_deref().unwrap_or("")
+                ));
             } else {
                 let tgt = p.target.clone().unwrap_or_else(|| "local".to_string());
                 lines.push(format!("  [{}] {} → {tgt}", p.index + 1, p.name));
@@ -292,7 +312,11 @@ pub fn plan_lines(
                 for (l, r, exists) in &p.uploads {
                     lines.push(format!(
                         "      ↑ {l} -> {r}{}",
-                        if *exists { "" } else { "（本地缺失 ⚠）" }
+                        if *exists {
+                            ""
+                        } else {
+                            "（本地缺失 ⚠）"
+                        }
                     ));
                 }
             }
@@ -310,24 +334,40 @@ pub(crate) fn format_event(ev: &LogEvent) -> Option<String> {
     match ev {
         LogEvent::Stdout { line, .. } => Some(line.clone()),
         LogEvent::Stderr { line, .. } => Some(format!("[stderr] {line}")),
-        LogEvent::StepStart { step_index, name, .. } => {
-            Some(format!("── Step {} ── {name}", step_index + 1))
-        }
-        LogEvent::StepEnd { step_index, exit_code, duration_ms } => {
-            Some(format!("── Step {} 退出码 {exit_code} ({duration_ms}ms)", step_index + 1))
-        }
+        LogEvent::StepStart {
+            step_index, name, ..
+        } => Some(format!("── Step {} ── {name}", step_index + 1)),
+        LogEvent::StepEnd {
+            step_index,
+            exit_code,
+            duration_ms,
+        } => Some(format!(
+            "── Step {} 退出码 {exit_code} ({duration_ms}ms)",
+            step_index + 1
+        )),
         // 退避等待期已有"第 N 次尝试失败…后重试"告警行，不重复落盘
         LogEvent::StepRetryWait { .. } => None,
-        LogEvent::JobEnd { status, total_duration_ms, .. } => {
-            Some(format!("==== {} ({total_duration_ms}ms) ====", status.short()))
-        }
+        LogEvent::JobEnd {
+            status,
+            total_duration_ms,
+            ..
+        } => Some(format!(
+            "==== {} ({total_duration_ms}ms) ====",
+            status.short()
+        )),
         LogEvent::Error { message } => Some(format!("[error] {message}")),
-        LogEvent::GroupJobBegin { job, index, total, .. } => {
-            Some(format!("──── 组运行 [{index}/{total}] 启动流程 {job} ────"))
-        }
-        LogEvent::GroupJobEnd { job, status, duration_ms, .. } => {
-            Some(format!("──── 组流程 {job}: {} ({duration_ms}ms) ────", status.short()))
-        }
+        LogEvent::GroupJobBegin {
+            job, index, total, ..
+        } => Some(format!("──── 组运行 [{index}/{total}] 启动流程 {job} ────")),
+        LogEvent::GroupJobEnd {
+            job,
+            status,
+            duration_ms,
+            ..
+        } => Some(format!(
+            "──── 组流程 {job}: {} ({duration_ms}ms) ────",
+            status.short()
+        )),
     }
 }
 
@@ -336,8 +376,7 @@ pub(crate) fn format_event(ev: &LogEvent) -> Option<String> {
 /// 组多确认词场景（如打包 prod + 发布 prod 两个流程都设门）一次输入全部通过。
 pub fn confirm_words_match(input: &str, expected_words: &[String]) -> bool {
     let tokens: Vec<&str> = input.split_whitespace().collect();
-    !expected_words.is_empty()
-        && expected_words.iter().all(|w| tokens.contains(&w.as_str()))
+    !expected_words.is_empty() && expected_words.iter().all(|w| tokens.contains(&w.as_str()))
 }
 
 #[cfg(test)]
@@ -360,12 +399,28 @@ mod tests {
         }
     }
 
-    fn group_job(name: &str, command: &str) -> GroupJob {
+    fn group_job(dir: &std::path::Path, name: &str, command: &str) -> GroupJob {
+        group_job_in("p", dir, name, command)
+    }
+
+    /// 指定工程名的流程（跨工程组运行测试用）：工程 local_path = dir，
+    /// exec 步骤的相对路径产物落在各自工程目录里，可验证"各流程用各自工程"
+    fn group_job_in(
+        project_name: &str,
+        dir: &std::path::Path,
+        name: &str,
+        command: &str,
+    ) -> GroupJob {
         GroupJob {
+            project: Project {
+                name: project_name.to_string(),
+                local_path: dir.to_string_lossy().to_string(),
+                ..Default::default()
+            },
             name: name.to_string(),
             job: Job {
                 name: name.to_string(),
-                project: "p".to_string(),
+                project: project_name.to_string(),
                 steps: vec![Step {
                     name: Some("s".to_string()),
                     command: command.to_string(),
@@ -378,17 +433,11 @@ mod tests {
         }
     }
 
-    fn spec(dir: &std::path::Path, jobs: Vec<GroupJob>, from: usize) -> GroupSpec {
+    fn spec(jobs: Vec<GroupJob>, from: usize) -> GroupSpec {
         GroupSpec {
-            project: Project {
-                name: "p".to_string(),
-                local_path: dir.to_string_lossy().to_string(),
-                ..Default::default()
-            },
             group: "g".to_string(),
             jobs,
             tools: Default::default(),
-            all_targets: Default::default(),
             default_step_timeout: crate::engine::DEFAULT_STEP_TIMEOUT,
             group_id: "p-grp-test".to_string(),
             cancel_tx: None,
@@ -413,22 +462,34 @@ mod tests {
         let rt = rt();
         let sink = VecSink::default();
         let jobs = vec![
-            group_job("一", "echo done> m1.txt"),
-            group_job("二", "cmd /C exit 5"),
-            group_job("三", "echo done> m3.txt"),
+            group_job(&dir, "一", "echo done> m1.txt"),
+            group_job(&dir, "二", "cmd /C exit 5"),
+            group_job(&dir, "三", "echo done> m3.txt"),
         ];
-        let outcome = rt.block_on(run_group_serial(spec(&dir, jobs, 0), &sink));
+        let outcome = rt.block_on(run_group_serial(spec(jobs, 0), &sink));
         assert_eq!(outcome.results.len(), 2, "失败即停: {:?}", outcome.results);
         assert_eq!(outcome.failed, Some(1));
         assert!(!outcome.cancelled);
         assert!(!outcome.ok());
-        assert!(matches!(outcome.status(), JobStatus::Failed { reason, .. } if reason.contains("二")));
+        assert!(
+            matches!(outcome.status(), JobStatus::Failed { reason, .. } if reason.contains("二"))
+        );
         assert!(dir.join("m1.txt").exists(), "第一个流程应已执行");
         assert!(!dir.join("m3.txt").exists(), "失败后的流程不应执行");
 
         let evs = sink.0.lock().unwrap();
-        assert_eq!(evs.iter().filter(|e| matches!(e, LogEvent::GroupJobBegin { .. })).count(), 2);
-        assert_eq!(evs.iter().filter(|e| matches!(e, LogEvent::GroupJobEnd { .. })).count(), 2);
+        assert_eq!(
+            evs.iter()
+                .filter(|e| matches!(e, LogEvent::GroupJobBegin { .. }))
+                .count(),
+            2
+        );
+        assert_eq!(
+            evs.iter()
+                .filter(|e| matches!(e, LogEvent::GroupJobEnd { .. }))
+                .count(),
+            2
+        );
         assert!(
             !evs.iter().any(|e| matches!(e, LogEvent::JobEnd { .. })),
             "聚合 JobEnd 由调用方发，循环内只发组边界事件"
@@ -443,11 +504,11 @@ mod tests {
         let rt = rt();
         let sink = VecSink::default();
         let jobs = vec![
-            group_job("一", "echo done> m1.txt"),
-            group_job("二", "echo done> m2.txt"),
-            group_job("三", "echo done> m3.txt"),
+            group_job(&dir, "一", "echo done> m1.txt"),
+            group_job(&dir, "二", "echo done> m2.txt"),
+            group_job(&dir, "三", "echo done> m3.txt"),
         ];
-        let outcome = rt.block_on(run_group_serial(spec(&dir, jobs, 1), &sink));
+        let outcome = rt.block_on(run_group_serial(spec(jobs, 1), &sink));
         assert!(outcome.ok(), "got: {:?}", outcome.results);
         assert_eq!(outcome.results.len(), 2);
         assert!(!dir.join("m1.txt").exists());
@@ -461,15 +522,61 @@ mod tests {
         let dir = temp_dir("yellow");
         let rt = rt();
         let sink = VecSink::default();
-        let mut yellow = group_job("黄", "cmd /C exit 3");
+        let mut yellow = group_job(&dir, "黄", "cmd /C exit 3");
         yellow.job.steps[0].continue_on_error = true;
-        let jobs = vec![yellow, group_job("三", "echo done> m3.txt")];
-        let outcome = rt.block_on(run_group_serial(spec(&dir, jobs, 0), &sink));
+        let jobs = vec![yellow, group_job(&dir, "三", "echo done> m3.txt")];
+        let outcome = rt.block_on(run_group_serial(spec(jobs, 0), &sink));
         assert!(outcome.ok(), "黄灯不应停组: {:?}", outcome.results);
         assert_eq!(outcome.failed, None);
         assert!(matches!(outcome.status(), JobStatus::Success));
         assert!(dir.join("m3.txt").exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cross_project_group_uses_each_projects_context_and_stops() {
+        // 跨工程项目运行：api工程(成功→失败) → web工程；api 失败即停，
+        // web 的流程不执行；每个流程的产物落各自工程目录（目标/变量/锁按各自工程解析）
+        let dir_a = temp_dir("xproj-a");
+        let dir_b = temp_dir("xproj-b");
+        let rt = rt();
+        let sink = VecSink::default();
+        let jobs = vec![
+            group_job_in("api工程", &dir_a, "构建", "echo done> a1.txt"),
+            group_job_in("api工程", &dir_a, "发布", "cmd /C exit 5"),
+            group_job_in("web工程", &dir_b, "构建", "echo done> b1.txt"),
+        ];
+        let outcome = rt.block_on(run_group_serial(spec(jobs, 0), &sink));
+        assert_eq!(
+            outcome.results.len(),
+            2,
+            "api 发布失败后 web 不启动: {:?}",
+            outcome.results
+        );
+        assert_eq!(outcome.failed, Some(1));
+        assert!(dir_a.join("a1.txt").exists());
+        assert!(!dir_b.join("b1.txt").exists(), "失败工程的后续工程不应执行");
+
+        // 全部成功的路径：web工程 正常执行，事件带各自工程名
+        let sink2 = VecSink::default();
+        let jobs_ok = vec![
+            group_job_in("api工程", &dir_a, "构建", "echo done> a2.txt"),
+            group_job_in("web工程", &dir_b, "构建", "echo done> b2.txt"),
+        ];
+        let outcome2 = rt.block_on(run_group_serial(spec(jobs_ok, 0), &sink2));
+        assert!(outcome2.ok(), "{:?}", outcome2.results);
+        assert!(dir_a.join("a2.txt").exists() && dir_b.join("b2.txt").exists());
+        let evs = sink2.0.lock().unwrap();
+        let projects: Vec<String> = evs
+            .iter()
+            .filter_map(|e| match e {
+                LogEvent::GroupJobBegin { project, .. } => Some(project.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(projects, vec!["api工程".to_string(), "web工程".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
     }
 
     #[test]
@@ -481,7 +588,13 @@ mod tests {
         assert!(!confirm_words_match("", &words));
         let single = vec!["prod".to_string()];
         assert!(confirm_words_match("prod", &single));
-        assert!(!confirm_words_match("product", &single), "整词匹配不是子串匹配");
-        assert!(!confirm_words_match("anything", &[]), "无确认词时应走旧路径而非本函数");
+        assert!(
+            !confirm_words_match("product", &single),
+            "整词匹配不是子串匹配"
+        );
+        assert!(
+            !confirm_words_match("anything", &[]),
+            "无确认词时应走旧路径而非本函数"
+        );
     }
 }

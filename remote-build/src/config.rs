@@ -24,18 +24,30 @@ pub fn app_root() -> PathBuf {
         .join(".remote-build")
 }
 
-pub fn config_path() -> PathBuf { app_root().join("config.yaml") }
-pub fn tools_path() -> PathBuf { app_root().join("tools.yaml") }
-pub fn projects_dir() -> PathBuf { app_root().join("projects") }
-pub fn logs_dir() -> PathBuf { app_root().join("logs") }
+pub fn config_path() -> PathBuf {
+    app_root().join("config.yaml")
+}
+pub fn tools_path() -> PathBuf {
+    app_root().join("tools.yaml")
+}
+pub fn projects_dir() -> PathBuf {
+    app_root().join("projects")
+}
+pub fn logs_dir() -> PathBuf {
+    app_root().join("logs")
+}
 
 /// 代码工作区根：~/.remote-build/workspace（git 克隆的默认落点）。
 /// 与 projects/（配置目录）彻底分离——仓库自带的 project.yaml / *.yaml
 /// 不会与配置同名冲突，也不会被流程发现逻辑误当流程解析
-pub fn workspace_dir() -> PathBuf { app_root().join("workspace") }
+pub fn workspace_dir() -> PathBuf {
+    app_root().join("workspace")
+}
 
 /// git 克隆的默认目标目录：workspace/<项目名>
-pub fn default_clone_target(name: &str) -> PathBuf { workspace_dir().join(name) }
+pub fn default_clone_target(name: &str) -> PathBuf {
+    workspace_dir().join(name)
+}
 
 /// 创建目录骨架（§7.1 首次启动第一步）
 pub fn ensure_layout() -> std::io::Result<()> {
@@ -115,18 +127,15 @@ pub fn merge_detection(report: &DetectionReport) -> Result<usize> {
         if !dt.ok {
             continue;
         }
-        let entry = file
-            .tools
-            .entry(dt.name.clone())
-            .or_insert_with(|| Tool {
-                name: dt.name.clone(),
-                tool_type: ToolType::System,
-                command: String::new(),
-                version: None,
-                version_check: None,
-                detected_from: None,
-                env: HashMap::new(),
-            });
+        let entry = file.tools.entry(dt.name.clone()).or_insert_with(|| Tool {
+            name: dt.name.clone(),
+            tool_type: ToolType::System,
+            command: String::new(),
+            version: None,
+            version_check: None,
+            detected_from: None,
+            env: HashMap::new(),
+        });
         entry.command = dt.command.clone();
         entry.version = dt.version.clone();
         entry.version_check = dt.version_check.clone();
@@ -198,18 +207,33 @@ pub fn effective_targets(project: &Project) -> HashMap<String, Target> {
 
 /// 本地目标的单条映射（项目 targets 初始化用）
 pub fn local_targets_map() -> HashMap<String, Target> {
-    [local_target()].into_iter().map(|t| (t.name.clone(), t)).collect()
+    [local_target()]
+        .into_iter()
+        .map(|t| (t.name.clone(), t))
+        .collect()
 }
 
 /// 生成 project.yaml + 起始 build.yaml（Git clone 完成后 / 本地目录模式创建时调用）。
-/// 返回项目配置目录（projects/<name>）。
-pub fn create_project_entry(name: &str, local_path: &Path) -> Result<PathBuf> {
-    let dir = projects_dir().join(name);
+/// 返回项目配置目录；category（"/" 分隔的层级路径，深度不限）决定目录为
+/// projects/<a>/<b>/<工程>/，净化后的链原样写入 category 字段；None/空 = 平铺。
+pub fn create_project_entry_in(
+    category: Option<&str>,
+    name: &str,
+    local_path: &Path,
+) -> Result<PathBuf> {
+    // 每段目录名单独净化（整串净化会把 "/" 一起换掉；工程名上层已 sanitize_name）
+    let chain = sanitize_category_chain(category);
+    let mut dir = projects_dir();
+    for seg in &chain {
+        dir = dir.join(seg);
+    }
+    dir = dir.join(name);
     std::fs::create_dir_all(&dir)?;
 
     let project = Project {
         name: name.to_string(),
         description: None,
+        category: (!chain.is_empty()).then(|| chain.join("/")),
         local_path: local_path.to_string_lossy().to_string(),
         variables: HashMap::new(),
         tools: HashMap::new(),
@@ -262,13 +286,26 @@ pub fn create_project_entry(name: &str, local_path: &Path) -> Result<PathBuf> {
     Ok(dir)
 }
 
-
 /// Windows 文件名非法字符替换为下划线。
 /// 流程名（如 dev:h5）进 YAML 的 name 字段保留原名，仅文件名净化。
 pub fn sanitize_filename(s: &str) -> String {
     s.chars()
         .map(|c| if r#"\/:*?"<>|"#.contains(c) { '_' } else { c })
         .collect()
+}
+
+/// 归类链净化："/" 分隔的多级路径逐段净化，空段剔除；空串/全空白 → 空链。
+/// UI 与落盘共用，保证同一个 category 值算出的目录路径一致。
+pub fn sanitize_category_chain(category: Option<&str>) -> Vec<String> {
+    category
+        .map(|c| {
+            c.split('/')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(sanitize_filename)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// 流程（job）文件路径：projects/<项目>/jobs/<流程名>.yaml（文件名经净化）。
@@ -365,13 +402,17 @@ pub fn create_example_project() -> Result<()> {
              看「👁 预览」即可，无需真的执行；demo-server 是占位目标，改成真实机器就能跑"
                 .to_string(),
         ),
+        category: None,
         local_path: dir.to_string_lossy().to_string(),
         variables: [
             (
                 "staging".to_string(),
                 EnvironmentVariables {
                     vars: [
-                        ("REGISTRY".to_string(), "registry-staging.internal:5000".to_string()),
+                        (
+                            "REGISTRY".to_string(),
+                            "registry-staging.internal:5000".to_string(),
+                        ),
                         ("NAMESPACE".to_string(), "demo-staging".to_string()),
                         ("APP_NAME".to_string(), "demo-app".to_string()),
                         // 数据库连接信息（⑤ 数据库与压缩合集用；密码勿入变量——见该合集描述）
@@ -407,7 +448,9 @@ pub fn create_example_project() -> Result<()> {
         .collect(),
         tools: HashMap::new(),
         // mise 风格版本门禁演示：java 不满足要求时运行零步失败（预览里也会 ⚠）
-        tools_require: [("java".to_string(), ">=17".to_string())].into_iter().collect(),
+        tools_require: [("java".to_string(), ">=17".to_string())]
+            .into_iter()
+            .collect(),
         jobs: vec![
             "① Git 合集".to_string(),
             "② 构建合集".to_string(),
@@ -932,7 +975,10 @@ pub fn validate_project(project: &Project) -> Vec<ValidationIssue> {
     if !path.exists() {
         issues.push(ValidationIssue::Error {
             field: "local_path".to_string(),
-            message: format!("目录不存在: {}，请检查路径或先 git clone", project.local_path),
+            message: format!(
+                "目录不存在: {}，请检查路径或先 git clone",
+                project.local_path
+            ),
         });
     } else if !path.join(".git").exists() {
         issues.push(ValidationIssue::Warning {
@@ -989,13 +1035,15 @@ mod tests {
         // ── create_project_entry 生成 project.yaml + jobs/build.yaml ──
         let code_dir = tmp.join("code");
         std::fs::create_dir_all(&code_dir).unwrap();
-        let dir = create_project_entry("demo", &code_dir).unwrap();
+        let dir = create_project_entry_in(None, "demo", &code_dir).unwrap();
 
         let build_path = job_file_path(&dir, "build");
         assert!(build_path.exists(), "{}", build_path.display());
-        assert!(!dir.join("build.yaml").exists(), "起步流程应在新布局 jobs/ 下");
-        let p: Project =
-            crate::storage::files::load_yaml(&dir.join("project.yaml")).unwrap();
+        assert!(
+            !dir.join("build.yaml").exists(),
+            "起步流程应在新布局 jobs/ 下"
+        );
+        let p: Project = crate::storage::files::load_yaml(&dir.join("project.yaml")).unwrap();
         assert_eq!(p.name, "demo");
         assert_eq!(p.local_path, code_dir.to_string_lossy().to_string());
         let j: Job = crate::storage::files::load_yaml(&build_path).unwrap();
@@ -1005,7 +1053,7 @@ mod tests {
         // ── git 仓库目录（有 .git）→ 起步流程自带「版本信息 + 拉取最新」+ git 前置 ──
         let git_dir = tmp.join("gitcode");
         std::fs::create_dir_all(git_dir.join(".git")).unwrap();
-        let gdir = create_project_entry("gdemo", &git_dir).unwrap();
+        let gdir = create_project_entry_in(None, "gdemo", &git_dir).unwrap();
         let gj: Job = crate::storage::files::load_yaml(&job_file_path(&gdir, "build")).unwrap();
         assert_eq!(gj.steps.len(), 2, "{:?}", gj.steps);
         assert_eq!(gj.steps[0].command, "git log -1 --oneline");
@@ -1034,12 +1082,17 @@ mod tests {
         // ── 示范工程：五本合集生成、可解析、能被发现 ──
         create_example_project().unwrap();
         let ex_dir = projects_dir().join("example");
-        let p: Project =
-            crate::storage::files::load_yaml(&ex_dir.join("project.yaml")).unwrap();
+        let p: Project = crate::storage::files::load_yaml(&ex_dir.join("project.yaml")).unwrap();
         assert!(p.targets.contains_key("local"));
         assert!(p.targets.contains_key("demo-server"), "远端合集占位目标");
         let mut names = Vec::new();
-        for f in ["git.yaml", "build.yaml", "linux.yaml", "deploy.yaml", "db.yaml"] {
+        for f in [
+            "git.yaml",
+            "build.yaml",
+            "linux.yaml",
+            "deploy.yaml",
+            "db.yaml",
+        ] {
             let j: Job = crate::storage::files::load_yaml(&ex_dir.join("jobs").join(f)).unwrap();
             assert!(!j.steps.is_empty(), "{f} 应有示范步骤");
             names.push(j.name);
@@ -1054,11 +1107,14 @@ mod tests {
                 "数据库运维".to_string()
             ]
         );
-        let g: Job = crate::storage::files::load_yaml(&ex_dir.join("jobs").join("git.yaml")).unwrap();
+        let g: Job =
+            crate::storage::files::load_yaml(&ex_dir.join("jobs").join("git.yaml")).unwrap();
         assert_eq!(g.group.as_deref(), Some("本地构建"));
-        let d: Job = crate::storage::files::load_yaml(&ex_dir.join("jobs").join("deploy.yaml")).unwrap();
+        let d: Job =
+            crate::storage::files::load_yaml(&ex_dir.join("jobs").join("deploy.yaml")).unwrap();
         assert_eq!(d.group.as_deref(), Some("远端发布"));
-        let db: Job = crate::storage::files::load_yaml(&ex_dir.join("jobs").join("db.yaml")).unwrap();
+        let db: Job =
+            crate::storage::files::load_yaml(&ex_dir.join("jobs").join("db.yaml")).unwrap();
         assert_eq!(db.group.as_deref(), Some("数据库运维"));
         assert_eq!(db.steps[1].tool, "mysqldump", "第三方 CLI 工具绑定演示");
 
@@ -1088,7 +1144,11 @@ mod tests {
             .flat_map(|pv| pv.uploads.iter())
             .find(|(l, _, _)| l.ends_with("app.jar"))
             .expect("应有 app.jar 上传示范");
-        assert!(upload.1.starts_with("/opt/demo/"), "相对远端路径拼 work_root: {}", upload.1);
+        assert!(
+            upload.1.starts_with("/opt/demo/"),
+            "相对远端路径拼 work_root: {}",
+            upload.1
+        );
 
         // ── merge_detection：探测不到 putty 时清理自动探测的旧条目 ──
         // （内置捆绑目录时代写入 tools.yaml 的残留，会在目标面板一直刷出来）
@@ -1104,10 +1164,17 @@ mod tests {
         };
         file.tools.insert("putty".to_string(), auto);
         save_tools(&file).unwrap();
-        let report = DetectionReport { tools: Vec::new(), putty: Default::default() };
+        let report = DetectionReport {
+            tools: Vec::new(),
+            putty: Default::default(),
+        };
         merge_detection(&report).unwrap();
         let t = load_tools().unwrap();
-        assert!(!t.tools.contains_key("putty"), "自动探测的 putty 条目应被清理: {:?}", t.tools.keys());
+        assert!(
+            !t.tools.contains_key("putty"),
+            "自动探测的 putty 条目应被清理: {:?}",
+            t.tools.keys()
+        );
 
         // 手动添加的 putty（detected_from = None）保留
         let manual = Tool {
@@ -1143,7 +1210,11 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         assert_eq!(current_branch(&tmp), None);
 
-        if std::process::Command::new("git").arg("--version").output().is_err() {
+        if std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
             let _ = std::fs::remove_dir_all(&tmp);
             return;
         }
@@ -1165,7 +1236,15 @@ mod tests {
         // 游离 HEAD：返回短哈希提示（含「游离」字样）
         std::fs::write(tmp.join("a.txt"), "a").unwrap();
         git(&["add", "."]);
-        git(&["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-m", "init"]);
+        git(&[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-m",
+            "init",
+        ]);
         git(&["checkout", "--detach"]);
         let detached = current_branch(&tmp).unwrap();
         assert!(detached.contains("游离"), "游离 HEAD 应有提示: {detached}");
