@@ -189,8 +189,10 @@ impl ConsoleState {
         if self.lines.len() > MAX_LINES {
             let drop = self.lines.len() - MAX_LINES;
             self.lines.drain(0..drop);
-            // 前段裁剪让 heights 索引整体错位，标脏全量重测
-            self.heights_dirty = true;
+            // 行高缓存同步裁剪：heights 与 lines 索引保持对齐，无需置脏。
+            // 若置脏，控制台到上限后刷屏期间每帧都触发 5000 行全量重排
+            //（每推一行裁一行），长任务日志刷屏的掉帧直接来源
+            self.heights.drain(0..drop.min(self.heights.len()));
         }
     }
 
@@ -432,4 +434,29 @@ pub fn show(console: &mut ConsoleState, ui: &mut egui::Ui, running: bool, dark: 
                     }
                 });
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 裁剪后行高缓存必须与行列表保持同长对齐：渲染侧按索引取高，
+    /// 错位会让可视区行高算错；此前裁剪置脏全量重排（5000 行/帧），
+    /// 是控制台满行后日志刷屏掉帧的直接来源——此处锁住"裁剪同步裁高度"
+    #[test]
+    fn trim_keeps_heights_aligned_with_lines() {
+        let mut c = ConsoleState::default();
+        for i in 0..(MAX_LINES + 50) {
+            c.push_line(format!("line {i}"), Role::Stdout);
+            // 模拟渲染侧增量测量：新行有高度缓存（老行不重测）
+            c.heights.push(12.0);
+        }
+        assert_eq!(c.lines.len(), MAX_LINES, "超过上限后应裁到 MAX_LINES");
+        assert_eq!(
+            c.heights.len(),
+            c.lines.len(),
+            "裁剪后 heights 必须与 lines 对齐"
+        );
+        assert_eq!(c.lines[0].text, "line 50", "首行应是裁剪后的第一行");
+    }
 }

@@ -142,6 +142,10 @@ enum StepAction {
     Delete,
     MoveUp,
     MoveDown,
+    /// 移到第一步（置顶）
+    MoveTop,
+    /// 移到最后一步（置底）
+    MoveBottom,
     /// 从该步骤执行到流程结束
     RunFrom,
     /// 只执行该步骤（调试）
@@ -903,6 +907,18 @@ pub fn show(main: &mut MainState, ui: &mut egui::Ui) {
             StepAction::MoveDown => {
                 if si + 1 < job.steps.len() {
                     job.steps.swap(si, si + 1);
+                }
+            }
+            StepAction::MoveTop => {
+                if si < job.steps.len() {
+                    let step = job.steps.remove(si);
+                    job.steps.insert(0, step);
+                }
+            }
+            StepAction::MoveBottom => {
+                if si < job.steps.len() {
+                    let step = job.steps.remove(si);
+                    job.steps.push(step);
                 }
             }
             StepAction::RunFrom | StepAction::RunOnly => {}
@@ -2367,6 +2383,33 @@ fn edit_step(
                 .clicked()
             {
                 action = StepAction::MoveDown;
+            }
+            // 置顶/置底：长流程里把常用步骤一键挪到两端（↑/↓ 要连点多下）。
+            // 用文字不用 ⤒/⤓ 字形——msyh 字体链缺字形渲染成空白的教训见
+            // chevron_icon 注释（▴ U+25B4 实测豆腐块）；已在两端时禁用并说明
+            let can_top = si > 0;
+            let top_hover = if can_top { "置顶（移到第一步）" } else { "已是第一步" };
+            if ui
+                .add_enabled(can_top, egui::Button::new("置顶").small())
+                .on_hover_text(top_hover)
+                .on_disabled_hover_text(top_hover)
+                .clicked()
+            {
+                action = StepAction::MoveTop;
+            }
+            let can_bottom = si + 1 < steps_len;
+            let bottom_hover = if can_bottom {
+                "置底（移到最后一步）"
+            } else {
+                "已是最后一步"
+            };
+            if ui
+                .add_enabled(can_bottom, egui::Button::new("置底").small())
+                .on_hover_text(bottom_hover)
+                .on_disabled_hover_text(bottom_hover)
+                .clicked()
+            {
+                action = StepAction::MoveBottom;
             }
             if ui.small_button("🗑").clicked() {
                 action = StepAction::Delete;

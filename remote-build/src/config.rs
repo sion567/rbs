@@ -213,6 +213,26 @@ pub fn local_targets_map() -> HashMap<String, Target> {
         .collect()
 }
 
+/// 净化链 → category 字段值（None/空链 = None 平铺）。落盘字段与目录逐段一致，
+/// 新建（create_project_entry_in）与归类搬移（relocate_project_dir）共用
+pub fn category_field(category: Option<&str>) -> Option<String> {
+    let chain = sanitize_category_chain(category);
+    (!chain.is_empty()).then(|| chain.join("/"))
+}
+
+/// 工程配置目录：projects/<归类链逐段净化>/<工程名>；None/空 = 平铺在根。
+/// 新建（create_project_entry_in）、归类搬移（relocate_project_dir）、
+/// 改名（rename_project）三处共用——同一个 (归类, 名字) 在所有路径下算出的
+/// 目录必须一致，否则字段与实际位置脱钩（树显示与磁盘对不上）。
+pub fn project_config_dir(root: &Path, category: Option<&str>, name: &str) -> PathBuf {
+    // 每段目录名单独净化（整串净化会把 "/" 一起换掉；工程名上层已 sanitize_name）
+    let mut dir = root.to_path_buf();
+    for seg in sanitize_category_chain(category) {
+        dir = dir.join(seg);
+    }
+    dir.join(name)
+}
+
 /// 生成 project.yaml + 起始 build.yaml（Git clone 完成后 / 本地目录模式创建时调用）。
 /// 返回项目配置目录；category（"/" 分隔的层级路径，深度不限）决定目录为
 /// projects/<a>/<b>/<工程>/，净化后的链原样写入 category 字段；None/空 = 平铺。
@@ -221,19 +241,13 @@ pub fn create_project_entry_in(
     name: &str,
     local_path: &Path,
 ) -> Result<PathBuf> {
-    // 每段目录名单独净化（整串净化会把 "/" 一起换掉；工程名上层已 sanitize_name）
-    let chain = sanitize_category_chain(category);
-    let mut dir = projects_dir();
-    for seg in &chain {
-        dir = dir.join(seg);
-    }
-    dir = dir.join(name);
+    let dir = project_config_dir(&projects_dir(), category, name);
     std::fs::create_dir_all(&dir)?;
 
     let project = Project {
         name: name.to_string(),
         description: None,
-        category: (!chain.is_empty()).then(|| chain.join("/")),
+        category: category_field(category),
         local_path: local_path.to_string_lossy().to_string(),
         variables: HashMap::new(),
         tools: HashMap::new(),
@@ -1255,5 +1269,33 @@ mod tests {
         assert_eq!(wt_branch, "feature/wt");
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// 配置目录计算：链逐段净化后 join；空链 = 平铺根。
+    /// 新建 / 搬移 / 改名三处共用本函数，字段与目录不一致的错位从这里防住
+    #[test]
+    fn project_config_dir_joins_sanitized_chain() {
+        let root = Path::new("R");
+        assert_eq!(project_config_dir(root, None, "demo"), Path::new("R/demo"));
+        assert_eq!(
+            project_config_dir(root, Some(""), "demo"),
+            Path::new("R/demo"),
+            "空串视同平铺"
+        );
+        assert_eq!(
+            project_config_dir(root, Some(" yudao / 后台 "), "api工程"),
+            Path::new("R/yudao/后台/api工程"),
+            "逐段 trim、层级不限"
+        );
+        assert_eq!(
+            project_config_dir(root, Some("a//b"), "x"),
+            Path::new("R/a/b/x"),
+            "空段剔除"
+        );
+        assert_eq!(
+            project_config_dir(root, Some("a/b:c"), "x"),
+            Path::new("R/a/b_c/x"),
+            "段内非法字符净化（不破坏 / 分隔结构）"
+        );
     }
 }

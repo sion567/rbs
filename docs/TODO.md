@@ -1,5 +1,45 @@
 # TODO
 
+## 2026-11-12 三连修复（归类错位 bug / 步骤置顶置底 / 每帧开销清理）
+
+### ✅ bug：工程「归到项目」后配置文件不在项目目录下、树却显示正常
+
+- **根因**：树按 project.yaml 的 `category` 字段渲染、discover 也只信字段
+  （缺省才回填目录链）——「树对、文件不在」= 字段与实际目录脱钩。代码里能造成脱钩的路径：
+  1. `rename_project` 把目录**固定 join 到 projects 根**、category 字段不变：
+     归类下的工程一改名就"文件平铺、树还在项目里"（潜伏 bug，本轮修复）；
+  2. `relocate_project_dir` 以 `category == new_cat` 早退：字段已对但目录不对时
+     拒绝搬目录，用户没法一键自愈（本轮修复）。
+- **修复**（三处共用 `config::project_config_dir`，同一 (归类, 名字) 永远算出同一目录）：
+  - 改名跟随现有归类链（`projects/<链>/<新名>/`），不再丢链；
+  - 搬移跳过条件改为按**位置**判断 → 右键「🗂 移入项目」（预填当前归类）确认一次
+    即把目录搬回，存量错位一键自愈；
+  - reload 时一致性检测：`relative_parent_chain`（实际父链）vs `category` 字段，
+    不一致 → validation 缓存挂 ⚠（树上工程头/编辑器现有通道显示，含两个路径与
+    修复入口提示）。不自动动盘——启动期悄悄搬目录不可接受，指路 + 一键修复。
+- 新增单测：`project_config_dir_joins_sanitized_chain`、`relative_parent_chain_from_dir_layout`。
+
+### ✅ 步骤排序加 置顶/置底（流程编辑器）
+
+- 步骤卡片 ↑/↓ 旁新增「置顶 / 置底」按钮（`StepAction::MoveTop/MoveBottom`）：
+  一键挪到两端，长流程不再连点；首/尾自动禁用并悬停说明（与 ↑/↓ 同款约定）。
+- 用文字不用 ⤒/⤓ 字形——msyh 字体链缺字形渲染成空白的教训（chevron_icon 注释）。
+- 布局回归测试 `step_card_layout_stable_under_input` 实测仍 ≤726px，无需收窄输入框；
+  受影响快照已 `UPDATE_SNAPSHOTS=1` 重生成。
+
+### ✅ 卡顿：清掉三处每帧开销
+
+| 开销点 | 问题 | 修复 |
+|---|---|---|
+| **每帧 `.git` stat** | `render_project` 每帧每工程 `local_path/.git` 做 `exists()`——网络盘/断开路径一次 stat 可阻塞数秒，**每帧都发生**（10-30 性能审计缓存了 validate_project，漏了这处） | `MainState.git_repos` reload 时算一次，⎇ 徽标与「更新代码」菜单都读缓存 |
+| **控制台满行后整屏重排** | `trim_to_limit` 裁剪即置脏 → 控制台到 5000 行上限后，日志刷屏期间**每帧全量重排 5000 行 galley**（长任务刷屏掉帧的直接来源） | 裁剪时同步 `heights.drain`，索引保持对齐不再置脏（单测锁对齐不变量） |
+| **每帧指纹序列化** | `refresh_dirty` 每帧 `serde_json` 序列化整个 Project+Job（鼠标移动即 60fps） | 同项探测 250ms 节流（`dirty_last_probe`）；换选中项/保存仍立即重算基线，● 徽标最多迟 1/4 秒亮 |
+
+- 验证：`cargo test` 178 通过（2 个 `timeout_zero` 引擎测试为环境性失败，干净树同样失败，
+  与本轮改动无关）；`cargo clippy` 无新增告警。
+- 遗留观察：若刷屏卡顿仍在，查 `logs/app-*.log` 看门狗记录（STALL_SECS=15 才记）+
+  确认是否 RDP 会话（渲染后端已锁 DX12）。
+
 ## 项目归类层（category）
 
 > 2026-11-10 已实现：`projects/` 支持**任意深度**目录布局 `projects/<a>/<b>/<工程>/`。

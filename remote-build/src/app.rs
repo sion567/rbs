@@ -181,6 +181,11 @@ pub struct MainState {
     /// 项目名 → 分支显示文本；None = 非仓库 / 读不到，树上悬停时不显示该行。
     /// clone / 更新代码完成都会走 reload，分支随之刷新
     pub git_branches: std::collections::HashMap<String, Option<String>>,
+    /// 是否 git 仓库缓存（reload 时 stat 一次 local_path/.git）：
+    /// 项目名 → 是否仓库。树上的 ⎇ 徽标每帧都要用，渲染路径 stat 不得——
+    /// local_path 指向网络盘/断开路径时一次 stat 可阻塞数秒（「卡卡的」典型根源，
+    /// validation 缓存修过一轮但漏了这处），与 git_branches 同批缓存
+    pub git_repos: std::collections::HashMap<String, bool>,
     pub selected_project: Option<usize>,
     pub selected_job: Option<usize>,
     pub console: ui::console::ConsoleState,
@@ -259,6 +264,10 @@ pub struct MainState {
     pub dirty_baseline: Option<(String, String, u64)>,
     /// 当前选中流程是否有未保存修改（工具栏 ● 未保存 徽标 + 状态栏提示）
     pub job_dirty: bool,
+    /// 指纹节流探测时刻（None = 下帧立即探）：指纹 = serde_json 序列化整个
+    /// Project+Job，每帧跑（鼠标移动即 60fps）在大配置上是纯浪费；
+    /// 250ms 探一次足够感知（● 徽标最多迟 1/4 秒亮）。换选中项立即探
+    pub dirty_last_probe: Option<Instant>,
     /// 项目级编辑缓冲（变量表 / 工具版本要求，job_editor 渲染用）
     pub project_edit: ui::job_editor::ProjectEditBufs,
 }
@@ -364,6 +373,9 @@ pub struct RunHandle {
 /// sha256）时，等待这么久就把按钮升级为「⛔ 强制结束」
 const FORCE_FINISH_AFTER: Duration = Duration::from_secs(10);
 
+/// 未保存指纹的同项探测间隔（refresh_dirty 节流；换选中项不受此限）
+const DIRTY_PROBE_INTERVAL: Duration = Duration::from_millis(250);
+
 /// 组运行事件出口：runner（tokio 任务）→ std mpsc → UI drain_events。
 /// 历史入库与日志落盘在 runner 内完成（与单流程转发任务同一路径）。
 struct UiSink {
@@ -390,8 +402,10 @@ impl MainState {
             console: Default::default(),
             validation: Default::default(),
             git_branches: Default::default(),
+            git_repos: Default::default(),
             dirty_baseline: None,
             job_dirty: false,
+            dirty_last_probe: None,
             project_edit: Default::default(),
             run: None,
             stop_requested: None,
@@ -483,20 +497,39 @@ impl MainState {
         self.projects = files::discover_projects(&self.projects_root);
         // reload 后内存与磁盘一致，未保存基线重置（下一帧 refresh_dirty 静默重建）
         self.dirty_baseline = None;
+        self.dirty_last_probe = None;
         self.job_dirty = false;
         // 校验结果随 reload 刷新（目录存在性 / .git 只在项目列表变化时才可能变）
         self.validation = self
             .projects
             .iter()
             .map(|e| {
-                (
-                    e.project.name.clone(),
-                    crate::config::validate_project(&e.project),
-                )
+                let mut issues = crate::config::validate_project(&e.project);
+                // 归类一致性：树按 category 字段渲染，字段与实际父目录链脱钩时
+                // （历史改名/搬移遗留、手挪目录），文件位置与树显示对不上——
+                // 这里给 ⚠ 指路，右键「移入项目」确认一次即可搬回（不自动动盘）
+                let actual = files::relative_parent_chain(&self.projects_root, &e.dir);
+                if actual.as_deref() != e.project.category.as_deref().map(str::trim) {
+                    let field = e
+                        .project
+                        .category
+                        .clone()
+                        .unwrap_or_else(|| "（无 = 平铺）".to_string());
+                    issues.push(crate::models::ValidationIssue::Warning {
+                        field: "category".to_string(),
+                        message: format!(
+                            "归类与目录不一致：归类链字段是「{field}」，配置目录实际在 {}——\
+                             右键工程 → 🗂 移入项目（保持预填值）确认一次即可搬回",
+                            e.dir.display()
+                        ),
+                    });
+                }
+                (e.project.name.clone(), issues)
             })
             .collect();
         // 当前分支随 reload 刷新：clone / 更新代码完成都会走 reload；
-        // 与 validation 同理，不在悬停时每帧读 .git/HEAD
+        // 与 validation 同理，不在悬停时每帧读 .git/HEAD。
+        // 是否 git 仓库同批缓存（⎇ 徽标 / 更新代码菜单用，渲染路径禁止 stat）
         self.git_branches = self
             .projects
             .iter()
@@ -508,6 +541,17 @@ impl MainState {
                     crate::config::current_branch(std::path::Path::new(&local))
                 };
                 (e.project.name.clone(), branch)
+            })
+            .collect();
+        self.git_repos = self
+            .projects
+            .iter()
+            .map(|e| {
+                let is_git = !e.project.local_path.trim().is_empty()
+                    && std::path::Path::new(e.project.local_path.trim())
+                        .join(".git")
+                        .exists();
+                (e.project.name.clone(), is_git)
             })
             .collect();
 
@@ -2263,16 +2307,18 @@ impl MainState {
     }
 
     /// 每帧刷新 job_dirty：与保存时的基线指纹比对；换了选中项则静默重设基线
-    /// （选中变化不应误报「未保存」）。状态栏残留的「已保存 ✅」同步换成未保存提示
+    /// （选中变化不应误报「未保存」）。状态栏残留的「已保存 ✅」同步换成未保存提示。
+    /// 同一项的指纹探测按 250ms 节流（序列化整个 Project+Job 不便宜，见字段注释）
     fn refresh_dirty(&mut self) {
         self.job_dirty = false;
         let (Some(pi), Some(ji)) = (self.selected_project, self.selected_job) else {
+            self.dirty_last_probe = None;
             return;
         };
         let Some(entry) = self.projects.get(pi) else {
+            self.dirty_last_probe = None;
             return;
         };
-        let fp = config_fingerprint(&entry.project, entry.jobs.get(ji).map(|j| &j.job));
         let sel = (
             entry.project.name.clone(),
             entry
@@ -2281,6 +2327,19 @@ impl MainState {
                 .map(|j| j.job.name.clone())
                 .unwrap_or_default(),
         );
+        let same_selection =
+            matches!(&self.dirty_baseline, Some((p, j, _)) if *p == sel.0 && *j == sel.1);
+        if same_selection {
+            let due = self
+                .dirty_last_probe
+                .map(|t| t.elapsed() >= DIRTY_PROBE_INTERVAL)
+                .unwrap_or(true);
+            if !due {
+                return;
+            }
+        }
+        self.dirty_last_probe = Some(Instant::now());
+        let fp = config_fingerprint(&entry.project, entry.jobs.get(ji).map(|j| &j.job));
         match &self.dirty_baseline {
             Some((p, j, bfp)) if *p == sel.0 && *j == sel.1 => {
                 self.job_dirty = fp != *bfp;

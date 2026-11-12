@@ -100,8 +100,9 @@ fn walk_projects(
     }
 }
 
-/// 工程目录相对 root 的父目录链（"a/b" 形式；直接在 root 下 = None）
-fn relative_parent_chain(root: &Path, project_dir: &Path) -> Option<String> {
+/// 工程目录相对 root 的父目录链（"a/b" 形式；直接在 root 下 = None）。
+/// pub(crate)：app.rs reload 的一致性检测也用它（实际父链 vs category 字段）
+pub(crate) fn relative_parent_chain(root: &Path, project_dir: &Path) -> Option<String> {
     let rel = project_dir.strip_prefix(root).ok()?;
     let mut segs = Vec::new();
     for c in rel.components() {
@@ -409,6 +410,27 @@ mod tests {
         assert!(errors.is_empty(), "{errors:?}");
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 实际父目录链：归类检测（reload 对比 category 字段）共用
+    #[test]
+    fn relative_parent_chain_from_dir_layout() {
+        let root = Path::new("R");
+        assert_eq!(
+            relative_parent_chain(root, &root.join("yudao").join("api工程")),
+            Some("yudao".to_string()),
+            "一层归类"
+        );
+        assert_eq!(
+            relative_parent_chain(root, &root.join("a").join("b").join("deep工程")),
+            Some("a/b".to_string()),
+            "多级归类返回完整链"
+        );
+        assert_eq!(
+            relative_parent_chain(root, &root.join("平铺工程")),
+            None,
+            "直接在根下 = 平铺"
+        );
     }
 
     /// 任意深度：三层 a/b/工程 照样发现，category 回填 "a/b"；

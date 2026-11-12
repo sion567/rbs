@@ -276,11 +276,14 @@ fn render_project(main: &mut MainState, ui: &mut egui::Ui, pi: usize) {
                 })
                 .collect();
             // Git 仓库 / 本地目录模式的项目头标记（⎇ = git 仓库），
-            // 悬停显示代码目录与配置目录——两套目录分离时一眼可辨
-            let is_git = !entry.project.local_path.trim().is_empty()
-                && std::path::Path::new(&entry.project.local_path)
-                    .join(".git")
-                    .exists();
+            // 悬停显示代码目录与配置目录——两套目录分离时一眼可辨。
+            // 是否仓库读缓存（reload 时 stat 一次）：渲染路径 stat 在
+            // 网络盘/死路径上会卡住整个 UI（validation 缓存同款教训）
+            let is_git = main
+                .git_repos
+                .get(&entry.project.name)
+                .copied()
+                .unwrap_or(false);
             let name_shown = crate::ui::truncate_label(&entry.project.name, 14);
             let badge = if is_git { " ⎇" } else { "" };
             // 当前分支（reload 时缓存，git 项目才显示该行）
@@ -576,10 +579,13 @@ fn job_row(main: &mut MainState, ui: &mut egui::Ui, pi: usize, ji: usize, layer:
             main.start_run(0, None);
             ui.close();
         }
-        // 本地目录不是 git 仓库（无 .git）= 单机项目，没有可更新的远端，不显示本项
-        let is_git_repo = std::path::Path::new(&main.projects[pi].project.local_path)
-            .join(".git")
-            .exists();
+        // 本地目录不是 git 仓库（无 .git）= 单机项目，没有可更新的远端，不显示本项。
+        // 读缓存（reload 时算一次），菜单展开路径也不做 stat
+        let is_git_repo = main
+            .git_repos
+            .get(&main.projects[pi].project.name)
+            .copied()
+            .unwrap_or(false);
         if is_git_repo
             && ui
                 .add_enabled(
@@ -1471,8 +1477,15 @@ fn rename_project(main: &mut MainState, pi: usize, new_name: &str) {
     if new_name == old_name {
         return;
     }
-    let new_dir = main.projects_root.join(&new_name);
-    if new_dir.exists() {
+    // 目标目录跟随现有归类链：归类下的工程改名后仍留在项目里。
+    // 此前固定 join 到 projects 根——目录平铺而 category 字段不变，
+    // 树按字段显示"还在项目里"，配置文件却在根上（字段与目录脱钩）
+    let new_dir = crate::config::project_config_dir(
+        &main.projects_root,
+        project.category.as_deref(),
+        &new_name,
+    );
+    if new_dir != dir && new_dir.exists() {
         main.status_msg = Some(format!("⚠ 目标目录已存在: {}", new_dir.display()));
         return;
     }
@@ -1491,7 +1504,10 @@ fn rename_project(main: &mut MainState, pi: usize, new_name: &str) {
             return;
         }
     }
-    // 3. 目录改名
+    // 3. 目录改名（归类链的中间目录可能因字段手改而不存在，rename 不会自建父目录）
+    if let Some(parent) = new_dir.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
     if let Err(e) = std::fs::rename(&dir, &new_dir) {
         main.status_msg = Some(format!("改名失败（目录重命名）: {e}"));
         return;
@@ -1512,11 +1528,43 @@ fn rename_project(main: &mut MainState, pi: usize, new_name: &str) {
     main.status_msg = Some(format!("项目已改名: {old_name} → {new_name} ✅"));
 }
 
+/// 归类搬移计划（纯逻辑，单测锁语义）：目标目录 + 需要的动作。
+/// - Nothing：目录已在目标位置且字段一致（真无事可做）；
+/// - FieldOnly：目录已在目标位置、只差字段清/写（如目录在根的工程移出——
+///   只查位置会把字段留在旧值上）；
+/// - Move：目录与字段都要动——正常移入/移出，以及「字段在链上、目录不在」的
+///   历史错位自愈（「移入项目」预填当前归类确认一次即走这条搬回）。
+enum RelocatePlan {
+    Nothing,
+    FieldOnly,
+    Move { new_dir: std::path::PathBuf },
+}
+
+fn plan_relocate(
+    root: &std::path::Path,
+    dir: &std::path::Path,
+    current_cat: Option<&str>,
+    category: Option<&str>,
+    name: &str,
+) -> RelocatePlan {
+    let new_dir = crate::config::project_config_dir(root, category, name);
+    if new_dir == dir {
+        if current_cat == crate::config::category_field(category).as_deref() {
+            RelocatePlan::Nothing
+        } else {
+            RelocatePlan::FieldOnly
+        }
+    } else {
+        RelocatePlan::Move { new_dir }
+    }
+}
+
 /// 工程移入/移出归类链的底层搬运：改 category 字段 + 挪工程目录。
 /// 工程名不变——CLI 查找、运行历史、锁文件、凭据键全部按工程名工作，零影响。
 /// category 是 "/" 分隔的层级路径；None = 平铺（目录挪回 projects 根）。
 /// 字段写入净化后的链（与目录名逐段一致，reload 不串档）。
-/// 返回 Err 时未做任何磁盘改动（先写 yaml 后挪目录；挪目录失败会回滚字段）。
+/// 动作按 plan_relocate 决定；返回 Err 时未做任何磁盘改动
+/// （先写 yaml 后挪目录；挪目录失败会回滚字段）。
 fn relocate_project_dir(
     main: &mut MainState,
     pi: usize,
@@ -1527,43 +1575,47 @@ fn relocate_project_dir(
     };
     let (dir, mut project) = (entry.dir.clone(), entry.project.clone());
     let name = project.name.clone();
-    let chain = crate::config::sanitize_category_chain(category);
-    let new_cat = (!chain.is_empty()).then(|| chain.join("/"));
-    if project.category == new_cat {
-        return Ok(()); // 已在目标归类（或都已移出）：无事可做
-    }
-    let mut new_dir = main.projects_root.clone();
-    for seg in &chain {
-        new_dir = new_dir.join(seg);
-    }
-    new_dir = new_dir.join(&name);
-    if new_dir != dir && new_dir.exists() {
-        return Err(format!("目标目录已存在: {}", new_dir.display()));
-    }
-
-    let old_category = project.category.clone();
-    project.category = new_cat;
-    let yaml = dir.join("project.yaml");
-    if let Err(e) = crate::storage::files::save_yaml(&yaml, &project) {
-        return Err(format!("写入 project.yaml 失败: {e}"));
-    }
-    if new_dir != dir {
-        // 多级归类链的中间目录可能不存在（移入全新路径），rename 不会自建父目录
-        if let Some(parent) = new_dir.parent() {
-            let _ = std::fs::create_dir_all(parent);
+    match plan_relocate(
+        &main.projects_root,
+        &dir,
+        project.category.as_deref(),
+        category,
+        &name,
+    ) {
+        RelocatePlan::Nothing => Ok(()),
+        RelocatePlan::FieldOnly => {
+            project.category = crate::config::category_field(category);
+            let yaml = dir.join("project.yaml");
+            crate::storage::files::save_yaml(&yaml, &project)
+                .map_err(|e| format!("写入 project.yaml 失败: {e}"))
         }
-        if let Err(e) = std::fs::rename(&dir, &new_dir) {
-            // 回滚字段，保持 yaml 与目录位置一致（下次 reload 不串档）
-            project.category = old_category;
-            let _ = crate::storage::files::save_yaml(&yaml, &project);
-            return Err(format!(
-                "目录搬移失败（{} → {}）: {e}",
-                dir.display(),
-                new_dir.display()
-            ));
+        RelocatePlan::Move { new_dir } => {
+            if new_dir.exists() {
+                return Err(format!("目标目录已存在: {}", new_dir.display()));
+            }
+            let old_category = project.category.clone();
+            project.category = crate::config::category_field(category);
+            let yaml = dir.join("project.yaml");
+            if let Err(e) = crate::storage::files::save_yaml(&yaml, &project) {
+                return Err(format!("写入 project.yaml 失败: {e}"));
+            }
+            // 多级归类链的中间目录可能不存在（移入全新路径），rename 不会自建父目录
+            if let Some(parent) = new_dir.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if let Err(e) = std::fs::rename(&dir, &new_dir) {
+                // 回滚字段，保持 yaml 与目录位置一致（下次 reload 不串档）
+                project.category = old_category;
+                let _ = crate::storage::files::save_yaml(&yaml, &project);
+                return Err(format!(
+                    "目录搬移失败（{} → {}）: {e}",
+                    dir.display(),
+                    new_dir.display()
+                ));
+            }
+            Ok(())
         }
     }
-    Ok(())
 }
 
 /// 右键「移入/移出项目」：单工程搬运 + reload 保选中
@@ -1899,6 +1951,42 @@ mod tests {
         let mut e2 = e2;
         e2.project.jobs = vec!["b".into()]; // 名单只登记了 b（a 未登记 → 追加在后）
         assert_eq!(job_order(&e2), vec!["b".to_string(), "a".to_string()]);
+    }
+
+    /// 归类搬移计划的三种判定（字段与目录脱钩的自愈入口在这里）：
+    /// Nothing = 位置与字段都就位；FieldOnly = 目录本就对、只差字段清/写；
+    /// Move = 目录要挪（含「字段在链上、目录不在」的历史错位搬回）
+    #[test]
+    fn plan_relocate_covers_field_only_and_move() {
+        let root = std::path::Path::new("R");
+        let flat = root.join("demo");
+        let nested = root.join("yudao").join("demo");
+
+        // 已在归类下且字段一致 → 无事
+        assert!(matches!(
+            plan_relocate(root, &nested, Some("yudao"), Some("yudao"), "demo"),
+            RelocatePlan::Nothing
+        ));
+        // 平铺且无字段 → 无事
+        assert!(matches!(
+            plan_relocate(root, &flat, None, None, "demo"),
+            RelocatePlan::Nothing
+        ));
+        // 目录在根、字段还挂着 yudao（历史错位）→ 移入预填 yudao = 整体搬回
+        assert!(matches!(
+            plan_relocate(root, &flat, Some("yudao"), Some("yudao"), "demo"),
+            RelocatePlan::Move { .. }
+        ));
+        // 目录在根、字段挂着 yudao → 移出 = 只清字段，不挪目录
+        assert!(matches!(
+            plan_relocate(root, &flat, Some("yudao"), None, "demo"),
+            RelocatePlan::FieldOnly
+        ));
+        // 正常移入：平铺 → 链下
+        assert!(matches!(
+            plan_relocate(root, &flat, None, Some("yudao"), "demo"),
+            RelocatePlan::Move { .. }
+        ));
     }
 
     #[test]
