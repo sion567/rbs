@@ -1,12 +1,22 @@
-# 全局配置（首次启动自动生成，此文件为参考模板）
-default_timeout: 600        # 步骤默认超时（秒）：步骤未配 step.timeout 时生效；整个流程的超时用 build.yaml 的 job.timeout
-max_concurrent_jobs: 3
-log_retention_days: 30        # 日志与运行历史保留天数
-save_history: true           # 保留运行历史（SQLite ~/.remote-build/data/history.db）
-desktop_notify: true         # 作业结束时弹 Windows 桌面通知
-workspace_root: ~/.remote-build/projects
-auto_update_tools: false
-theme: dark
+# 全局配置（首次启动自动生成，此文件为参考模板；字段以 src/models.rs GlobalConfig 为准）
+default_timeout: 600        # 步骤默认超时（秒）：步骤未配 step.timeout 时生效；填 0 = 不限时
+log_retention_days: 30      # 日志与运行历史保留天数
+save_history: true          # 保留运行历史（SQLite ~/.remote-build/data/history.db）
+desktop_notify: true        # 作业结束时弹 Windows 桌面通知
+projects_root: ''           # 项目配置根目录（空 = ~/.remote-build/projects）
+theme: dark                 # dark / light（system 兼容解析、视同 dark）
 putty:
-  use_builtin: true
-  custom_path: null    # 指定自定义 PuTTY 目录，如 "C:/MyTools/PuTTY"
+  custom_path: null         # 自定义 PuTTY 目录（含 plink.exe / pscp.exe），如 "C:/MyTools/PuTTY"；null = 自动探测（PATH → Program Files）
+notify:
+  on_failure: false         # 作业失败时推送
+  on_success: false         # 作业成功时推送
+  mattermost: { enabled: false }   # webhook URL 存 Windows 凭据管理器（键 notify:mattermost）
+  dingtalk: { enabled: false }     # token/加签 secret 存凭据管理器
+  email:                     # SMTP；密码存凭据管理器（键 notify:smtp）
+    enabled: false
+    smtp_host: ''
+    smtp_port: 1
+    ssl: ''
+    username: ''
+    from: ''
+    to: []

@@ -63,7 +63,18 @@ pub struct ToolEditorState {
     pub verify_rx: Option<std::sync::mpsc::Receiver<(String, Option<String>)>>,
     /// 本会话内每个工具的最近验证结果（列表 ✓/✗ 标记；会话态不落盘）
     pub verify_results: std::collections::HashMap<String, (bool, String)>,
+    /// 通知凭据缓冲（进全局 tab 时读一次凭据管理器，编辑即写回）：
+    /// None = 未加载（首次进 tab / 离开 tab 后重置）
+    pub notify_secrets: Option<NotifySecretBufs>,
     pub unsaved: bool,
+}
+
+/// notify_section 的凭据字段缓冲（避免每帧 CredReadW）
+pub(crate) struct NotifySecretBufs {
+    pub mm_url: String,
+    pub dd_token: String,
+    pub dd_secret: String,
+    pub smtp_password: String,
 }
 
 fn reset_editor(main: &mut MainState) {
@@ -90,7 +101,7 @@ pub fn open_project_scope(main: &mut MainState) {
 /// 当前作用域对应的工具表（可变）
 fn scope_map_mut(
     main: &mut MainState,
-) -> Option<&mut std::collections::HashMap<String, Tool>> {
+) -> Option<&mut std::collections::BTreeMap<String, Tool>> {
     match main.tool_editor.scope {
         ToolScope::Global => Some(&mut main.tools),
         ToolScope::Project => {
@@ -101,7 +112,7 @@ fn scope_map_mut(
 }
 
 /// 当前作用域对应的工具表（只读）
-fn scope_map_ref(main: &MainState) -> Option<&std::collections::HashMap<String, Tool>> {
+fn scope_map_ref(main: &MainState) -> Option<&std::collections::BTreeMap<String, Tool>> {
     match main.tool_editor.scope {
         ToolScope::Global => Some(&main.tools),
         ToolScope::Project => main
@@ -166,14 +177,17 @@ pub(crate) fn tab_row(ui: &mut egui::Ui, tabs: &[String], selected: usize, enabl
 const SETTINGS_CONTENT_H: f32 = 484.0;
 
 pub fn show(ctx: &egui::Context, main: &mut MainState) {
-    // 回收后台验证结果
+    // 回收后台验证结果：结果带工具名，与当前选中不符（验证在途时切换了选中）
+    // 只进列表标记、不覆盖详情面板
     if let Some(rx) = &main.tool_editor.verify_rx {
         match rx.try_recv() {
             Ok((name, Some(first_line))) => {
                 main.tool_editor
                     .verify_results
                     .insert(name.clone(), (true, first_line.clone()));
-                main.tool_editor.verify = Some((true, first_line));
+                if main.tool_editor.selected.as_deref() == Some(name.as_str()) {
+                    main.tool_editor.verify = Some((true, first_line));
+                }
                 main.tool_editor.verify_rx = None;
             }
             Ok((name, None)) => {
@@ -181,7 +195,9 @@ pub fn show(ctx: &egui::Context, main: &mut MainState) {
                 main.tool_editor
                     .verify_results
                     .insert(name.clone(), (false, msg.clone()));
-                main.tool_editor.verify = Some((false, msg));
+                if main.tool_editor.selected.as_deref() == Some(name.as_str()) {
+                    main.tool_editor.verify = Some((false, msg));
+                }
                 main.tool_editor.verify_rx = None;
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {}
@@ -241,6 +257,10 @@ pub fn show(ctx: &egui::Context, main: &mut MainState) {
             // 内容高度固定（SETTINGS_CONTENT_H）：不足留白、超出滚动
             let tab_body = |ui: &mut egui::Ui| match main.settings_tab {
                 SettingsTab::Tools => {
+                    // 离开全局 tab：通知凭据缓冲作废（下次进 tab 重读最新值）
+                    if main.tool_editor.notify_secrets.is_some() {
+                        main.tool_editor.notify_secrets = None;
+                    }
                     ui.colored_label(
                         Color32::from_rgb(230, 180, 80),
                         "⚠ 本窗口编辑的是内存副本：如果你手动修改过 tools.yaml / project.yaml，\
@@ -425,7 +445,14 @@ fn tool_editor(ui: &mut egui::Ui, main: &mut MainState) {
     ui.add_space(6.0);
     ui.horizontal(|ui| {
         let scope = main.tool_editor.scope;
-        if ui.button("＋ 添加").clicked() {
+        // Project 作用域没有选中项目时「添加」无处落表：先给提示，
+        // 避免此后 selected/unsaved 落地成幻影状态（表单闪空 + 假未保存标记）
+        let project_scope_ok = scope == ToolScope::Global || main.selected_project.is_some();
+        if ui
+            .add_enabled(project_scope_ok, egui::Button::new("＋ 添加"))
+            .on_disabled_hover_text("项目作用域需要先在左侧选择项目")
+            .clicked()
+        {
             let mut n = 1;
             let mut name = format!("new-tool-{n}");
             while scope_map_ref(main).map(|m| m.contains_key(&name)).unwrap_or(false) {
@@ -484,6 +511,8 @@ fn tool_editor(ui: &mut egui::Ui, main: &mut MainState) {
                 if let Some(map) = scope_map_mut(main) {
                     map.remove(&name);
                 }
+                // 会话验证标记跟随条目：留着会让同名重建看到陈旧的 ✓/✗
+                main.tool_editor.verify_results.remove(&name);
                 main.tool_editor.unsaved = true;
             }
         }
@@ -495,7 +524,17 @@ fn tool_editor(ui: &mut egui::Ui, main: &mut MainState) {
             ToolScope::Global => "💾 保存 tools.yaml",
             ToolScope::Project => "💾 保存 project.yaml",
         };
-        if ui.button(save_label).clicked() {
+        // 运行中禁改盘（引擎正按路径读写 project.yaml / tools.yaml）：
+        // 工具栏入口已禁用，这里兜住 watch 自动重跑在窗口开着时启动运行的情况
+        if ui
+            .add_enabled(!main.run_active(), egui::Button::new(save_label))
+            .on_hover_text(if main.run_active() {
+                "有流程运行中，暂停保存"
+            } else {
+                "保存工具配置"
+            })
+            .clicked()
+        {
             let result = match scope {
                 ToolScope::Global => crate::config::save_tools(&ToolsFile {
                     tools: main.tools.clone(),
@@ -636,13 +675,13 @@ fn edit_form(ui: &mut egui::Ui, main: &mut MainState) {
             }
             ui.end_row();
 
-            if option_text_row(ui, "版本:", &mut tool.version, 180.0) {
+            if crate::ui::option_text_row(ui, "版本:", &mut tool.version, 180.0) {
                 main.tool_editor.unsaved = true;
             }
-            if option_text_row(ui, "版本检查:", &mut tool.version_check, 220.0) {
+            if crate::ui::option_text_row(ui, "版本检查:", &mut tool.version_check, 220.0) {
                 main.tool_editor.unsaved = true;
             }
-            if option_text_row(ui, "探测来源:", &mut tool.detected_from, 180.0) {
+            if crate::ui::option_text_row(ui, "探测来源:", &mut tool.detected_from, 180.0) {
                 main.tool_editor.unsaved = true;
             }
 
@@ -666,66 +705,46 @@ fn edit_form(ui: &mut egui::Ui, main: &mut MainState) {
             let tool = map.remove(&selected).expect("checked above");
             map.insert(new.clone(), tool);
         }
+        // 会话验证标记跟随改名（旧键清掉，新键继承）
+        if let Some(v) = main.tool_editor.verify_results.remove(&selected) {
+            main.tool_editor.verify_results.insert(new.clone(), v);
+        }
         main.tool_editor.selected = Some(new);
         main.tool_editor.unsaved = true;
     }
 }
 
-/// Option<String> 字段的编辑行（有值显示输入框 + × 清除；无值显示 — + ＋ 添加）
-/// 返回是否发生了修改。调用方需处于 Grid 中。
-fn option_text_row(
-    ui: &mut egui::Ui,
-    label: &str,
-    value: &mut Option<String>,
-    width: f32,
-) -> bool {
-    let mut changed = false;
-    ui.label(label);
-    match value {
-        Some(v) => {
-            let mut clear = false;
-            ui.horizontal(|ui| {
-                changed |= ui
-                    .add(egui::TextEdit::singleline(v).desired_width(width))
-                    .changed();
-                if ui.small_button("🗑").clicked() {
-                    clear = true;
-                }
-            });
-            if clear {
-                *value = None;
-                changed = true;
-            }
-        }
-        None => {
-            ui.horizontal(|ui| {
-                ui.weak("—");
-                if ui.small_button("＋").clicked() {
-                    *value = Some(String::new());
-                    changed = true;
-                }
-            });
-        }
-    }
-    ui.end_row();
-    changed
-}
-
 fn load_buffers(main: &mut MainState, name: &str) {
     main.tool_editor.name_buf = name.to_string();
+    // KEY=VALUE 单行往返：值里含换行的条目（只能来自手写 yaml）无法无损
+    // 展示在单行缓冲里——按"KEY=<值含\n>"拼行会被 parse_env_lines 拆成假键，
+    // 下次保存就静默改数据。此处把这类条目丢弃并提示（编辑保存前数据不变）
+    let mut dropped_multiline = false;
     let env = scope_map_ref(main)
         .and_then(|m| m.get(name))
         .map(|tool| {
-            let mut lines: Vec<String> =
-                tool.env.iter().map(|(k, v)| format!("{k}={v}")).collect();
+            let mut lines: Vec<String> = Vec::new();
+            for (k, v) in &tool.env {
+                if v.contains('\n') || v.contains('\r') {
+                    dropped_multiline = true;
+                    continue;
+                }
+                lines.push(format!("{k}={v}"));
+            }
             lines.sort();
             lines.join("\n")
         })
         .unwrap_or_default();
     main.tool_editor.env_buf = env;
+    if dropped_multiline {
+        main.status_msg = Some(format!(
+            "⚠ 工具「{name}」有值含换行的 env 条目，无法在单行编辑器中展示——\
+             本次编辑保存会丢弃它们（如需保留请手改 tools.yaml）"
+        ));
+    }
 }
 
-fn parse_env_lines(text: &str) -> std::collections::HashMap<String, String> {
+fn parse_env_lines(text: &str) -> std::collections::BTreeMap<String, String> {
     text.lines()
         .filter_map(|line| {
             let line = line.trim();
@@ -738,7 +757,9 @@ fn parse_env_lines(text: &str) -> std::collections::HashMap<String, String> {
         .collect()
 }
 
-/// 后台线程跑 version_check（≤3s），避免阻塞 UI
+/// 后台线程跑 version_check（≤3s），避免阻塞 UI。
+/// putty 也走线程：它的探测（plink -V）同步等待 ≤3s，此前在 UI 线程内联跑
+/// 会让整个窗口卡住直到返回——与其他工具的线程 + spinner 行为对齐
 fn start_verify(main: &mut MainState) {
     let Some(name) = main.tool_editor.selected.clone() else {
         return;
@@ -747,50 +768,37 @@ fn start_verify(main: &mut MainState) {
     // putty.exe 本体是 GUI 程序（--version 弹窗、不往 stdout 打）；
     // plink 在 PuTTY 安装器默认不进 PATH，裸名验证只会"无输出"，
     // 必须用套件探测（自定义目录 → PATH → Program Files）拿到的完整路径
-    if name == "putty" {
-        let detection = crate::transport::putty::detect_putty_tools();
-        let result = if !detection.found {
-            Err(
-                "未找到 PuTTY 套件（自定义目录 / PATH / Program Files 均未命中）——\
-                 请先安装 PuTTY，或在此表单指定套件目录"
-                    .to_string(),
-            )
-        } else {
-            let plink = detection.plink.to_string_lossy().to_string();
-            match crate::env_detect::probe(&plink, &["-V"]) {
-                Some(line) => Ok(line),
-                None => Err(format!("plink -V 无输出（套件目录缺 plink.exe？）: {plink}")),
-            }
-        };
-        main.tool_editor.verify = Some(match &result {
-            Ok(line) => (true, line.clone()),
-            Err(msg) => (false, msg.clone()),
-        });
-        match result {
-            Ok(line) => {
-                main.tool_editor
-                    .verify_results
-                    .insert(name, (true, line));
-            }
-            Err(msg) => {
-                main.tool_editor
-                    .verify_results
-                    .insert(name, (false, msg));
-            }
-        }
-        return;
-    }
-    let Some(check) = scope_map_ref(main)
-        .and_then(|m| m.get(&name))
-        .and_then(|t| t.version_check.clone())
-        .filter(|s| !s.trim().is_empty())
-    else {
+    let payload: Option<String> = if name == "putty" {
+        Some(String::new()) // 占位：putty 走探测路径，载荷只传名
+    } else {
+        scope_map_ref(main)
+            .and_then(|m| m.get(&name))
+            .and_then(|t| t.version_check.clone())
+            .filter(|s| !s.trim().is_empty())
+    };
+    let Some(check) = payload else {
         main.tool_editor.verify = Some((
             false,
             "未配置 version_check（如 java -version / mvn -v）".to_string(),
         ));
         return;
     };
+    if name == "putty" {
+        main.tool_editor.verify = None;
+        let (tx, rx) = std::sync::mpsc::channel();
+        main.tool_editor.verify_rx = Some(rx);
+        std::thread::spawn(move || {
+            let detection = crate::transport::putty::detect_putty_tools();
+            let result = if !detection.found {
+                None
+            } else {
+                let plink = detection.plink.to_string_lossy().to_string();
+                crate::env_detect::probe(&plink, &["-V"])
+            };
+            let _ = tx.send((name, result));
+        });
+        return;
+    }
     // 连同工具本体一起带过去：验证要按工具的 env / command 所在目录解析，
     // 否则裸名命令解析到系统 PATH 上的同名程序，结果与工具实际版本不符
     let tool = scope_map_ref(main).and_then(|m| m.get(&name)).cloned();
@@ -945,14 +953,16 @@ fn global_section(
             }
             ui.end_row();
             ui.label("主题:");
+            // System 只作为解析兼容值（app 启动时视同暗黑）：下拉只给明亮/暗黑。
+            // 改动只由下拉自身驱动——System 值此前在首次渲染帧被静默改写成 Dark
+            // 并落盘（看一眼配置页 = 改了 config.yaml）
             let theme_names = ["明亮", "暗黑"];
             let mut idx = match global.theme {
                 crate::models::Theme::Light => 0,
-                crate::models::Theme::Dark => 1,
-                crate::models::Theme::System => 2,
+                _ => 1,
             };
-            egui::ComboBox::from_id_salt("theme_combo")
-                .selected_text(theme_names[idx.min(1)])
+            let theme_combo = egui::ComboBox::from_id_salt("theme_combo")
+                .selected_text(theme_names[idx])
                 .width(120.0)
                 .show_ui(ui, |ui| {
                     ui.selectable_value(&mut idx, 0, "明亮");
@@ -962,7 +972,7 @@ fn global_section(
                 0 => crate::models::Theme::Light,
                 _ => crate::models::Theme::Dark,
             };
-            if new_theme != global.theme {
+            if theme_combo.response.changed() && new_theme != global.theme {
                 global.theme = new_theme;
                 crate::app::apply_theme(ctx, &global.theme);
                 match crate::config::save_global(global) {
@@ -1018,6 +1028,34 @@ fn notify_section(ui: &mut egui::Ui, main: &mut MainState) {
     let mut changed = false;
     let mut test_msg: Option<String> = None;
 
+    // 凭据字段缓冲：进 Global tab 时读一次（此前每帧 4 次 CredReadW——凭据
+    // 管理器调用不便宜，拖动输入框期间整窗口都在打凭据库）；编辑即写回
+    if main.tool_editor.notify_secrets.is_none() {
+        let mut read_err: Option<String> = None;
+        let read = |key: &str, err_out: &mut Option<String>| -> String {
+            match crate::secrets::get_password(key) {
+                Ok(Some(v)) => v,
+                // 读失败与"未配置"区分开：静默给空串会让用户重打一遍覆盖掉真凭据
+                Ok(None) => String::new(),
+                Err(e) => {
+                    *err_out = Some(format!(
+                        "⚠ 读取凭据失败（{key}）: {e}——显示为空，请勿直接覆盖保存"
+                    ));
+                    String::new()
+                }
+            }
+        };
+        main.tool_editor.notify_secrets = Some(NotifySecretBufs {
+            mm_url: read(crate::notify::KEY_MATTERMOST, &mut read_err),
+            dd_token: read(crate::notify::KEY_DINGTALK_TOKEN, &mut read_err),
+            dd_secret: read(crate::notify::KEY_DINGTALK_SECRET, &mut read_err),
+            smtp_password: read(crate::notify::KEY_SMTP_PASSWORD, &mut read_err),
+        });
+        if let Some(m) = read_err {
+            test_msg = Some(m);
+        }
+    }
+
     {
         let notify = &mut main.global.notify;
         ui.horizontal(|ui| {
@@ -1027,20 +1065,25 @@ fn notify_section(ui: &mut egui::Ui, main: &mut MainState) {
 
         // ── Mattermost：webhook URL 存凭据管理器（键 notify:mattermost）──
         ui.add_space(4.0);
-        let mut mm_url = crate::secrets::get_password(crate::notify::KEY_MATTERMOST)
-            .ok()
-            .flatten()
-            .unwrap_or_default();
+        let bufs = main.tool_editor.notify_secrets.as_mut();
+        let Some(bufs) = bufs else {
+            ui.weak("（凭据缓冲加载中…）");
+            return;
+        };
         ui.horizontal(|ui| {
             changed |= ui
                 .checkbox(&mut notify.mattermost.enabled, "📨 Mattermost")
                 .changed();
             ui.label("Webhook URL:");
             let resp = ui
-                .add(egui::TextEdit::singleline(&mut mm_url).password(true).desired_width(220.0))
+                .add(
+                    egui::TextEdit::singleline(&mut bufs.mm_url)
+                        .password(true)
+                        .desired_width(220.0),
+                )
                 .on_hover_text("incoming webhook 地址（含 token，只存本机凭据管理器）");
             if resp.changed() {
-                if let Err(e) = save_notify_secret(crate::notify::KEY_MATTERMOST, &mm_url) {
+                if let Err(e) = save_notify_secret(crate::notify::KEY_MATTERMOST, &bufs.mm_url) {
                     test_msg = Some(format!("❌ 保存凭据失败: {e}"));
                 }
             }
@@ -1054,14 +1097,6 @@ fn notify_section(ui: &mut egui::Ui, main: &mut MainState) {
         });
 
         // ── 钉钉：access_token + 加签 secret 存凭据管理器 ──
-        let mut dd_token = crate::secrets::get_password(crate::notify::KEY_DINGTALK_TOKEN)
-            .ok()
-            .flatten()
-            .unwrap_or_default();
-        let mut dd_secret = crate::secrets::get_password(crate::notify::KEY_DINGTALK_SECRET)
-            .ok()
-            .flatten()
-            .unwrap_or_default();
         ui.horizontal(|ui| {
             changed |= ui
                 .checkbox(&mut notify.dingtalk.enabled, "🔔 钉钉机器人")
@@ -1069,26 +1104,26 @@ fn notify_section(ui: &mut egui::Ui, main: &mut MainState) {
             ui.label("access_token:");
             let resp = ui
                 .add(
-                    egui::TextEdit::singleline(&mut dd_token)
+                    egui::TextEdit::singleline(&mut bufs.dd_token)
                         .password(true)
                         .desired_width(180.0),
                 )
                 .on_hover_text("机器人 webhook 的 access_token（或整条 URL）");
             if resp.changed() {
-                if let Err(e) = save_notify_secret(crate::notify::KEY_DINGTALK_TOKEN, &dd_token) {
+                if let Err(e) = save_notify_secret(crate::notify::KEY_DINGTALK_TOKEN, &bufs.dd_token) {
                     test_msg = Some(format!("❌ 保存凭据失败: {e}"));
                 }
             }
             ui.label("加签secret:");
             let resp = ui
                 .add(
-                    egui::TextEdit::singleline(&mut dd_secret)
+                    egui::TextEdit::singleline(&mut bufs.dd_secret)
                         .password(true)
                         .desired_width(140.0),
                 )
                 .on_hover_text("安全设置选「加签」时填；留空 = 不加签");
             if resp.changed() {
-                if let Err(e) = save_notify_secret(crate::notify::KEY_DINGTALK_SECRET, &dd_secret) {
+                if let Err(e) = save_notify_secret(crate::notify::KEY_DINGTALK_SECRET, &bufs.dd_secret) {
                     test_msg = Some(format!("❌ 保存凭据失败: {e}"));
                 }
             }
@@ -1103,10 +1138,6 @@ fn notify_section(ui: &mut egui::Ui, main: &mut MainState) {
 
         // ── 邮箱：服务器参数落 YAML，密码存凭据管理器 ──
         ui.add_space(4.0);
-        let mut smtp_password = crate::secrets::get_password(crate::notify::KEY_SMTP_PASSWORD)
-            .ok()
-            .flatten()
-            .unwrap_or_default();
         ui.horizontal(|ui| {
             changed |= ui
                 .checkbox(&mut notify.email.enabled, "✉ 邮箱（SMTP）")
@@ -1120,9 +1151,16 @@ fn notify_section(ui: &mut egui::Ui, main: &mut MainState) {
                 )
                 .changed();
             ui.label("端口:");
-            changed |= ui
-                .add(egui::DragValue::new(&mut notify.email.smtp_port).range(1..=65535))
-                .changed();
+            // drag_stopped 才落盘：DragValue 拖动期间每帧 changed，
+            // 此前每帧重写 config.yaml（tmp+rename + putty 探测缓存失效）
+            let port_resp = ui
+                .add(egui::DragValue::new(&mut notify.email.smtp_port).range(1..=65535));
+            if port_resp.changed() {
+                changed = true;
+            }
+            if port_resp.drag_stopped() {
+                changed = true;
+            }
             ui.label("加密:");
             let modes = ["starttls", "ssl", "none"];
             let hints = ["587 STARTTLS", "465 隐式SSL", "25 明文(内网中继)"];
@@ -1152,13 +1190,15 @@ fn notify_section(ui: &mut egui::Ui, main: &mut MainState) {
             ui.label("密码:");
             let resp = ui
                 .add(
-                    egui::TextEdit::singleline(&mut smtp_password)
+                    egui::TextEdit::singleline(&mut bufs.smtp_password)
                         .password(true)
                         .desired_width(120.0),
                 )
                 .on_hover_text("SMTP 密码/授权码，只存本机凭据管理器");
             if resp.changed() {
-                if let Err(e) = save_notify_secret(crate::notify::KEY_SMTP_PASSWORD, &smtp_password) {
+                if let Err(e) =
+                    save_notify_secret(crate::notify::KEY_SMTP_PASSWORD, &bufs.smtp_password)
+                {
                     test_msg = Some(format!("❌ 保存凭据失败: {e}"));
                 }
             }
@@ -1294,11 +1334,14 @@ fn history_section(ui: &mut egui::Ui, main: &mut MainState) {
         }
     }
 
-    let rows = main.history_rows.clone().unwrap_or_default();
-    if rows.is_empty() {
+    let rows_empty = main.history_rows.as_ref().map(|r| r.is_empty()).unwrap_or(true);
+    if rows_empty {
         ui.weak("（暂无运行记录）");
         return;
     }
+    let Some(rows) = &main.history_rows else {
+        return;
+    };
     egui::ScrollArea::vertical()
         .id_salt("history_scroll")
         .auto_shrink([false, false])
@@ -1314,7 +1357,7 @@ fn history_section(ui: &mut egui::Ui, main: &mut MainState) {
                     ui.strong("状态");
                     ui.strong("耗时");
                     ui.end_row();
-                    for r in &rows {
+                    for r in rows {
                         // RFC3339(UTC) → 本地时区 yyyy-MM-dd HH:mm:ss
                         let started = chrono::DateTime::parse_from_rfc3339(&r.started_at)
                             .map(|t| {

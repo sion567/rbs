@@ -37,6 +37,11 @@ impl FirstRunPage {
         self.confirmed
     }
 
+    /// 初始化失败后复位（app 层调用）：下次点按钮才重试，不再每帧自动重跑
+    pub fn clear_confirmed(&mut self) {
+        self.confirmed = false;
+    }
+
     /// 渲染引导页；用户点击「初始化并进入」后 confirmed() 变为 true
     pub fn show(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
@@ -124,9 +129,8 @@ impl FirstRunPage {
                             ui.add_space(8.0);
                             ui.colored_label(
                                 Color32::from_rgb(230, 180, 80),
-                                "⚠ 未找到 PuTTY：SSH 执行/上传不可用。可安装 PuTTY、设置自定义路径，\
-                                 或将 plink/pscp/psftp/puttygen/pageant.exe 放入 \
-                                 ~/.remote-build/tools/putty/ 后重启。",
+                                "⚠ 未找到 PuTTY：transport: putty 的目标不可用（russh 默认传输不受影响）。\
+                                 可安装 PuTTY，或在 ⚙ 设置 → 🔧 工具管理 → putty 指定套件目录。",
                             );
                         }
 

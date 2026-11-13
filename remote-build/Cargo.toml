@@ -4,9 +4,6 @@ version = "0.1.0"
 edition = "2021"
 description = "Remote Build System — Windows 桌面构建部署工具（P0）"
 
-[package.metadata.bundle]
-resources = ["tools/", "config/"]
-
 [dependencies]
 # wgpu 渲染后端：glow 在 RDP/远程会话下只有 GDI OpenGL 1.1，无法满足 GL2 要求；
 # wgpu 走 DX12/Vulkan，远程桌面可用
@@ -37,7 +34,7 @@ log = "0.4"                         # 仅用于 StderrLogger（main.rs）：暴�
 chrono = { version = "0.4", features = ["serde"] }
 sha2 = "0.10"                    # 工具校验和
 keyring = "2.0"                  # Windows Credential Manager（P1 密码存储）
-winapi = { version = "0.3", features = ["shellapi", "winuser", "wincon", "winnls", "stringapiset", "jobapi2", "winnt", "handleapi", "sysinfoapi"] }  # 快捷方式/通知（P2）；OEM 代码页解码；Job Object 进程树终止；本机信息（CPU/内存）
+winapi = { version = "0.3", features = ["wincon", "winnls", "stringapiset", "jobapi2", "winnt", "handleapi", "sysinfoapi", "processthreadsapi"] }  # 控制台代码页（main.rs）；OEM 代码页解码（transport）；Job Object 进程树终止（win_job）；进程存活检测（runlock）；本机信息（env_detect/logging）
 rfd = "0.13"                     # 原生文件/文件夹选择对话框（项目目录浏览）
 zip = { version = "2", default-features = false, features = ["deflate"] }  # pack 步骤 .zip 格式
 tar = "0.4"                      # pack 步骤 .tar.gz 格式（Linux 惯用；tar 保留可执行权限）

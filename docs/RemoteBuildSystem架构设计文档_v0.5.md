@@ -7,7 +7,7 @@
 | 状态 | 实施中（P0 / P0.5 已落地） |
 | 客户端 | Windows 桌面，egui + eframe |
 | 服务端 | **无**（已移除） |
-| 传输层 | **russh + russh-sftp（默认，进程内）**；PuTTY 套件按目标可选兜底（内置捆绑保留） |
+| 传输层 | **russh + russh-sftp（默认，进程内）**；PuTTY 套件按目标可选兜底（内置捆绑已移除，见 v0.5.2） |
 | 配置管理 | YAML 文件 + Git 仓库 |
 | 权限/审批 | **无**（研发自用，已移除） |
 
@@ -23,6 +23,7 @@
 | v0.4 | 2026-10-19 | 评审修复 10 项：serde 序列化对齐（`EnvironmentVariables` flatten、对外枚举补 `rename_all`）、`build_ssh_args` 解构修复、远端 `cd` 路径引号转义、补 `ValidationIssue` 定义、`FailureAction` 去重、澄清 tools.yaml putty 条目与 `PuttyTransport` 关系、完整性校验覆盖全部捆绑文件、UI 树修正、补充 `cancel_rx` 分发说明 |
 | v0.5 | 2026-10-27 | **传输层换防**：russh + russh-sftp 从 P3 预留升级为**默认传输**（进程内 SSH），PuTTY 套件转为**按目标可选的兜底**；Target 新增 `transport` 字段（旧目标兼容按 putty）；**移除 OpenSshTransport 计划**（占位封存，硬化参数移植进 russh）；上传/下载改走 SFTP；协议级 keepalive；拍板 §19 待确认问题 4 |
 | v0.5.1 | 2026-11-10 | **项目归类层**：`Project.category` 字段 + 任意深度目录布局 `projects/<a>/<b>/<工程>/`；discover 递归扫描（含 project.yaml 即工程并停止下钻，否则视为容器继续下钻，层级不限；category 缺省回填完整父目录链 "a/b"）；UI 树按归类链嵌套渲染多层「🗂 项目」节点；工程右键移入/移出项目（路径可含 / 建多级）、分类右键重命名（改本段，子级跟随）/解散（成员升一级）；工程名全局唯一（重名告警），CLI/历史/锁/凭据不受影响。**跨工程项目运行**：分类节点右键一键把成员工程流程串成流水线（全部/同名分组过滤），复用组运行串行循环失败即停；GroupJob 带所属工程，引擎逐流程解析各自工程的目标/变量/凭据/锁，日志按工程分目录，历史 trigger=category |
+| v0.5.2 | 2026-11-13 | **内置捆绑目录移除**（§5.3–§5.5 相应作废，仅存历史）：putty 套件查找只剩「自定义目录 → PATH → Program Files」；`verify_putty_integrity` 与 5-exe+VERSION 清单校验随捆绑方案一并删除，自定义安装不做完整性强制。**目标定义收口 project.yaml**（v0.4 起已无全局 targets.yaml，§5 内涉及处已核对）。工具链同类修正：步骤执行默认 russh，未检测到套件时目标管理自动切换并提示 |
 
 ### v0.3 相较 v0.2 的实质性变化
 
@@ -74,7 +75,7 @@ v0.4 §19 待确认问题 4 提出「russh 作为 P2 可选替换方案预留」
 | 决策 | 内容 |
 |------|------|
 | russh 默认化 | `russh`（0.64 系）+ `russh-sftp`（3.0 系）进程内实现，免安装、单 exe 分发 |
-| PuTTY 转兜底 | 捆绑分发与 `detect_putty_tools()` 全部保留；仅 `transport: putty` 的目标需要套件 |
+| PuTTY 转兜底 | `detect_putty_tools()` 保留（探测序：自定义目录 → PATH → Program Files；**内置捆绑分发已于 v0.5.2 移除**）；仅 `transport: putty` 的目标需要套件 |
 | OpenSSH 移除 | OpenSshTransport（P1 占位）不实现：定位被 russh 覆盖且不支持密码认证；`build_ssh_args` 硬化语义（ConnectTimeout / ServerAliveInterval / BatchMode）移植进 russh 配置 |
 | SCP → SFTP | russh 路径上传/下载走 SFTP：远端路径按字面处理，消除 pscp 远端 shell 解释一类告警 |
 | keepalive | 协议级保活 30s，治 VPN/NAT 环境掐空闲连接（plink 无 CLI 保活参数，现状只能靠步骤超时兜底） |
@@ -890,7 +891,11 @@ pub fn detect_putty_tools() -> PuttyDetectionResult {
 >
 > **与 tools.yaml 的关系（v0.4 澄清）**：`tools.yaml` 里的 `putty` 条目（§3.4）由本函数的探测结果**自动生成**，仅供 UI 展示与版本核对；`PuttyTransport` 实际使用的路径一律以本函数返回值为准，**不回读 tools.yaml**，避免两处配置漂移。
 
-内置目录定位：
+> ⚠ **以下「内置目录定位 / §5.4 捆绑文件清单 / §5.5 完整性校验」已作废（v0.5.2，2026-11-13）**：
+> 内置捆绑目录已从代码中移除（`detect_putty_tools_uncached` 只查自定义目录 → PATH → Program Files），
+> 本节内容仅存历史参考。
+
+~~内置目录定位：~~
 
 ```rust
 fn get_builtin_putty_dir() -> Option<PathBuf> {

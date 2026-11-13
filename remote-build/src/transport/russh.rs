@@ -22,7 +22,7 @@ use async_trait::async_trait;
 use russh::client::{AuthResult, Handle};
 use russh::keys::PrivateKeyWithHashAlg;
 use russh_sftp::client::SftpSession;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -99,7 +99,8 @@ fn hardened_client_config() -> Arc<russh::client::Config> {
     })
 }
 
-/// 每次操作新建连接（§5.2 连接语义）：TCP + 握手 + 认证 共享 CONNECT_TIMEOUT 上限
+/// 每次操作新建连接（§5.2 连接语义）：TCP + 握手 + 认证 共享 CONNECT_TIMEOUT 上限。
+/// 认证也在超时罩内——服务器接受 TCP 但认证往返挂死时不至于无限等
 async fn connect_and_auth(
     target: &Target,
     transient_password: Option<&str>,
@@ -112,19 +113,22 @@ async fn connect_and_auth(
     let config = hardened_client_config();
     let handler = ClientHandler { expected: expected.clone(), seen: seen.clone() };
 
-    let mut handle = tokio::time::timeout(
+    let handle = tokio::time::timeout(
         Duration::from_secs(CONNECT_TIMEOUT_SECS),
-        russh::client::connect(config, (host.as_str(), *port), handler),
+        async {
+            let mut h = russh::client::connect(config, (host.as_str(), *port), handler)
+                .await
+                .map_err(|e| connect_error(&seen, expected.as_deref(), e))?;
+            authenticate(&mut h, target, user, auth, transient_password).await?;
+            Ok::<_, anyhow::Error>(h)
+        },
     )
     .await
     .map_err(|_| {
         anyhow::anyhow!(
-            "连接超时（{CONNECT_TIMEOUT_SECS}s）——请检查网络 / 防火墙 / 主机地址: {host}:{port}"
+            "连接/认证超时（{CONNECT_TIMEOUT_SECS}s）——请检查网络 / 防火墙 / 主机地址: {host}:{port}"
         )
-    })?
-    .map_err(|e| connect_error(&seen, expected.as_deref(), e))?;
-
-    authenticate(&mut handle, target, user, auth, transient_password).await?;
+    })??;
     Ok(Connection { handle })
 }
 
@@ -239,31 +243,45 @@ async fn authenticate(
 // 远端命令执行
 // ---------------------------------------------------------------------------
 
-/// exec 输出按行切分缓冲（Data 消息不保证按行边界到达）
+/// exec 输出按行切分缓冲：按**字节**累积，遇 \n 才整体解码。
+/// SSH Data 块在任意字节边界切分——逐 chunk 解码时，跨块的多字节 UTF-8
+/// （中文日志）解码失败会落进 OEM 代码页兜底变成乱码且无法恢复；
+/// 0x0A 不会出现在 UTF-8 多字节序列内部，行边界解码无此问题
+/// （与 local.rs 的 read_until(b'\n') 同语义）。
 #[derive(Default)]
 struct LineBuffer {
-    pending: String,
+    pending: Vec<u8>,
 }
 
 impl LineBuffer {
-    fn pump(&mut self, text: &str, stream: Stream, log: &LogHandle) {
-        self.pending.push_str(text);
-        while let Some(pos) = self.pending.find('\n') {
-            let line: String = self.pending.drain(..=pos).collect();
-            log.line(stream, line.trim_end_matches(['\r', '\n']));
+    /// 喂入原始字节；完整行（含尾部 \n）解码后交给 sink（行尾 \r\n 已修剪）
+    fn pump(&mut self, chunk: &[u8], mut sink: impl FnMut(String)) {
+        self.pending.extend_from_slice(chunk);
+        while let Some(pos) = self.pending.iter().position(|&b| b == b'\n') {
+            let line: Vec<u8> = self.pending.drain(..=pos).collect();
+            sink(decode_line(&line));
         }
     }
 
-    fn flush(&mut self, stream: Stream, log: &LogHandle) {
+    /// 流结束后冲出未以 \n 结尾的残余行
+    fn flush(&mut self, mut sink: impl FnMut(String)) {
         if !self.pending.is_empty() {
             let rest = std::mem::take(&mut self.pending);
-            log.line(stream, rest.trim_end_matches(['\r', '\n']));
+            sink(decode_line(&rest));
         }
     }
+}
+
+fn decode_line(bytes: &[u8]) -> String {
+    super::decode_console_bytes(bytes)
+        .trim_end_matches(['\r', '\n'])
+        .to_string()
 }
 
 /// 单连接单命令执行。log = Some 逐行转发输出（exec 步骤）；None 只收集 stdout
 /// （sha256 批量探测等内部命令，输出不进控制台）。返回 (stdout 全文, 退出码)。
+/// stdout 全文仅在 log = None 时收集——exec 步骤的输出捕获走 LogHandle
+/// 的独立捕获缓冲，此前无条件整流缓冲一个大 String 纯属白占内存。
 async fn run_remote_command(
     handle: &mut Handle<ClientHandler>,
     command: &str,
@@ -284,15 +302,22 @@ async fn run_remote_command(
         };
         match msg {
             Some(russh::ChannelMsg::Data { ref data }) => {
-                let text = super::decode_console_bytes(data.as_ref());
-                if let Some(l) = log {
-                    stdout_lines.pump(&text, Stream::Stdout, l);
-                }
-                all_stdout.push_str(&text);
+                let collect = log.is_none();
+                stdout_lines.pump(data.as_ref(), |line| {
+                    if let Some(l) = log {
+                        l.line(Stream::Stdout, &line);
+                    }
+                    if collect {
+                        all_stdout.push_str(&line);
+                        all_stdout.push('\n');
+                    }
+                });
             }
             Some(russh::ChannelMsg::ExtendedData { ref data, .. }) => {
                 if let Some(l) = log {
-                    stderr_lines.pump(&super::decode_console_bytes(data.as_ref()), Stream::Stderr, l);
+                    stderr_lines.pump(data.as_ref(), |line| {
+                        l.line(Stream::Stderr, &line);
+                    });
                 }
             }
             Some(russh::ChannelMsg::ExitStatus { exit_status }) => exit_code = Some(exit_status),
@@ -301,10 +326,21 @@ async fn run_remote_command(
             _ => {}
         }
     }
-    if let Some(l) = log {
-        stdout_lines.flush(Stream::Stdout, l);
-        stderr_lines.flush(Stream::Stderr, l);
-    }
+    let flush_stdout = |line: String| {
+        if let Some(l) = log {
+            l.line(Stream::Stdout, &line);
+        }
+        if log.is_none() {
+            all_stdout.push_str(&line);
+            all_stdout.push('\n');
+        }
+    };
+    stdout_lines.flush(flush_stdout);
+    stderr_lines.flush(|line| {
+        if let Some(l) = log {
+            l.line(Stream::Stderr, &line);
+        }
+    });
     Ok((all_stdout, exit_code.map(|c| c as i32).unwrap_or(-1)))
 }
 
@@ -392,24 +428,48 @@ async fn upload_file(
 /// `target/config/ -> /opt/app/config/` 语义；pscp -r 的嵌套行为不在此复刻，
 /// 引擎对目录上传本就跳过校验并建议先 pack）。
 /// async fn 递归必须装箱（E0733）：手动 Box::pin 返回。
+/// 目录符号链接 / junction 不跟随（与 pack.rs 防环同款）：自引用源目录会把
+/// 栈与内存打爆，且全程不触达文件导致取消信号无从观察；深度上限兜底。
 fn upload_dir<'a>(
     sftp: &'a SftpSession,
     local: &'a Path,
     remote: String,
     cancel: &'a mut broadcast::Receiver<()>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>> {
+    upload_dir_inner(sftp, local, remote, cancel, 0)
+}
+
+const UPLOAD_DIR_MAX_DEPTH: usize = 64;
+
+fn upload_dir_inner<'a>(
+    sftp: &'a SftpSession,
+    local: &'a Path,
+    remote: String,
+    cancel: &'a mut broadcast::Receiver<()>,
+    depth: usize,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>> {
     Box::pin(async move {
+        if depth > UPLOAD_DIR_MAX_DEPTH {
+            anyhow::bail!(
+                "目录层级超过 {UPLOAD_DIR_MAX_DEPTH} 层，停止上传: {}（疑似符号链接环路）",
+                local.display()
+            );
+        }
         sftp_mkdir_p(sftp, &remote).await;
         let entries = std::fs::read_dir(local)
             .with_context(|| format!("读取目录失败: {}", local.display()))?;
         for entry in entries {
             let entry = entry?;
             let child_local = entry.path();
+            // file_type() 不跟随链接：目录链接（含 junction）跳过，防环
+            let ft = entry.file_type().with_context(|| {
+                format!("读取条目类型失败: {}", child_local.display())
+            })?;
             let name = entry.file_name().to_string_lossy().into_owned();
             let child_remote = format!("{}/{}", remote.trim_end_matches('/'), name);
-            if child_local.is_dir() {
-                upload_dir(sftp, &child_local, child_remote, cancel).await?;
-            } else if child_local.is_file() {
+            if ft.is_dir() {
+                upload_dir_inner(sftp, &child_local, child_remote, cancel, depth + 1).await?;
+            } else if ft.is_file() {
                 upload_file(sftp, &child_local, &child_remote, cancel).await?;
             }
         }
@@ -424,16 +484,13 @@ impl RemoteTransport for RusshTransport {
         target: &Target,
         command: &str,
         working_dir: &str,
-        _env: &HashMap<String, String>,
+        _env: &BTreeMap<String, String>,
         log: &LogHandle,
         cancel: &mut broadcast::Receiver<()>,
     ) -> anyhow::Result<ExitStatus> {
         let mut conn = connect_and_auth(target, None).await?;
-        let full_command = if working_dir.is_empty() {
-            command.to_string()
-        } else {
-            format!("cd '{}' && {}", escape_posix_single_quote(working_dir), command)
-        };
+        // cd 组合共用（空命令报错 / ~ 展开语义），见 mod.rs
+        let full_command = super::compose_remote_command(working_dir, command)?;
         // env 与 putty 行为对齐：不影响远端 shell（远端变量请写在命令里）
         let (_, code) = run_remote_command(&mut conn.handle, &full_command, Some(log), cancel).await?;
         Ok(ExitStatus::from_code(code))
@@ -469,27 +526,46 @@ impl RemoteTransport for RusshTransport {
     ) -> anyhow::Result<()> {
         let mut conn = connect_and_auth(target, None).await?;
         let sftp = sftp_session(&mut conn.handle).await?;
-        // 与 putty 路径一致：单文件下载（pscp 同样不支持裸目录；目录先 pack）
+        // 与 putty 路径一致：单文件下载（pscp 同样不支持裸目录；目录先 pack）。
+        // 先写 .tmp 再改名：中途失败/取消不留残缺文件在目标路径冒充完整产物
         let mut src = sftp
             .open(remote.to_string())
             .await
             .with_context(|| format!("远端打开失败: {remote}（文件不存在？目录请先 pack 成单文件）"))?;
-        let mut dst = std::fs::File::create(local)
-            .with_context(|| format!("创建本地文件失败: {}", local.display()))?;
-        let mut buf = vec![0u8; CHUNK_SIZE];
-        loop {
-            let n = tokio::select! {
-                r = src.read(&mut buf) => r?,
-                _ = cancel.recv() => return Err(anyhow::Error::new(Cancelled)),
-            };
-            if n == 0 {
-                break;
+        let tmp = local.with_extension("rbs-download.tmp");
+        let write = async {
+            let mut dst = std::fs::File::create(&tmp)
+                .with_context(|| format!("创建本地文件失败: {}", tmp.display()))?;
+            let mut buf = vec![0u8; CHUNK_SIZE];
+            loop {
+                let n = tokio::select! {
+                    r = src.read(&mut buf) => r?,
+                    _ = cancel.recv() => return Err(anyhow::Error::new(Cancelled)),
+                };
+                if n == 0 {
+                    break;
+                }
+                // 本地写盘同步执行（同 upload 的取舍）
+                std::io::Write::write_all(&mut dst, &buf[..n])
+                    .with_context(|| format!("写入本地文件失败: {}", tmp.display()))?;
             }
-            // 本地写盘同步执行（同 upload 的取舍）
-            std::io::Write::write_all(&mut dst, &buf[..n])
-                .with_context(|| format!("写入本地文件失败: {}", local.display()))?;
+            std::io::Write::flush(&mut dst)?;
+            Ok(())
+        };
+        match write.await {
+            Ok(()) => {}
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(e);
+            }
         }
-        std::io::Write::flush(&mut dst)?;
+        std::fs::rename(&tmp, local).with_context(|| {
+            format!(
+                "下载完成但改名失败（{} → {}）",
+                tmp.display(),
+                local.display()
+            )
+        })?;
         Ok(())
     }
 
@@ -574,7 +650,7 @@ mod tests {
             },
             transport: Some(crate::models::TransportKind::Russh),
             work_root: None,
-            env: HashMap::new(),
+            env: BTreeMap::new(),
             cred_key: None,
         }
     }
@@ -684,9 +760,15 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(64);
         let log = LogHandle::new(tx, 0);
         let mut lb = LineBuffer::default();
-        lb.pump("hello\r\nwor", Stream::Stdout, &log);
-        lb.pump("ld\n", Stream::Stdout, &log);
-        lb.flush(Stream::Stdout, &log);
+        // 一行中文 + \r\n：故意把多字节字符从中间切开喂入（SSH Data 块的真实
+        // 边界行为）——按字节累积 + 行边界解码，不再落入 OEM 代码页乱码
+        let text = "构建输出 hello\r\nwor";
+        let bytes = text.as_bytes();
+        let split = "构建输".len() - 1; // 切在「输」的 3 字节序列中间
+        lb.pump(&bytes[..split], |line| log.line(Stream::Stdout, line));
+        lb.pump(&bytes[split..], |line| log.line(Stream::Stdout, line));
+        lb.pump(b"ld\n", |line| log.line(Stream::Stdout, line));
+        lb.flush(|line| log.line(Stream::Stdout, line));
         drop(log);
         let mut lines = Vec::new();
         while let Ok(ev) = rx.try_recv() {
@@ -695,6 +777,6 @@ mod tests {
                 _ => {}
             }
         }
-        assert_eq!(lines, vec!["hello", "world"]);
+        assert_eq!(lines, vec!["构建输出 hello", "world"]);
     }
 }

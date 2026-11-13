@@ -14,7 +14,7 @@
 
 use crate::models::Target;
 use chrono::Local;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 /// 内置时间变量：运行启动时生成一次，整个运行期间所有步骤同值
 /// （备份后缀等场景要求同一次发版里各步骤引用一致）。
@@ -46,11 +46,11 @@ impl BuiltinNow {
 #[derive(Debug, Clone, Default)]
 pub struct VarContext {
     /// project.variables[environment] — ${{ variables.X }}
-    pub variables: HashMap<String, String>,
+    pub variables: BTreeMap<String, String>,
     /// 步骤产出 / 全局 env — ${{ env.X }}
-    pub env: HashMap<String, String>,
+    pub env: BTreeMap<String, String>,
     /// ${{ targets.<name>.<field> }}
-    pub targets: HashMap<String, Target>,
+    pub targets: BTreeMap<String, Target>,
     /// 本次运行唯一标识（与日志文件同名）— ${{ run.id }}；None 时占位符原样保留
     pub run_id: Option<String>,
     /// 内置时间变量（引擎构建上下文时生成一次）
@@ -298,12 +298,12 @@ mod tests {
     use crate::models::{Target, TargetType};
 
     fn ctx() -> VarContext {
-        let mut variables = HashMap::new();
+        let mut variables = BTreeMap::new();
         variables.insert("REGISTRY".to_string(), "registry-staging.internal:5000".to_string());
         variables.insert("NAMESPACE".to_string(), "staging".to_string());
-        let mut env = HashMap::new();
+        let mut env = BTreeMap::new();
         env.insert("VERSION".to_string(), "1.0.0".to_string());
-        let mut targets = HashMap::new();
+        let mut targets = BTreeMap::new();
         targets.insert(
             "prod".to_string(),
             Target {
@@ -317,7 +317,7 @@ mod tests {
             },
             transport: None,
             work_root: Some("/opt/builds".to_string()),
-            env: HashMap::new(),
+            env: BTreeMap::new(),
             cred_key: None,
         },
         );

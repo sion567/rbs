@@ -241,16 +241,33 @@ fn ps_command(script: &str) -> Command {
 fn run_powershell(mut cmd: Command) -> Result<()> {
     cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd.spawn().context("启动 PowerShell 失败")?;
+    // stdout/stderr 各起一线排空（putty probe 同款模式）：此前只在进程退出后
+    // 读 stderr——子进程往管道写满 64KB 会阻塞，try_wait 永远 None，
+    // 表面是"15s 超时"，实际 webhook 根本没发完
+    let mut stdout = child.stdout.take();
+    let mut stderr = child.stderr.take();
+    let out_thread = std::thread::spawn(move || {
+        if let Some(r) = stdout.as_mut() {
+            use std::io::Read as _;
+            let mut sink = String::new();
+            let _ = r.read_to_string(&mut sink);
+        }
+    });
+    let err_thread = std::thread::spawn(move || {
+        let mut err = String::new();
+        if let Some(r) = stderr.as_mut() {
+            use std::io::Read as _;
+            let _ = r.read_to_string(&mut err);
+        }
+        err
+    });
     let start = Instant::now();
     loop {
         match child.try_wait()? {
             Some(status) => {
-                // 进程已退出，管道不会再写入，此刻读干净即可
-                let mut err = String::new();
-                if let Some(mut se) = child.stderr.take() {
-                    use std::io::Read as _;
-                    let _ = se.read_to_string(&mut err);
-                }
+                // 进程已退出，排空线程读到管道尾部后自然结束
+                let err = err_thread.join().unwrap_or_default();
+                let _ = out_thread.join();
                 if !status.success() {
                     // PS 异常的第一行是异常本体（如 Invoke-RestMethod : 404），
                     // 后续是 At line / CategoryInfo 噪音

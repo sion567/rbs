@@ -7,7 +7,7 @@
 
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// yaml_serde（serde_yaml 后继，YAML 官方组织维护）对 derive 枚举会输出 YAML tag（如 `!exec`），而文档约定 YAML 使用
 /// 纯字符串值（`step_type: exec`）。此宏生成与 `#[serde(rename_all = "kebab-case")]`
@@ -55,6 +55,12 @@ macro_rules! kebab_string_enum {
 // Project（§3.1）
 // ---------------------------------------------------------------------------
 
+/// YAML 序列化顺序敏感的 map 统一用 BTreeMap（按键排序）：
+/// HashMap 每次保存键序随机——project.yaml 跨会话首存必重排（git diff 噪声）、
+/// sqlite config_snapshot 不稳定、变量表/目标表 UI 显示顺序随机。
+/// HashMap 仅保留给非序列化的内部传输结构（如 StepResult.output_vars）。
+pub type YamlMap<V> = BTreeMap<String, V>;
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct Project {
@@ -69,23 +75,23 @@ pub struct Project {
     /// 本地代码目录（UI 输入框绑定）
     pub local_path: String,
     /// 环境 → 变量表
-    pub variables: HashMap<String, EnvironmentVariables>,
+    pub variables: YamlMap<EnvironmentVariables>,
     /// 项目级工具覆盖：键相同整体覆盖全局 tools.yaml 条目。
     /// 用于 pnpm/yarn 等工程内工具链的按项目固定（§6.5），如
     /// tools: { pnpm: { command: D:/tools/pnpm/pnpm.cmd, tool_type: custom } }
     #[serde(default)]
-    pub tools: HashMap<String, Tool>,
+    pub tools: YamlMap<Tool>,
     /// 关联的 job 文件名列表
     pub jobs: Vec<String>,
     /// 项目级目标定义（键 = 目标名）：不同项目的 prod 可以是不同服务器。
     /// 与全局 targets.yaml 合并时项目同名覆盖全局（§3.5）。
     #[serde(default)]
-    pub targets: HashMap<String, Target>,
+    pub targets: YamlMap<Target>,
     /// 工具版本要求（mise 风格）：键 = tools.yaml / 项目级 tools 的工具名，
     /// 值 = 要求形态（">=21" / "22" 前缀匹配 22.x / "22.1.3"）。
     /// 运行前与 tools.yaml 探测到的 version 对比，偏差零步失败；预览显示偏差。
     #[serde(default)]
-    pub tools_require: HashMap<String, String>,
+    pub tools_require: YamlMap<String>,
     /// 流程分组（项目树展示用）：分组只是名字列表，流程通过自身的
     /// `group` 字段归属；引用了列表外分组名的流程会动态显示为该组。
     /// 空分组因此可以持久存在（先建组、后往里加任务）。
@@ -98,7 +104,7 @@ pub struct EnvironmentVariables {
     /// v0.4 §3.1：flatten 使 YAML 中直接展开键值对（没有 vars 包装层），
     /// 与 project.yaml 的 variables: staging: {REGISTRY: ...} 结构一一对应。
     #[serde(flatten)]
-    pub vars: HashMap<String, String>,
+    pub vars: YamlMap<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -173,7 +179,7 @@ kebab_string_enum!(FailureAction {
 // Step（§3.3）
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Step {
     pub name: Option<String>,
@@ -182,6 +188,10 @@ pub struct Step {
     /// 自由输入，支持多行
     pub command: String,
     pub step_type: StepType,
+    /// 手写 YAML 漏写 enabled: 时默认**启用**（GHA/Ansible 语义）——
+    /// 缺省 false 会让步骤静默跳过，只能靠预览/控制台的"未启用"提示发现。
+    /// Default 实现与 serde 同口径（enabled: true）
+    #[serde(default = "default_true")]
     pub enabled: bool,
     pub continue_on_error: bool,
     /// 单步超时（秒）：不填 = 全局 default_timeout（config.yaml，缺省 600）；
@@ -191,13 +201,13 @@ pub struct Step {
     /// 相对 project.local_path 的子目录
     pub working_dir: Option<String>,
     /// 步骤级额外环境变量
-    pub env: HashMap<String, String>,
+    pub env: YamlMap<String>,
     /// 凭据注入（TODO「第三方工具管理 · 方案 B」）：环境变量名 → Credential Manager 键。
     /// 运行时从凭据管理器取密码注入子进程 env——密码不进命令行、不落 YAML。
     /// 例：MYSQL_PWD → db/prod-mysql（先 `remote-build set-password db/prod-mysql <密码>` 保存）。
     /// 凭据键支持 ${{ }} 变量替换；键未存储 → 本步失败并给保存指引。
     #[serde(default)]
-    pub secret_env: HashMap<String, String>,
+    pub secret_env: YamlMap<String>,
     /// 条件执行（Ansible when 语义；YAML 可写 when: 或 condition:，二者等价）。
     /// 例：${{ variables.ENV }} == prod / ${{ env.VERSION != '' }}
     #[serde(alias = "when")]
@@ -217,7 +227,7 @@ pub struct Step {
     /// 后续步骤用 ${{ env.<键> }} 引用（与 .env 约定同一命名空间）。
     /// 例：outputs: { VERSION: 'VERSION=(\S+)' } ← echo VERSION=1.2.0
     #[serde(default)]
-    pub outputs: HashMap<String, String>,
+    pub outputs: YamlMap<String>,
     /// 通知的 handler 名（Ansible notify）：本步骤实际产生变更（上传了新内容 /
     /// 命令真的执行，creates / when / enabled 跳过不算）时登记，job 成功结束后
     /// 按定义顺序执行对应 handlers。例：notify: [重启服务]
@@ -225,6 +235,37 @@ pub struct Step {
     pub notify: Vec<String>,
     /// step_type=wait 的探测模式（None = 沿用旧行为：轮询执行 step.command）
     pub wait: Option<WaitProbe>,
+}
+
+impl Default for Step {
+    fn default() -> Self {
+        // 与 serde 缺字段口径一致：enabled 缺省启用（见字段注释）
+        Self {
+            name: None,
+            tool: String::new(),
+            command: String::new(),
+            step_type: StepType::default(),
+            enabled: true,
+            continue_on_error: false,
+            timeout: None,
+            retry: None,
+            working_dir: None,
+            env: YamlMap::new(),
+            secret_env: YamlMap::new(),
+            condition: None,
+            creates: None,
+            k8s_watch: None,
+            target: None,
+            outputs: YamlMap::new(),
+            notify: Vec::new(),
+            wait: None,
+        }
+    }
+}
+
+/// serde 缺字段时的 enabled 值（Default 同口径）
+fn default_true() -> bool {
+    true
 }
 
 /// wait 步骤探测模式（Docker Compose healthcheck / Ansible wait_for 同款三模式）
@@ -315,7 +356,7 @@ pub struct Tool {
     /// 首次启动时从哪个环境变量探测到
     pub detected_from: Option<String>,
     /// 工具级环境变量（如 JAVA_HOME）
-    pub env: HashMap<String, String>,
+    pub env: YamlMap<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -340,7 +381,7 @@ kebab_string_enum!(ToolType {
 /// tools.yaml 的文件根结构
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ToolsFile {
-    pub tools: HashMap<String, Tool>,
+    pub tools: YamlMap<Tool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -358,7 +399,7 @@ pub struct Target {
     pub transport: Option<TransportKind>,
     /// 远端工作目录
     pub work_root: Option<String>,
-    pub env: HashMap<String, String>,
+    pub env: YamlMap<String>,
     /// 凭据管理器的键（运行时按作用域回填：{项目}/{目标} 或 global/{目标}），不序列化
     #[serde(skip)]
     pub cred_key: Option<String>,
@@ -786,17 +827,9 @@ kebab_string_enum!(Theme {
 });
 
 // ---------------------------------------------------------------------------
-// 变量文件（§3.7，P1 使用）
+// 变量文件（§3.7）：全局 variables.yaml 兜底方案已废弃（曾有的 VariablesFile
+// 结构零引用已删）——变量组只存在于 project.yaml 的 variables: 段
 // ---------------------------------------------------------------------------
-
-/// P1 变量文件结构（当前仅全局 variables.yaml 兜底用）
-#[allow(dead_code)]
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct VariablesFile {
-    pub environments: HashMap<String, HashMap<String, String>>,
-    /// secrets 加密存储路径
-    pub secrets: Option<String>,
-}
 
 // ---------------------------------------------------------------------------
 // 日志事件与状态（§4.2 / §4.4）——仅进程内 mpsc 传输，不序列化到 YAML
@@ -887,6 +920,9 @@ pub enum JobStatus {
 impl JobStatus {
     /// 前置检查失败的 step_index 占位（不对应任何真实步骤）
     pub const PRECONDITION_STEP: usize = usize::MAX;
+    /// handler 失败的 step_index 占位：handlers 不在主流程步骤序列里，
+    /// 报 handler_base+hi 会给出一个不存在的"Step N"；失败原因自带 handler 名
+    pub const HANDLER_STEP: usize = usize::MAX - 1;
 
     pub fn short(&self) -> String {
         match self {
@@ -903,6 +939,9 @@ impl JobStatus {
             JobStatus::Failed { step_index, reason } => {
                 if *step_index == Self::PRECONDITION_STEP {
                     format!("failed (precondition: {reason})")
+                } else if *step_index == Self::HANDLER_STEP {
+                    // reason 已含 handler 名，不再拼步骤号
+                    format!("failed ({reason})")
                 } else {
                     // 对外展示统一 1 起始（与 StepStart/StepEnd 事件一致）
                     format!("failed (step {}: {})", step_index + 1, reason)
@@ -1283,5 +1322,42 @@ targets:
         assert_eq!(JobStatus::Cancelled.short(), "cancelled");
         assert_eq!(JobStatus::Timeout.short(), "timeout");
         assert!(JobStatus::Success.short().starts_with("success"));
+    }
+
+    /// 手写 YAML 漏写 enabled: → 默认启用（GHA/Ansible 语义）；显式 false 照旧禁用
+    #[test]
+    fn step_enabled_defaults_to_true_when_missing() {
+        let step: Step = yaml_serde::from_str("command: echo x").unwrap();
+        assert!(step.enabled, "漏写 enabled 应默认启用（此前缺省 false 静默跳过）");
+        let step: Step = yaml_serde::from_str("command: echo x\nenabled: false").unwrap();
+        assert!(!step.enabled, "显式 false 必须保留");
+    }
+
+    /// yaml 可见 map 字段按键排序输出：跨会话保存的 project.yaml 不再随机重排
+    #[test]
+    fn yaml_map_fields_serialize_sorted() {
+        let mut p = Project::default();
+        p.variables.insert(
+            "prod".to_string(),
+            EnvironmentVariables {
+                vars: [("B".to_string(), "2".to_string()), ("A".to_string(), "1".to_string())]
+                    .into_iter()
+                    .collect(),
+            },
+        );
+        let text = yaml_serde::to_string(&p).unwrap();
+        let a = text.find("A:").expect("A 键应序列化");
+        let b = text.find("B:").expect("B 键应序列化");
+        assert!(a < b, "BTreeMap 字段应按键排序输出: {text}");
+    }
+
+    /// handler 失败的 step_index 哨兵：short() 不再编造不存在的"Step N"
+    #[test]
+    fn handler_failure_reports_handler_not_step_number() {
+        let st = JobStatus::Failed {
+            step_index: JobStatus::HANDLER_STEP,
+            reason: "handler「重启服务」失败: 退出码 1".to_string(),
+        };
+        assert_eq!(st.short(), "failed (handler「重启服务」失败: 退出码 1)");
     }
 }

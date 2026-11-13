@@ -9,7 +9,6 @@ mod config;
 mod engine;
 mod env_detect;
 mod group;
-mod k8s;
 mod logging;
 mod models;
 mod notify;

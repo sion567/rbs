@@ -12,7 +12,7 @@
 use super::{connect_and_auth, probe_server_russh, run_remote_command, RusshTransport};
 use crate::models::{AuthMethod, Target, TargetType, TransportKind};
 use crate::transport::RemoteTransport;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -440,7 +440,7 @@ fn target_for(port: u16, host_key: Option<String>, password: bool) -> Target {
         },
         transport: Some(TransportKind::Russh),
         work_root: None,
-        env: HashMap::new(),
+        env: BTreeMap::new(),
         cred_key: Some(cred_key()),
     }
 }
@@ -499,12 +499,14 @@ async fn russh_transport_end_to_end() {
     let (tx, mut rx) = mpsc::channel(64);
     let log = crate::transport::LogHandle::new(tx, 0);
     let (_ctx, mut cancel) = tokio::sync::broadcast::channel(1);
+    // log = Some：stdout 逐行走 LogHandle（exec 步骤的捕获缓冲），
+    // 返回值不再整流收集 stdout（此前白占内存，见 run_remote_command 文档）
     let (out, code) =
         run_remote_command(&mut conn.handle, "echo hello-russh", Some(&log), &mut cancel)
             .await
             .expect("exec 成功");
     assert_eq!(code, 0);
-    assert_eq!(out, "E2E:echo hello-russh\n");
+    assert_eq!(out, "", "log = Some 时 stdout 只走事件流，不收集返回");
     drop(log);
     let mut stdout_lines = Vec::new();
     while let Ok(ev) = rx.try_recv() {
@@ -513,6 +515,14 @@ async fn russh_transport_end_to_end() {
         }
     }
     assert_eq!(stdout_lines, vec!["E2E:echo hello-russh"]);
+
+    // log = None（内部命令）：stdout 走返回值（sha256 批量 / probe 的路径）
+    let (out2, code) =
+        run_remote_command(&mut conn.handle, "echo hello-russh", None, &mut cancel)
+            .await
+            .expect("exec 成功");
+    assert_eq!(code, 0);
+    assert_eq!(out2, "E2E:echo hello-russh\n");
 
     // 失败退出码透传（引擎据判定步骤失败）
     let (_o, code) = run_remote_command(&mut conn.handle, "test -e '/no/such/file'", None, &mut cancel)

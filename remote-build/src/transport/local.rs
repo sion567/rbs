@@ -6,7 +6,7 @@
 use super::{ExitStatus, LogHandle, RemoteTransport, Stream};
 use crate::models::Target;
 use async_trait::async_trait;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use tokio::io::AsyncBufReadExt;
 use tokio::process::Command;
@@ -21,12 +21,15 @@ impl RemoteTransport for LocalTransport {
         _target: &Target,
         command: &str,
         working_dir: &str,
-        env: &HashMap<String, String>,
+        env: &BTreeMap<String, String>,
         log: &LogHandle,
         cancel: &mut broadcast::Receiver<()>,
     ) -> anyhow::Result<ExitStatus> {
         let mut cmd = Command::new("cmd");
-        cmd.arg("/C").arg(command);
+        // raw_arg 原样拼接：arg() 会按 MSVCRT 规则给含空格/引号的参数加引号并
+        // 把内部引号转义成 \"，cmd.exe 不认这种转义——`git commit -m "fix bug"`
+        // 这类含引号命令会被拆错参数。/C 后面由 cmd 按自己的规则解析整段
+        cmd.raw_arg("/C").raw_arg(command);
         if !working_dir.is_empty() {
             let dir = PathBuf::from(working_dir);
             if !dir.exists() {

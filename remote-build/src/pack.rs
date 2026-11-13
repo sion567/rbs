@@ -67,17 +67,69 @@ pub fn pack(src: &Path, dst: &Path, excludes: &[String]) -> Result<(usize, u64)>
         }
     };
     let files = collect_files(&src, excludes)?;
+    // 排除目标自身与 pack 的 .tmp：目标落在源目录里（`dist\. -> dist\app.tar.gz`
+    // 是合法用法）时，上一轮运行留下的旧包在收集时已存在——不清掉就滚进新包，
+    // 反复打包体积指数增长（真机实测 40G 的根源）。
+    // "清单先收集完再写包"只防得住本次正在写的包（此刻尚不存在）。
+    let dst_str = std::fs::canonicalize(dst)
+        .unwrap_or_else(|_| std::path::absolute(dst).unwrap_or_else(|_| dst.to_path_buf()))
+        .to_string_lossy()
+        .to_ascii_lowercase();
+    let files: Vec<PathBuf> = files
+        .into_iter()
+        .filter(|p| {
+            let p_str = std::fs::canonicalize(p)
+                .unwrap_or_else(|_| std::path::absolute(p).unwrap_or_else(|_| p.clone()))
+                .to_string_lossy()
+                .to_ascii_lowercase();
+            if p_str == dst_str {
+                return false;
+            }
+            // pack 自己的 tmp：`<dst去扩展名>.rbs-pack.<pid>.tmp`（含上次崩溃残留）
+            !(p_str.ends_with(".tmp") && p_str.contains(".rbs-pack."))
+        })
+        .collect();
     if let Some(parent) = dst.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("创建目录失败: {}", parent.display()))?;
         }
     }
+    // 条目重名检测：通配源（如 target/*/*.jar）跨目录同名时 zip/tar 会写
+    // 两个同名条目，解包后只剩最后一个——静默内容丢失。目录源天然唯一
+    let mut seen_names = std::collections::HashSet::new();
+    for path in &files {
+        let name = entry_name_for(&src, path, no_root)?;
+        if !seen_names.insert(name.clone()) {
+            anyhow::bail!(
+                "打包条目重名（通配源跨目录同名）：{name} ——请改用目录源或用 excludes 收窄"
+            );
+        }
+    }
 
-    match dst_format(dst) {
-        Some(ArchiveFormat::Zip) => write_zip(dst, &src, &files, no_root),
-        Some(ArchiveFormat::TarGz) => write_tar_gz(dst, &src, &files, no_root),
+    // 先写 .tmp 再改名：中途失败（磁盘满 / 文件被占）不留残缺包在目标路径——
+    // 否则 creates 守卫会永久跳过重打，上传 sha256 校验还会把残包"校验通过"
+    let tmp = dst.with_extension(format!("rbs-pack.{}.tmp", std::process::id()));
+    let result = match dst_format(dst) {
+        Some(ArchiveFormat::Zip) => write_zip(&tmp, &src, &files, no_root),
+        Some(ArchiveFormat::TarGz) => write_tar_gz(&tmp, &src, &files, no_root),
         None => anyhow::bail!("pack 目标必须是 .zip / .tar.gz / .tgz 文件: {}", dst.display()),
+    };
+    match result {
+        Ok((count, bytes)) => {
+            std::fs::rename(&tmp, dst).with_context(|| {
+                format!(
+                    "打包完成但改名失败（{} → {}）",
+                    tmp.display(),
+                    dst.display()
+                )
+            })?;
+            Ok((count, bytes))
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
     }
 }
 
@@ -470,6 +522,74 @@ mod tests {
         let dst = ws.join("out/rooted.zip");
         pack(&ws.join("src"), &dst, &[]).unwrap();
         assert!(names(&dst).contains(&"src/a.txt".to_string()));
+
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    /// 失败不留残包：写包先 .tmp 再改名（此前直接写目标——磁盘满/被占留下的
+    /// 残缺包会被 creates 守卫永久跳过、上传 sha256 校验还会误判一致）
+    #[test]
+    fn pack_failure_leaves_no_partial_archive() {
+        let ws = make_ws("tmprename");
+        let dst = ws.join("out.zip");
+
+        // 源不存在 → 收集阶段失败，目标与 tmp 都不出现
+        assert!(pack(&ws.join("missing"), &dst, &[]).is_err());
+        assert!(!dst.exists());
+
+        // 成功：dst 存在、无 tmp 残留
+        let src = ws.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("a.txt"), "a").unwrap();
+        pack(&src, &dst, &[]).unwrap();
+        assert!(dst.exists());
+        let leftovers: Vec<String> = std::fs::read_dir(&ws)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.contains(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "不应有 tmp 残留: {leftovers:?}");
+
+        // 通配源跨目录同名条目 → 报错（zip 双同名条目解包后静默丢内容）
+        let g1 = ws.join("g1");
+        let g2 = ws.join("g2");
+        std::fs::create_dir_all(&g1).unwrap();
+        std::fs::create_dir_all(&g2).unwrap();
+        std::fs::write(g1.join("x.jar"), "1").unwrap();
+        std::fs::write(g2.join("x.jar"), "2").unwrap();
+        let dup = ws.join("dup.zip");
+        assert!(
+            pack(&ws.join("g*/*.jar"), &dup, &[]).is_err(),
+            "跨目录同名条目应报错"
+        );
+        assert!(!dup.exists(), "重名报错时不应写出包");
+
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    /// dst 在源目录内：连续打包不再吞上一轮的旧包（40G 指数增长的根源）。
+    /// 此前"清单先收集再写包"只防得住本次正在写的包，防不住上次留下的
+    #[test]
+    fn pack_dst_inside_src_does_not_swallow_previous_archive() {
+        let ws = make_ws("selfswallow");
+        let src = ws.join("dist");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("app.js"), "console.log(1)").unwrap();
+        let dst = ws.join("dist").join("dist.zip");
+
+        let (count1, size1) = pack(&ws.join("dist/."), &dst, &[]).unwrap();
+        assert_eq!(count1, 1, "首包只含 app.js，不含本次正在写的包");
+
+        // 第二轮：旧包已存在源目录里 → 必须被排除，不滚进新包
+        let (count2, size2) = pack(&ws.join("dist/."), &dst, &[]).unwrap();
+        assert_eq!(count2, 1, "第二轮不应把上一轮的包吞进去");
+        assert_eq!(size1, size2, "内容不变时两轮包大小应一致（不再指数增长）");
+        let n = names(&dst);
+        assert!(
+            !n.iter().any(|e| e.contains("dist.zip")),
+            "包内不应有旧包条目: {n:?}"
+        );
 
         let _ = std::fs::remove_dir_all(&ws);
     }

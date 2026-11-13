@@ -9,7 +9,7 @@
 use crate::engine::{Engine, RunInput};
 use crate::models::{Job, JobStatus, LogEvent, Project, Tool};
 use async_trait::async_trait;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use tokio::sync::broadcast;
 
 /// 组内一个待执行流程（顺序 = 项目树顺序，即 jobs 列表过滤后的相对顺序）。
@@ -27,7 +27,7 @@ pub struct GroupSpec {
     /// 标签：单工程组运行 = 分组名；跨工程项目运行 = 「项目·链」标签（进状态行/边界事件）
     pub group: String,
     pub jobs: Vec<GroupJob>,
-    pub tools: HashMap<String, Tool>,
+    pub tools: BTreeMap<String, Tool>,
     pub default_step_timeout: u64,
     /// 组运行唯一标识（{项目}-grp-时间戳）：成员流程 run_id = {group_id}-{序号}，
     /// 历史里同前缀 = 同一次组发布
@@ -151,9 +151,12 @@ pub async fn run_group_serial(spec: GroupSpec, sink: &dyn GroupSink) -> GroupOut
         } else {
             None
         };
+        // BufWriter：日志行不再逐行一次 write 系统调用（同 app.rs 转发任务）
         let mut file = spec.log_dir.as_ref().and_then(|d| {
             let _ = std::fs::create_dir_all(d);
-            std::fs::File::create(d.join(format!("{run_id}.log"))).ok()
+            std::fs::File::create(d.join(format!("{run_id}.log")))
+                .ok()
+                .map(std::io::BufWriter::new)
         });
 
         let (tok_tx, mut tok_rx) = tokio::sync::mpsc::channel(8192);
@@ -191,6 +194,11 @@ pub async fn run_group_serial(spec: GroupSpec, sink: &dyn GroupSink) -> GroupOut
                 }
             }
             sink.on_event(ev).await;
+        }
+        // 该流程事件流收尾：BufWriter 缓冲落盘（每个流程一个日志文件）
+        if let Some(f) = file.as_mut() {
+            use std::io::Write as _;
+            let _ = f.flush();
         }
         let status = handle.await.unwrap_or(JobStatus::Failed {
             step_index: 0,
@@ -246,7 +254,7 @@ pub async fn run_group_serial(spec: GroupSpec, sink: &dyn GroupSink) -> GroupOut
 /// GUI 确认门窗口与 CLI run-group 共用；续跑场景传 `&jobs[from..]` 只展剩余。
 pub fn plan_lines(
     jobs: &[GroupJob],
-    tools: &HashMap<String, Tool>,
+    tools: &BTreeMap<String, Tool>,
     default_step_timeout: u64,
 ) -> Vec<String> {
     let total = jobs.len();

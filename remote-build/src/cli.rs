@@ -3,6 +3,8 @@
 //! - `remote-build set-password <目标名> <密码>`  写入 Windows Credential Manager
 //! - `remote-build test-conn <目标名>`            SSH 连接测试
 //! - `remote-build run <项目名> <流程名>`         无头执行一条流程（控制台实时输出）
+//! - `remote-build run-group <项目名> <组名>`     组运行（串行·失败即停，--from 续跑）
+//! - `remote-build preview <项目名> <流程名>`     干跑预览（不执行任何命令）
 //! - `remote-build regen-example`                 重新生成示范工程 example（当参考文档用）
 //!
 //! 便于脚本化与 CI 使用；GUI 功能与 CLI 共用同一套引擎/配置。

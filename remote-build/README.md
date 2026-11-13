@@ -1,9 +1,9 @@
 # Remote Build System
 
 Windows 桌面构建部署工具，覆盖"下载 → 编译 → 打包 → 上传 → 部署"链路。
-架构设计见 `../docs/RemoteBuildSystem架构设计文档_v0.4.md`；变量语法速查见 `../docs/变量速查.md`，
+架构设计见 `../docs/RemoteBuildSystem架构设计文档_v0.5.md`；变量语法速查见 `../docs/变量速查.md`，
 常用命令与工具速查（Linux / Windows cmd / Maven / Gradle / Docker / kubectl / MySQL 等，实例 + 参数）见
-`../docs/命令速查.md`（GUI 工具栏有「？ 变量语法」「？ 命令速查」两个速查窗口，与文档同源）；
+`../docs/命令速查.md`（GUI 工具栏「？ 帮助」一窗两 tab：命令速查 / 变量语法，与文档同源）；
 功能路线与完成情况见 `../docs/TODO.md`。
 
 ## 构建与运行
@@ -24,6 +24,7 @@ remote-build run <项目名> <流程名> [--yes]       # 无头执行（--yes �
 remote-build run-group <项目名> <组名> [--yes] [--from <流程名>]
                                                 # 组运行：组内流程串行·失败即停（--from 从指定流程续跑）
 remote-build preview <项目名> <流程名>           # 干跑预览：解析后的命令 / 上传清单 / 将跳过的步骤
+remote-build regen-example                       # 重新生成示范工程（projects/example 五本合集）
 ```
 
 ## 步骤类型（step_type）

@@ -6,7 +6,7 @@
 use crate::models::*;
 use crate::transport::{self, LogHandle, RemoteTransport};
 use crate::variables::{eval_condition, resolve, VarContext};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -25,9 +25,9 @@ pub const DEFAULT_STEP_TIMEOUT: u64 = 300;
 pub struct RunInput {
     pub project: Project,
     pub job: Job,
-    pub tools: HashMap<String, Tool>,
+    pub tools: BTreeMap<String, Tool>,
     /// 全部 targets（供 ${{ targets.x.y }} 解析）
-    pub all_targets: HashMap<String, Target>,
+    pub all_targets: BTreeMap<String, Target>,
     /// 从第几步开始执行（0 起；默认 0 = 全部）。
     /// 注意：跳过的前面步骤其产出变量（workspace/.env 约定）不可用。
     pub from_step: usize,
@@ -105,6 +105,12 @@ impl Engine {
 
         let mut attempt = 0;
         let mut first_rx = Some(cancel_rx);
+        // 跨尝试保留的状态（修复：此前每次尝试都在 run_job_inner 里重建——
+        // 第 1 次尝试上传新 jar 并登记 notify，第 2 次尝试 sha256 命中跳过上传
+        // → changed=false → handlers 整块跳过 → 全程绿灯但重启从未执行；
+        // handler 自身失败同理被重试"洗白"。outputs 捕获同理跨尝试丢失）
+        let mut notified: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut carried_outputs: BTreeMap<String, String> = BTreeMap::new();
         loop {
             attempt += 1;
             // 首次用调用方给的 receiver；重试从 cancel_tx 重新订阅（receiver 已被上次消费）
@@ -116,7 +122,15 @@ impl Engine {
                     .unwrap_or_else(detached_cancel_rx)
             });
 
-            let status = self.run_job_inner(input.clone(), rx, log_tx.clone()).await;
+            let status = self
+                .run_job_inner(
+                    input.clone(),
+                    rx,
+                    log_tx.clone(),
+                    &mut notified,
+                    &mut carried_outputs,
+                )
+                .await;
 
             let retriable = matches!(&status, JobStatus::Failed { .. })
                 && input.job.on_failure == FailureAction::Retry;
@@ -158,11 +172,16 @@ impl Engine {
         input: RunInput,
         mut cancel_rx: broadcast::Receiver<()>,
         log_tx: mpsc::Sender<LogEvent>,
+        notified: &mut std::collections::HashSet<String>,
+        carried_outputs: &mut BTreeMap<String, String>,
     ) -> JobStatus {
         // JobEnd 事件由外层包装任务统一发送（见 app.rs），引擎只返回最终状态
 
         // ── 解析变量（§4.3 第一步）────────────────────────────────────────
         let mut ctx = build_var_context(&input);
+        // 重试场景：上次尝试已捕获的 outputs 先并入 env（下游步骤对
+        // creates 跳过的产出步骤仍能引用 ${{ env.X }}）
+        ctx.env.extend(carried_outputs.clone());
 
         // 工作目录解析（§4.5；working_dir 支持变量替换，与命令同一批占位符）
         let workspace = PathBuf::from(&input.project.local_path);
@@ -385,8 +404,8 @@ impl Engine {
                 .await;
         }
 
-        // notify 登记（Ansible handlers 语义）：变更步骤 → 待执行 handler 名
-        let mut notified: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // notify 登记（Ansible handlers 语义）：变更步骤 → 待执行 handler 名。
+        // notified 由 run_job 持有、跨重试尝试累积（见外层注释）
         // GHA 黄灯：continue_on_error / on_failure=continue 跳过的失败步骤
         let mut failed_skipped: Vec<usize> = Vec::new();
 
@@ -452,10 +471,19 @@ impl Engine {
             .await;
 
             match result {
-                StepResult::Success { exit_code, duration_ms, changed, .. } => {
+                StepResult::Success {
+                    exit_code,
+                    duration_ms,
+                    changed,
+                    output_vars,
+                    ..
+                } => {
                     let _ = log_tx
                         .send(LogEvent::StepEnd { step_index: index, exit_code, duration_ms })
                         .await;
+                    // outputs 跨尝试保留：本次捕获并入 carried_outputs，
+                    // 重试时由 run_job_inner 开头 seed 回 ctx.env
+                    carried_outputs.extend(output_vars);
                     // notify 登记（Ansible 语义）：只有实际产生变更的步骤才触发 handler
                     if changed {
                         for name in &step.notify {
@@ -563,12 +591,31 @@ impl Engine {
                         let _ = log_tx
                             .send(LogEvent::StepEnd { step_index: index, exit_code, duration_ms })
                             .await;
+                        // step_index 用 HANDLER_STEP 哨兵：handler 不在主流程序列里，
+                        // 报 handler_base+hi 会给出一个不存在的"Step N"（reason 自带名字）
                         return JobStatus::Failed {
-                            step_index: index,
+                            step_index: JobStatus::HANDLER_STEP,
                             reason: format!("handler「{hname}」失败: {reason}"),
                         };
                     }
                 }
+            }
+            // notify 引用了不存在的 handler 定义：静默丢弃会让人以为通知已生效
+            let defined: std::collections::HashSet<&str> = input
+                .job
+                .handlers
+                .iter()
+                .filter_map(|h| h.name.as_deref().map(str::trim))
+                .filter(|s| !s.is_empty())
+                .collect();
+            for name in notified.iter().filter(|n| !defined.contains(n.as_str())) {
+                let _ = log_tx
+                    .send(LogEvent::Error {
+                        message: format!(
+                            "⚠ notify 引用的 handler「{name}」没有定义（handlers 里无同名条目），不会执行"
+                        ),
+                    })
+                    .await;
             }
         }
 
@@ -591,7 +638,7 @@ impl Engine {
 #[allow(clippy::too_many_arguments)]
 async fn run_single_step(
     input: &RunInput,
-    merged_tools: &HashMap<String, Tool>,
+    merged_tools: &BTreeMap<String, Tool>,
     pinned_frontend: bool,
     corepack_ok: bool,
     workspace: &Path,
@@ -780,7 +827,7 @@ async fn run_single_step(
             });
 
             // §6.1 优先级：步骤级 env > 工具 env > target env
-            let mut env_map: HashMap<String, String> = eff_target
+            let mut env_map: BTreeMap<String, String> = eff_target
                 .as_ref()
                 .map(|t| t.env.clone())
                 .unwrap_or_default();
@@ -904,7 +951,7 @@ async fn run_single_step(
 // ---------------------------------------------------------------------------
 
 pub(crate) fn build_var_context(input: &RunInput) -> VarContext {
-    let mut variables = HashMap::new();
+    let mut variables = BTreeMap::new();
     if let Some(env_name) = &input.job.environment {
         if let Some(evs) = input.project.variables.get(env_name) {
             variables.extend(evs.vars.clone());
@@ -912,7 +959,7 @@ pub(crate) fn build_var_context(input: &RunInput) -> VarContext {
     }
     VarContext {
         variables,
-        env: HashMap::new(),
+        env: BTreeMap::new(),
         targets: input.all_targets.clone(),
         run_id: (!input.run_id.is_empty()).then(|| input.run_id.clone()),
         // 内置时间变量在此冻结：一次运行所有步骤同值（备份后缀等场景）
@@ -946,7 +993,7 @@ async fn run_step_with_retry(
     command: &str,
     local_wd: &Path,
     remote_dir: &str,
-    env_map: &HashMap<String, String>,
+    env_map: &BTreeMap<String, String>,
     workspace: &Path,
     step_timeout: Option<Duration>,
     job_deadline: Option<tokio::time::Instant>,
@@ -1001,7 +1048,35 @@ async fn run_step_with_retry(
                     let remaining = dl.saturating_duration_since(tokio::time::Instant::now());
                     match tokio::time::timeout(remaining, fut).await {
                         Ok(inner) => inner,
-                        Err(_) => return StepResult::Timeout,
+                        Err(_) => {
+                            // 此前超时完全静默（日志只见 StepStart 没有下文）——
+                            // 说明哪一步、按哪个死限掐的（步骤级 / 作业级取更早者）
+                            let fired_job = match (step_deadline, job_deadline) {
+                                (Some(d), Some(jd)) => jd <= d,
+                                (Some(_), None) => false,
+                                (None, Some(_)) => true,
+                                (None, None) => false,
+                            };
+                            let source = if fired_job {
+                                "作业级总超时（job.timeout）".to_string()
+                            } else {
+                                format!(
+                                    "步骤级超时（timeout = {}s）",
+                                    step_timeout.map(|d| d.as_secs()).unwrap_or(0)
+                                )
+                            };
+                            let _ = log_tx
+                                .send(LogEvent::Error {
+                                    message: format!(
+                                        "⏱ 步骤 {}「{}」超时：{}；流程按超时终态收尾",
+                                        index + 1,
+                                        step.name.as_deref().unwrap_or("未命名"),
+                                        source
+                                    ),
+                                })
+                                .await;
+                            return StepResult::Timeout;
+                        }
                     }
                 }
                 None => fut.await,
@@ -1052,7 +1127,7 @@ async fn execute_step(
     command: &str,
     local_wd: &Path,
     remote_dir: &str,
-    env_map: &HashMap<String, String>,
+    env_map: &BTreeMap<String, String>,
     workspace: &Path,
     wait: Option<&WaitProbe>,
     log: &LogHandle,
@@ -1281,14 +1356,24 @@ async fn probe_http(url: &str) -> anyhow::Result<bool> {
 /// step outputs：每个键对 stdout 取首个正则匹配（有捕获组取组 1，无则整行匹配）。
 /// 未匹配的键留空并告警（GHA：未声明的输出 = 空）。
 fn apply_step_outputs(
-    outputs: &HashMap<String, String>,
+    outputs: &BTreeMap<String, String>,
     stdout: &str,
     log: &LogHandle,
 ) -> HashMap<String, String> {
     let mut out = HashMap::new();
     for (key, pattern) in outputs {
-        let value = regex::Regex::new(pattern)
-            .ok()
+        // 编译失败与"没匹配到"分开报：写错正则不该伪装成输出格式变化
+        let compiled = match regex::Regex::new(pattern) {
+            Ok(re) => Some(re),
+            Err(e) => {
+                log.line(
+                    transport::Stream::Stderr,
+                    format!("[outputs] ⚠ {key} 的正则无效: {pattern} —— {e}"),
+                );
+                None
+            }
+        };
+        let value = compiled
             .and_then(|re| re.captures(stdout))
             .and_then(|caps| caps.get(1).or_else(|| caps.get(0)))
             .map(|m| m.as_str().trim().to_string())
@@ -1332,9 +1417,16 @@ pub(crate) fn resolve_remote_step_dir(step: &Step, remote_base: &str, ctx: &VarC
 /// 前置检查执行：发版机本地 cmd /C，退出码 0 = 通过（30 秒超时；失败取输出末尾几行）
 async fn run_local_check(command: &str, working_dir: &Path) -> Result<(), String> {
     use std::process::Stdio;
+    if command.trim().is_empty() {
+        // /C 后面跟空串会落进 cmd 的交互/歧义行为，前置检查显式报错更友好
+        return Err("前置检查命令为空".to_string());
+    }
     let mut cmd = tokio::process::Command::new("cmd");
-    cmd.arg("/C")
-        .arg(command)
+    // raw_arg 原样拼接：arg() 会按 MSVCRT 规则给含空格/引号的参数加引号并转义内部
+    // 引号为 \"，cmd.exe 不认这种转义——`git commit -m "fix bug"` 这类命令会被
+    // 拆错参数。/C 后面由 cmd 按自己的规则解析整段命令
+    cmd.raw_arg("/C")
+        .raw_arg(command)
         .current_dir(working_dir)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -1501,8 +1593,8 @@ mod tests {
                 steps,
                 ..Default::default()
             },
-            tools: HashMap::new(),
-            all_targets: HashMap::new(),
+            tools: BTreeMap::new(),
+            all_targets: BTreeMap::new(),
             from_step: 0,
             only_step: None,
             run_id: "test-run".into(),
@@ -1962,7 +2054,7 @@ mod tests {
         let (_cancel_tx, cancel_rx) = broadcast::channel(4);
         let engine = Engine;
 
-        let mut all_targets = HashMap::new();
+        let mut all_targets = BTreeMap::new();
         all_targets.insert(
             "remote".to_string(),
             Target {

@@ -15,7 +15,7 @@ use crate::models::{AuthMethod, Target, TargetType};
 use anyhow::Context as _;
 use async_trait::async_trait;
 use sha2::Sha256;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
 use tokio::sync::broadcast;
@@ -118,40 +118,10 @@ fn which_dir(exe: &str) -> Option<PathBuf> {
 }
 
 // ---------------------------------------------------------------------------
-// 完整性校验（§5.5 v0.4：与 §5.4 捆绑清单一一对应）
+// 完整性校验（§5.5 v0.4）——内置捆绑目录已于 2026-10-28 移除（见模块头），
+// 5-exe+VERSION 清单校验随之失效，整个函数与测试已删；启动期校验的 P1 计划
+// 随捆绑方案一并作废，自定义目录/PATH 安装不做完整性强制
 // ---------------------------------------------------------------------------
-
-/// 当前仅单元测试使用；启动期强制校验为 P1
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn verify_putty_integrity(putty_dir: &Path) -> Result<(), String> {
-    // 5 个 exe + VERSION 清单，缺一不可。
-    // puttygen.exe（密钥转换）、pageant.exe（agent 认证）虽不在传输主链路上，
-    // 缺失也必须在启动校验期暴露，而不是等到运行期才失败。
-    const REQUIRED_EXES: [&str; 5] = [
-        "plink.exe",
-        "pscp.exe",
-        "psftp.exe",
-        "puttygen.exe",
-        "pageant.exe",
-    ];
-    for tool in REQUIRED_EXES {
-        let p = putty_dir.join(tool);
-        if !p.exists() {
-            return Err(format!("{} missing", tool));
-        }
-        let meta = std::fs::metadata(&p).map_err(|e| e.to_string())?;
-        if meta.len() < 100_000 {
-            return Err(format!("{} appears corrupted (too small)", tool));
-        }
-    }
-
-    // VERSION 清单记录各 exe 的 sha256；存在即校验格式，逐文件哈希比对为 P1 加强项
-    let version = putty_dir.join("VERSION");
-    if !version.exists() {
-        return Err("VERSION manifest missing".to_string());
-    }
-    Ok(())
-}
 
 pub fn sha256_file(path: &Path) -> anyhow::Result<String> {
     // 流式读取：大文件（几百 MB 的 jar/zip）不全量载入内存
@@ -280,19 +250,14 @@ impl RemoteTransport for PuttyTransport {
         target: &Target,
         command: &str,
         working_dir: &str,
-        env: &HashMap<String, String>,
+        env: &BTreeMap<String, String>,
         log: &LogHandle,
         cancel: &mut broadcast::Receiver<()>,
     ) -> anyhow::Result<ExitStatus> {
         let (dest, args_prefix) = Self::build_ssh_args(target)?;
 
-        let full_command = if working_dir.is_empty() {
-            command.to_string()
-        } else {
-            // 远端是 Linux shell：cd 路径用单引号包裹，避免路径含空格时被拆词；
-            // 路径本身含单引号时按 POSIX 规则转义为 '\''
-            format!("cd '{}' && {}", escape_posix_single_quote(working_dir), command)
-        };
+        // cd 组合共用（空命令报错 / ~ 展开语义 / 单引号防拆词），见 mod.rs
+        let full_command = super::compose_remote_command(working_dir, command)?;
 
         let mut args = args_prefix;
         args.push(dest);
@@ -516,7 +481,10 @@ pub fn probe_server_with(
 ) -> Result<(ServerInfo, u128), String> {
     let d = detect_putty_tools();
     if !d.found {
-        return Err("未找到 plink（PuTTY），请安装或将套件放入内置目录".to_string());
+        return Err(
+            "未找到 plink（PuTTY）：请安装 PuTTY，或在 ⚙ 设置 → 🔧 工具管理 → putty 指定套件目录"
+                .to_string(),
+        );
     }
     let (dest, mut args) = PuttyTransport::build_ssh_args_with(target, transient_password)
         .map_err(|e| e.to_string())?;
@@ -845,7 +813,7 @@ mod tests {
             },
             transport: None,
             work_root: None,
-            env: HashMap::new(),
+            env: BTreeMap::new(),
             cred_key: None,
         }
     }
@@ -948,39 +916,6 @@ mod tests {
 
         // 含单引号的路径按 POSIX 规则转义：' → '\''
         assert_eq!(escape_posix_single_quote("it's"), "it'\\''s");
-    }
-
-    #[test]
-    fn integrity_requires_all_bundled_files() {
-        // v0.4 评审 #8：5 个 exe + VERSION 全部校验
-        let dir = std::env::temp_dir().join(format!("rbs_test_putty_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-
-        // 全空 → 报缺失
-        let err = verify_putty_integrity(&dir).unwrap_err();
-        assert!(err.contains("plink.exe missing"));
-
-        // 只放 3 个核心文件（v0.3 的行为）→ 仍应报 puttygen 缺失
-        for name in ["plink.exe", "pscp.exe", "psftp.exe"] {
-            std::fs::write(dir.join(name), vec![0u8; 200_000]).unwrap();
-        }
-        let err = verify_putty_integrity(&dir).unwrap_err();
-        assert!(err.contains("puttygen.exe missing"), "got: {err}");
-
-        // 补齐全部文件 → 通过
-        for name in ["puttygen.exe", "pageant.exe"] {
-            std::fs::write(dir.join(name), vec![0u8; 200_000]).unwrap();
-        }
-        std::fs::write(dir.join("VERSION"), "0.85").unwrap();
-        assert!(verify_putty_integrity(&dir).is_ok());
-
-        // 文件过小 → 判定损坏
-        std::fs::write(dir.join("plink.exe"), b"tiny").unwrap();
-        let err = verify_putty_integrity(&dir).unwrap_err();
-        assert!(err.contains("corrupted"));
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

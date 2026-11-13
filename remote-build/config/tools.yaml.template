@@ -1,4 +1,5 @@
 # 工具链（首次启动探测自动生成，此文件为参考模板）
+# 说明：目标（targets）自 v0.4 起随项目走，定义在各工程 project.yaml 的 targets: 段，不再有全局 targets.yaml
 tools:
   java:
     name: java
@@ -12,8 +13,9 @@ tools:
 
   putty:
     # putty 条目由探测自动生成，仅供 UI 展示与版本核对；
-    # PuttyTransport 实际路径以 detect_putty_tools() 为准（见设计文档 §3.4 / §5.3）
+    # 传输实际路径以套件探测为准（自定义目录 → PATH → Program Files，见 src/transport/putty.rs）
     name: putty
     tool_type: custom
-    command: ~/.remote-build/tools/putty/pscp.exe
-    detected_from: builtin
+    command: C:/Program Files/PuTTY/pscp.exe
+    version_check: "plink -V"
+    detected_from: "Program Files"

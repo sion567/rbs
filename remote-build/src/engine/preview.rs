@@ -348,7 +348,7 @@ fn unresolved_exprs(text: &str) -> Vec<String> {
 mod tests {
     use super::super::{preview_job, RunInput, DEFAULT_STEP_TIMEOUT};
     use crate::models::*;
-    use std::collections::HashMap;
+    use std::collections::BTreeMap;
 
     fn preview_input(steps: Vec<Step>) -> (RunInput, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!("rbs_preview_{}", std::process::id()));
@@ -359,7 +359,7 @@ mod tests {
             project: Project {
                 name: "p".into(),
                 local_path: dir.to_string_lossy().to_string(),
-                variables: HashMap::new(),
+                variables: BTreeMap::new(),
                 ..Default::default()
             },
             job: Job {
@@ -368,8 +368,8 @@ mod tests {
                 steps,
                 ..Default::default()
             },
-            tools: HashMap::new(),
-            all_targets: HashMap::new(),
+            tools: BTreeMap::new(),
+            all_targets: BTreeMap::new(),
             from_step: 0,
             only_step: None,
             run_id: String::new(),

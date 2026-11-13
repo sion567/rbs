@@ -11,7 +11,7 @@
 use crate::env_detect::DetectionReport;
 use crate::models::*;
 use anyhow::{Context, Result};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// 应用根目录；测试可通过 REMOTE_BUILD_HOME 环境变量重定向
@@ -134,7 +134,7 @@ pub fn merge_detection(report: &DetectionReport) -> Result<usize> {
             version: None,
             version_check: None,
             detected_from: None,
-            env: HashMap::new(),
+            env: BTreeMap::new(),
         });
         entry.command = dt.command.clone();
         entry.version = dt.version.clone();
@@ -153,7 +153,7 @@ pub fn merge_detection(report: &DetectionReport) -> Result<usize> {
                 version: None,
                 version_check: None,
                 detected_from: None,
-                env: HashMap::new(),
+                env: BTreeMap::new(),
             });
         entry.command = report.putty.pscp.to_string_lossy().to_string();
         entry.version = report.putty.version.clone();
@@ -186,7 +186,7 @@ pub fn local_target() -> Target {
         target_type: TargetType::Local,
         transport: None,
         work_root: None,
-        env: HashMap::new(),
+        env: BTreeMap::new(),
         cred_key: None,
     }
 }
@@ -194,8 +194,8 @@ pub fn local_target() -> Target {
 /// 项目级目标的规范化（§3.5）：回填 Target.name = 键名、凭据键 = {项目}/{目标}——
 /// 不同项目的同名目标（如各自的 prod）密码互不干扰（§14）。
 /// v0.4 调整：目标仅定义在 project.yaml，不再有全局 targets.yaml。
-pub fn effective_targets(project: &Project) -> HashMap<String, Target> {
-    let mut out = HashMap::new();
+pub fn effective_targets(project: &Project) -> BTreeMap<String, Target> {
+    let mut out = BTreeMap::new();
     for (k, t) in &project.targets {
         let mut t = t.clone();
         t.name = k.clone();
@@ -206,7 +206,7 @@ pub fn effective_targets(project: &Project) -> HashMap<String, Target> {
 }
 
 /// 本地目标的单条映射（项目 targets 初始化用）
-pub fn local_targets_map() -> HashMap<String, Target> {
+pub fn local_targets_map() -> YamlMap<Target> {
     [local_target()]
         .into_iter()
         .map(|t| (t.name.clone(), t))
@@ -249,11 +249,11 @@ pub fn create_project_entry_in(
         description: None,
         category: category_field(category),
         local_path: local_path.to_string_lossy().to_string(),
-        variables: HashMap::new(),
-        tools: HashMap::new(),
+        variables: BTreeMap::new(),
+        tools: BTreeMap::new(),
         jobs: vec!["build".to_string()],
         targets: crate::config::local_targets_map(),
-        tools_require: HashMap::new(),
+        tools_require: BTreeMap::new(),
         groups: Vec::new(),
     };
     crate::storage::files::save_yaml(&dir.join("project.yaml"), &project)?;
@@ -388,7 +388,7 @@ pub fn create_example_project() -> Result<()> {
     let dir = projects_dir().join("example");
     std::fs::create_dir_all(&dir)?;
 
-    let mut targets = HashMap::new();
+    let mut targets = BTreeMap::new();
     targets.insert("local".to_string(), local_target());
     targets.insert(
         "demo-server".to_string(),
@@ -404,7 +404,7 @@ pub fn create_example_project() -> Result<()> {
             },
             transport: None,
             work_root: Some("/opt/demo".to_string()),
-            env: HashMap::new(),
+            env: BTreeMap::new(),
             cred_key: None,
         },
     );
@@ -460,7 +460,7 @@ pub fn create_example_project() -> Result<()> {
         ]
         .into_iter()
         .collect(),
-        tools: HashMap::new(),
+        tools: BTreeMap::new(),
         // mise 风格版本门禁演示：java 不满足要求时运行零步失败（预览里也会 ⚠）
         tools_require: [("java".to_string(), ">=17".to_string())]
             .into_iter()
@@ -1139,7 +1139,7 @@ mod tests {
         let input = crate::engine::RunInput {
             project: p.clone(),
             job: linux_job,
-            tools: HashMap::new(),
+            tools: BTreeMap::new(),
             all_targets: effective_targets(&p),
             from_step: 0,
             only_step: None,
@@ -1174,7 +1174,7 @@ mod tests {
             version: Some("0.79".into()),
             version_check: None,
             detected_from: Some("builtin".into()),
-            env: HashMap::new(),
+            env: BTreeMap::new(),
         };
         file.tools.insert("putty".to_string(), auto);
         save_tools(&file).unwrap();
@@ -1198,7 +1198,7 @@ mod tests {
             version: None,
             version_check: None,
             detected_from: None,
-            env: HashMap::new(),
+            env: BTreeMap::new(),
         };
         file.tools.insert("putty".to_string(), manual);
         save_tools(&file).unwrap();

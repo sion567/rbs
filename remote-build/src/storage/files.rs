@@ -17,9 +17,17 @@ pub fn save_yaml<T: Serialize>(path: &Path, value: &T) -> Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     let text = yaml_serde::to_string(value)?;
-    // 先写临时文件再改名，避免写一半崩溃留下残缺配置
-    let tmp = path.with_extension("yaml.tmp");
-    std::fs::write(&tmp, text)?;
+    // 先写临时文件再改名，避免写一半崩溃留下残缺配置。
+    // tmp 名带进程号：GUI 与 CLI 并发保存同一文件不会互写对方的 tmp；
+    // rename 前 sync_all：掉电时 NTFS 可能先落 rename 日志后落数据块，
+    // 留下零长度 yaml——恰好是 tmp+rename 要防的事故
+    let tmp = path.with_extension(format!("yaml.{}.tmp", std::process::id()));
+    {
+        use std::io::Write as _;
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(text.as_bytes())?;
+        f.sync_all()?;
+    }
     std::fs::rename(&tmp, path).with_context(|| format!("写入失败: {}", path.display()))?;
     Ok(())
 }
@@ -84,13 +92,34 @@ fn walk_projects(
         ));
         return;
     }
-    for sub in sorted_subdirs(dir) {
+    for sub in ordered_subdirs(dir) {
+        // 容器目录里的构建垃圾不进发现：.git 有几千个 pack 子目录、
+        // node_modules 几万条目——reload 每次全量扫一遍纯浪费 IO
+        if let Some(name) = sub.file_name().and_then(|n| n.to_str()) {
+            if matches!(name, ".git" | "node_modules") {
+                continue;
+            }
+        }
         if sub.join("project.yaml").exists() {
             // 工程：category 只认 yaml 自己的字段（手写填了就照显示）；
             // 缺省回填相对 root 的父目录链（手挪目录的迁移路径）
             if let Some(mut entry) = load_project_dir(&sub, errors) {
+                // 手写的 category: "" / 空白 = 平铺（与字段缺省同口径），
+                // 否则一致性检查会提示"修复"一个不存在的问题
+                if entry
+                    .project
+                    .category
+                    .as_deref()
+                    .map(|c| c.trim().is_empty())
+                    .unwrap_or(false)
+                {
+                    entry.project.category = None;
+                }
                 if entry.project.category.is_none() {
-                    entry.project.category = relative_parent_chain(root, &sub);
+                    // 回填链逐段净化：字段值必须与 project_config_dir 的
+                    // 逐段净化一致，否则改名/搬移会算出另一个目录
+                    entry.project.category = relative_parent_chain(root, &sub)
+                        .map(|c| crate::config::sanitize_category_chain(Some(&c)).join("/"));
                 }
                 out.push(entry);
             }
@@ -114,6 +143,58 @@ pub(crate) fn relative_parent_chain(root: &Path, project_dir: &Path) -> Option<S
     } else {
         Some(segs.join("/"))
     }
+}
+
+/// 容器内的自定义顺序文件名（每行一个子目录名）：工程树拖拽排序的持久化。
+/// 归类容器是纯展示容器、跨工程项目运行按 discover 顺序展平——顺序不该写进
+/// 各工程的 project.yaml（搬家即含义失效、全部兄弟要重编号），就地放容器
+/// 目录里，GUI 与 CLI 共用 discover 自动同序。无此文件 = 字母序。
+const ORDER_FILE: &str = ".rbs-order";
+
+/// 读容器自定义顺序（行 = 子目录名）；文件不存在 / 无有效行 → None
+pub(crate) fn read_order(dir: &Path) -> Option<Vec<String>> {
+    let text = std::fs::read_to_string(dir.join(ORDER_FILE)).ok()?;
+    let names: Vec<String> = text
+        .lines()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect();
+    (!names.is_empty()).then_some(names)
+}
+
+/// 写容器自定义顺序（tmp + rename 原子落盘，避免读到半截）
+pub(crate) fn save_order(dir: &Path, names: &[String]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let tmp = dir.join(format!(".rbs-order.{}.tmp", std::process::id()));
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        for n in names {
+            writeln!(f, "{n}")?;
+        }
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, dir.join(ORDER_FILE))
+}
+
+/// 子目录排序：`.rbs-order` 里列出的排前面（按文件内顺序），未列出的按
+/// 字母序排后面。文件里不存在的名字忽略。
+pub(crate) fn ordered_subdirs(dir: &Path) -> Vec<PathBuf> {
+    let mut subs = sorted_subdirs(dir);
+    let Some(order) = read_order(dir) else {
+        return subs;
+    };
+    subs.sort_by_key(|p| {
+        let name = p
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        match order.iter().position(|n| *n == name) {
+            Some(i) => (0, i, name),
+            None => (1, 0, name),
+        }
+    });
+    subs
 }
 
 fn sorted_subdirs(dir: &Path) -> Vec<PathBuf> {
@@ -473,6 +554,64 @@ mod tests {
             Some("a/b/c/d"),
             "category 回填完整父目录链"
         );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 手写 category: "" / 空白 = 平铺：归一成 None，不再触发一致性检查的
+    /// "修复"提示（字段与目录本就一致）
+    #[test]
+    fn empty_category_field_normalizes_to_flat() {
+        let root = std::env::temp_dir().join(format!("rbs_files_blankcat_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("demo");
+        std::fs::create_dir_all(&dir).unwrap();
+        save_yaml(
+            &dir.join("project.yaml"),
+            &crate::models::Project {
+                name: "demo".to_string(),
+                category: Some("   ".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let (found, errors) = discover_with_errors(&root);
+        assert!(errors.is_empty(), "{errors:?}");
+        let e = found.iter().find(|e| e.project.name == "demo").unwrap();
+        assert_eq!(e.project.category, None, "空白 category 应归一成平铺");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `.rbs-order` 生效：列出的工程按文件序在前，未列出的按字母序随后；
+    /// 文件里不存在的名字忽略。树显示与跨工程项目运行的串行序都吃这个顺序
+    #[test]
+    fn order_file_reorders_container_children() {
+        let root = std::env::temp_dir().join(format!("rbs_files_order_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for name in ["甲", "乙", "丙"] {
+            let d = root.join(name);
+            std::fs::create_dir_all(&d).unwrap();
+            save_yaml(
+                &d.join("project.yaml"),
+                &crate::models::Project { name: name.to_string(), ..Default::default() },
+            )
+            .unwrap();
+        }
+        // 无顺序文件 = 字母序（unicode 码点序：丙 4E19 < 乙 4E59 < 甲 7532）
+        let found = discover_projects(&root);
+        let names: Vec<&str> = found.iter().map(|e| e.project.name.as_str()).collect();
+        assert_eq!(names, vec!["丙", "乙", "甲"]);
+
+        // 顺序文件：丙 → 甲，乙 未列出 → 排最后
+        save_order(&root, &["丙".to_string(), "甲".to_string(), "不存在".to_string()]).unwrap();
+        let found = discover_projects(&root);
+        let names: Vec<&str> = found.iter().map(|e| e.project.name.as_str()).collect();
+        assert_eq!(names, vec!["丙", "甲", "乙"], "顺序文件先按列出序，未列出随后");
+
+        // 往返一致
+        assert_eq!(read_order(&root), Some(vec!["丙".to_string(), "甲".to_string(), "不存在".to_string()]));
 
         let _ = std::fs::remove_dir_all(&root);
     }

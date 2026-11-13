@@ -11,7 +11,7 @@ pub mod win_job;
 
 use crate::models::{LogEvent, Target, TargetType, TransportKind};
 use async_trait::async_trait;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use tokio::sync::{broadcast, mpsc};
 
 /// 日志行流向（§5.1 v0.4 补充定义）
@@ -66,12 +66,16 @@ impl LogHandle {
 
     pub fn line(&self, stream: Stream, text: impl Into<String>) {
         let line_text = text.into();
-        // stdout 捕获（step outputs）：先入缓冲再发事件，缓冲满/锁失败不影响主流程
+        // stdout 捕获（step outputs）：先入缓冲再发事件，缓冲满/锁失败不影响主流程。
+        // 上限截断（outputs 只取首个匹配，尾部无用）——海量输出的构建日志
+        // 不再无界吃内存
         if matches!(stream, Stream::Stdout) {
             if let Some(buf) = &self.capture {
                 if let Ok(mut b) = buf.lock() {
-                    b.push_str(&line_text);
-                    b.push('\n');
+                    if b.len() < CAPTURE_MAX_BYTES {
+                        b.push_str(&line_text);
+                        b.push('\n');
+                    }
                 }
             }
         }
@@ -129,7 +133,7 @@ pub trait RemoteTransport: Send + Sync {
         target: &Target,
         command: &str,
         working_dir: &str,
-        env: &HashMap<String, String>,
+        env: &BTreeMap<String, String>,
         log: &LogHandle,
         cancel: &mut broadcast::Receiver<()>,
     ) -> anyhow::Result<ExitStatus>;
@@ -242,12 +246,16 @@ pub fn probe_target(
 /// 轮询间隔（step_type=wait）
 pub const WAIT_POLL_SECONDS: u64 = 5;
 
+/// outputs 捕获缓冲上限（1MB）：outputs 只取 stdout 首个正则匹配，
+/// 超限后的行对捕获无用却会无界吃内存（GB 级构建日志场景）
+const CAPTURE_MAX_BYTES: usize = 1024 * 1024;
+
 /// 在 env 副本上把 dir 前置到 PATH（env 无 PATH 项时只插入 dir；
 /// 进程原有 PATH 由 spawn 时的 merged_env 追加，避免重复）
 pub fn with_path_prepended(
-    mut env: HashMap<String, String>,
+    mut env: BTreeMap<String, String>,
     dir: &std::path::Path,
-) -> HashMap<String, String> {
+) -> BTreeMap<String, String> {
     let key = env
         .keys()
         .find(|k| k.eq_ignore_ascii_case("PATH"))
@@ -264,7 +272,7 @@ pub fn with_path_prepended(
 
 /// 注入子进程前合并 PATH：显式提供的 PATH 在前，进程原有 PATH 追加在后。
 /// 否则步骤 env 里设置一次 PATH 就会把系统目录整个顶掉。
-pub(crate) fn merged_env(env: &HashMap<String, String>) -> HashMap<String, String> {
+pub(crate) fn merged_env(env: &BTreeMap<String, String>) -> BTreeMap<String, String> {
     let mut out = env.clone();
     let Some((key, value)) = env
         .iter()
@@ -291,6 +299,31 @@ pub(crate) fn decode_console_bytes(bytes: &[u8]) -> String {
         Ok(s) => s.to_string(),
         Err(_) => decode_with_oem_codepage(bytes),
     }
+}
+
+/// 组合「cd <工作目录> && <命令>」（russh / putty 两个远端传输共用）。
+/// - 空命令直接报错：此前会拼出 `cd 'dir' && `，远端 shell 报一条费解的
+///   语法错误；env 注入对远端 shell 本就不生效，空命令步骤没有意义
+/// - 工作目录首位的 ~ 保持不带引号：单引号会阻止 shell 展开 ~——
+///   work_root / working_dir 写 `~/deploy` 是常见习惯。`cd ~'/rest'` 中
+///   ~ 在词首未加引号照常展开，其余段照旧单引号防拆词
+pub(crate) fn compose_remote_command(
+    working_dir: &str,
+    command: &str,
+) -> anyhow::Result<String> {
+    if command.trim().is_empty() {
+        anyhow::bail!("命令为空（远端步骤请写实际命令；env 注入不影响远端 shell）");
+    }
+    let wd = working_dir.trim();
+    if wd.is_empty() {
+        return Ok(command.to_string());
+    }
+    let cd = if wd == "~" || wd.starts_with("~/") {
+        format!("cd ~'{}'", crate::transport::putty::escape_posix_single_quote(&wd[1..]))
+    } else {
+        format!("cd '{}'", crate::transport::putty::escape_posix_single_quote(wd))
+    };
+    Ok(format!("{cd} && {command}"))
 }
 
 #[cfg(windows)]
@@ -378,7 +411,7 @@ mod tests {
 
     #[test]
     fn path_helpers_prepend_and_merge() {
-        let mut env = HashMap::new();
+        let mut env = BTreeMap::new();
         env.insert("PATH".to_string(), "C:\\a".to_string());
 
         let env = with_path_prepended(env, std::path::Path::new("C:\\bin"));
@@ -411,5 +444,21 @@ mod tests {
         if cp == 936 {
             assert_eq!(decoded, "中文");
         }
+    }
+
+    /// cd 组合：空命令报错（不再拼出 `cd 'dir' && ` 的费解语法错误）、
+    /// 工作目录首位的 ~ 不加引号（单引号会阻止 shell 展开 ~）
+    #[test]
+    fn compose_remote_command_handles_empty_and_tilde() {
+        assert_eq!(compose_remote_command("", "echo x").unwrap(), "echo x");
+        assert!(compose_remote_command("", "   ").is_err(), "空命令应报错");
+        let c = compose_remote_command("~/deploy", "echo x").unwrap();
+        assert_eq!(c, "cd ~'/deploy' && echo x");
+        assert_eq!(compose_remote_command("~", "echo x").unwrap(), "cd ~'' && echo x");
+        let sp = compose_remote_command("/opt/My App", "echo x").unwrap();
+        assert_eq!(sp, "cd '/opt/My App' && echo x");
+        // 路径含单引号：POSIX '\'' 转义照常生效
+        let q = compose_remote_command("/opt/it's", "echo x").unwrap();
+        assert_eq!(q, "cd '/opt/it'\\''s' && echo x");
     }
 }

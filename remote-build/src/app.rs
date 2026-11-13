@@ -76,7 +76,13 @@ impl eframe::App for RemoteBuildApp {
                             Ok(()) => {
                                 self.page = Page::Main(MainState::new(self.runtime.clone()));
                             }
-                            Err(e) => page.error = Some(e.to_string()),
+                            Err(e) => {
+                                // one-shot：失败即复位 confirmed——否则看门狗强制
+                                // 0.5fps 重绘期间每帧重跑全量生成（重复写盘），
+                                // 用户也无法取消或主动重试
+                                page.clear_confirmed();
+                                page.error = Some(e.to_string());
+                            }
                         }
                     }
                 }
@@ -171,7 +177,7 @@ pub struct MainState {
     pub runtime: Arc<tokio::runtime::Runtime>,
     pub projects_root: std::path::PathBuf,
     pub global: crate::models::GlobalConfig,
-    pub tools: std::collections::HashMap<String, crate::models::Tool>,
+    pub tools: std::collections::BTreeMap<String, crate::models::Tool>,
     pub projects: Vec<ProjectEntry>,
     /// 项目校验结果缓存（reload 时算一次）：validate_project 每次要 stat
     /// 本地目录 + .git，每帧逐项目 stat 在网络盘 / 死路径上可阻塞数秒——
@@ -262,7 +268,7 @@ pub struct MainState {
     /// 每帧对比当前指纹：换了选中项静默重设基线；同一项指纹变了 = 有未保存修改。
     /// reload / 保存成功都会重设基线
     pub dirty_baseline: Option<(String, String, u64)>,
-    /// 当前选中流程是否有未保存修改（工具栏 ● 未保存 徽标 + 状态栏提示）
+    /// 当前选中流程是否有未保存修改（💾 Save 按钮黄色指示）
     pub job_dirty: bool,
     /// 指纹节流探测时刻（None = 下帧立即探）：指纹 = serde_json 序列化整个
     /// Project+Job，每帧跑（鼠标移动即 60fps）在大配置上是纯浪费；
@@ -273,10 +279,11 @@ pub struct MainState {
 }
 
 /// 选中配置的指纹：经 serde_json 归一化后哈希（会话内自比对，不要求跨版本稳定）。
-/// 不能直接哈希 Debug 文本：Project 里嵌着 HashMap，其迭代顺序每帧随机，
-/// 指纹会漂移 → 「● 未保存」徽标随机闪现（快照测试抓到的真 bug）。
-/// serde_json 默认无 preserve_order，Map 是 BTreeMap —— 按键排序，输出稳定
-fn config_fingerprint(project: &crate::models::Project, job: Option<&crate::models::Job>) -> u64 {
+/// 不能直接哈希 Debug 文本：HashMap 迭代顺序每帧随机，指纹会漂移导致
+/// 未保存指示随机闪现（快照测试抓到的真 bug）。
+/// serde_json 默认无 preserve_order，Map 是 BTreeMap —— 按键排序，输出稳定。
+/// pub(crate)：目标管理改名同步流程落盘后也用它重置未保存基线
+pub(crate) fn config_fingerprint(project: &crate::models::Project, job: Option<&crate::models::Job>) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     serde_json::to_string(project)
@@ -507,9 +514,19 @@ impl MainState {
                 let mut issues = crate::config::validate_project(&e.project);
                 // 归类一致性：树按 category 字段渲染，字段与实际父目录链脱钩时
                 // （历史改名/搬移遗留、手挪目录），文件位置与树显示对不上——
-                // 这里给 ⚠ 指路，右键「移入项目」确认一次即可搬回（不自动动盘）
-                let actual = files::relative_parent_chain(&self.projects_root, &e.dir);
-                if actual.as_deref() != e.project.category.as_deref().map(str::trim) {
+                // 这里给 ⚠ 指路，右键「移入项目」确认一次即可搬回（不自动动盘）。
+                // 两边都按 sanitize_category_chain 归一后再比：
+                // 手写的 category: "" / 前后空白 / 段内非法字符不算错位
+                let actual = files::relative_parent_chain(&self.projects_root, &e.dir)
+                    .map(|c| crate::config::sanitize_category_chain(Some(&c)).join("/"));
+                let field_norm = e
+                    .project
+                    .category
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|c| !c.is_empty())
+                    .map(|c| crate::config::sanitize_category_chain(Some(c)).join("/"));
+                if actual != field_norm {
                     let field = e
                         .project
                         .category
@@ -748,12 +765,21 @@ impl MainState {
                     }
                 }
                 // 运行中禁用一切会改盘/改配置的入口（引擎正按路径读写、状态可视化依赖步骤索引稳定）
-                if ui.add_enabled(!running, egui::Button::new("💾 Save")).clicked() {
-                    self.save_selected();
-                }
+                // 未保存指示 = 按钮本身变黄（悬停说明），不再另出徽标/状态栏文案
+                let mut save_btn = egui::Button::new("💾 Save");
                 if self.job_dirty {
-                    ui.colored_label(egui::Color32::from_rgb(230, 180, 80), "● 未保存")
-                        .on_hover_text("当前流程有未保存的修改（💾 Save 落盘后熄灭）");
+                    save_btn = save_btn.fill(egui::Color32::from_rgb(180, 150, 40));
+                }
+                if ui
+                    .add_enabled(!running, save_btn)
+                    .on_hover_text(if self.job_dirty {
+                        "当前流程有未保存的修改（黄色提示），💾 Save 落盘后恢复"
+                    } else {
+                        "保存 project.yaml 与当前流程"
+                    })
+                    .clicked()
+                {
+                    self.save_selected();
                 }
                 if ui.add_enabled(!running, egui::Button::new("⟳ Reload")).clicked() {
                     self.reload();
@@ -983,9 +1009,23 @@ impl MainState {
         };
         self.selected_project = Some(pi);
         self.selected_job = Some(ji);
-        // 监听触发的重跑：历史入库 trigger=watch
+        // 监听触发的历史入库 trigger=watch（实际启动时消费）
         self.run_trigger_watch = true;
-        self.launch_run(0, None);
+        // watch 开启时已确认过一次；但 job 配置可能在监听期间被改（如加了
+        // confirm: prod）——重跑前按**当前**配置复查，有确认门就走 start_run 弹门，
+        // 不再直通 launch_run 绕过防手滑门
+        let has_confirm = self.projects[pi].jobs[ji]
+            .job
+            .confirm
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .is_some();
+        if has_confirm {
+            self.start_run(0, None);
+        } else {
+            self.launch_run(0, None);
+        }
     }
 
     /// 项目树「⟳ 更新代码」：对项目代码目录（local_path）后台执行 git pull --ff-only，
@@ -1817,7 +1857,10 @@ impl MainState {
             } else {
                 None
             };
-            let mut file = std::fs::File::create(&log_path).ok();
+            // BufWriter：此前每行一次 write 系统调用（阻塞在 async 转发任务里），
+            // 刷屏长任务数万行 = 数万次 syscall；进程崩溃丢尾部若干行可接受
+            //（运行状态在历史库里）
+            let mut file = std::fs::File::create(&log_path).ok().map(std::io::BufWriter::new);
             while let Some(ev) = tok_rx.recv().await {
                 #[cfg(feature = "sqlite")]
                 if let Some(rec) = &recorder {
@@ -1832,6 +1875,10 @@ impl MainState {
                 if std_tx.send(ev).is_err() {
                     break; // UI 已关闭
                 }
+            }
+            if let Some(f) = file.as_mut() {
+                use std::io::Write as _;
+                let _ = f.flush();
             }
             #[cfg(feature = "sqlite")]
             if let Some(rec) = recorder {
@@ -1850,6 +1897,15 @@ impl MainState {
             );
             match results {
                 (Ok(()), Ok(())) => {
+                    // 自动保存即落盘：以当前内存内容为新基线——否则跑完之后
+                    // Save 按钮黄色指示一直亮着（磁盘与内存明明一致）
+                    let fp = config_fingerprint(&entry.project, entry.jobs.get(ji).map(|j| &j.job));
+                    self.dirty_baseline = Some((
+                        entry.project.name.clone(),
+                        entry.jobs.get(ji).map(|j| j.job.name.clone()).unwrap_or_default(),
+                        fp,
+                    ));
+                    self.dirty_last_probe = None;
                     self.console.push_line(
                         "（运行前已自动保存 project.yaml 与当前流程）",
                         crate::ui::console::Role::Info,
@@ -2288,7 +2344,7 @@ impl MainState {
 
         self.status_msg = Some(match (project_result, job_result) {
             (Ok(()), Ok(())) => {
-                // 保存成功 → 以当前内容为新基线，「● 未保存」徽标随之熄灭
+                // 保存成功 → 以当前内容为新基线，Save 按钮黄色指示随之熄灭
                 let fp = config_fingerprint(&entry.project, entry.jobs.get(ji).map(|j| &j.job));
                 self.dirty_baseline = Some((
                     entry.project.name.clone(),
@@ -2307,15 +2363,18 @@ impl MainState {
     }
 
     /// 每帧刷新 job_dirty：与保存时的基线指纹比对；换了选中项则静默重设基线
-    /// （选中变化不应误报「未保存」）。状态栏残留的「已保存 ✅」同步换成未保存提示。
-    /// 同一项的指纹探测按 250ms 节流（序列化整个 Project+Job 不便宜，见字段注释）
+    /// （选中变化不应误报「未保存」）。
+    /// 同一项的指纹探测按 250ms 节流（序列化整个 Project+Job 不便宜）。
+    /// job_dirty **保持上次探测结果**、帧首不清零——清了会在探测帧/非探测帧
+    /// 交替亮灭（● 未保存闪烁的真实根源）；指示 = 💾 Save 按钮黄色
     fn refresh_dirty(&mut self) {
-        self.job_dirty = false;
         let (Some(pi), Some(ji)) = (self.selected_project, self.selected_job) else {
+            self.job_dirty = false;
             self.dirty_last_probe = None;
             return;
         };
         let Some(entry) = self.projects.get(pi) else {
+            self.job_dirty = false;
             self.dirty_last_probe = None;
             return;
         };
@@ -2343,13 +2402,10 @@ impl MainState {
         match &self.dirty_baseline {
             Some((p, j, bfp)) if *p == sel.0 && *j == sel.1 => {
                 self.job_dirty = fp != *bfp;
-                // 「保存后再改，状态栏还挂着已保存 ✅」的真实反馈：指纹一变就换文案
-                if self.job_dirty && self.status_msg.as_deref() == Some("已保存 ✅") {
-                    self.status_msg = Some("✏ 有未保存的修改（💾 Save 落盘）".to_string());
-                }
             }
             _ => {
                 self.dirty_baseline = Some((sel.0, sel.1, fp));
+                self.job_dirty = false;
             }
         }
     }
@@ -2433,6 +2489,9 @@ fn show_confirm_gate_window(ctx: &egui::Context, main: &mut MainState) {
     }
     if cancel {
         main.confirm_gate.open = false;
+        // watch 重跑在确认门被取消：trigger=watch 标记一并复位，
+        // 否则下一次手动运行会被误记为 watch 触发
+        main.run_trigger_watch = false;
     }
 }
 

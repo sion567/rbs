@@ -53,6 +53,47 @@ pub(crate) fn truncate_label(s: &str, max: usize) -> String {
     format!("{cut}…")
 }
 
+/// Option<String> 字段的编辑行（有值显示输入框 + 🗑 清除；无值显示 — + ＋ 添加），
+/// 返回是否发生了修改。调用方需处于 Grid 中（本函数负责 end_row）。
+/// settings（工具表单）与 targets（目标表单）共用——此前两处各有一份逐字节相同的实现
+pub(crate) fn option_text_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &mut Option<String>,
+    width: f32,
+) -> bool {
+    let mut changed = false;
+    ui.label(label);
+    match value {
+        Some(v) => {
+            let mut clear = false;
+            ui.horizontal(|ui| {
+                changed |= ui
+                    .add(egui::TextEdit::singleline(v).desired_width(width))
+                    .changed();
+                if ui.small_button("🗑").clicked() {
+                    clear = true;
+                }
+            });
+            if clear {
+                *value = None;
+                changed = true;
+            }
+        }
+        None => {
+            ui.horizontal(|ui| {
+                ui.weak("—");
+                if ui.small_button("＋").clicked() {
+                    *value = Some(String::new());
+                    changed = true;
+                }
+            });
+        }
+    }
+    ui.end_row();
+    changed
+}
+
 /// 打开目录选择对话框，起点 = 输入框当前路径（约定：所有「浏览」按钮都从
 /// 输入框已有的地址出发，而不是每次都弹到系统默认位置）。
 /// 输入框是文件路径或不存在时，回退到其父目录；再不行才用系统默认。

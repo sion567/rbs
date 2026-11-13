@@ -1,5 +1,107 @@
 # TODO
 
+## 2026-11-13 二次反馈（未保存闪烁 / pack 40G / 工程树拖拽排序）
+
+### ✅ `● 未保存` 闪烁（第七轮节流引入的 bug）+ Save 按钮黄色化
+
+- **根因**：`refresh_dirty` 每帧开头清 `job_dirty = false`，指纹却按 250ms 节流——
+  非探测帧指示消失、探测帧又亮起，交替闪烁。修复：job_dirty 保持上次探测结果，
+  帧首不清零（仅探测帧/换选中/保存后重算）。
+- **指示简化**（按反馈）：💾 Save 按钮**脏时变黄**（悬停说明），删除 `● 未保存`
+  徽标与状态栏"已保存 ✅/有未保存修改"来回切换。
+
+### ✅ pack 打出 40G：目标在源目录内时吞上一次的旧包
+
+- 实锤链：`dist\. -> dist\dist.tar.gz` 目标在源目录里；"清单先收集再写包"只防
+  **本次正在写的包**（此刻尚不存在），防不住**上次运行留下的旧包**——收集时它已
+  存在，被吞进新包。反复打包每次吞上一个（压缩内容不二次压缩，体积近似相加），
+  指数增长到 40G。city-update-web 的包不在源目录所以没事。
+- 修复：收集清单后排除目标自身（canonicalize + 大小写不敏感比较）与 pack 的
+  `.rbs-pack.*.tmp` 残留。回归单测：dst 在源目录内连续打包两轮，第二轮不吞旧包、
+  大小一致。
+
+### ✅ 工程树拖拽排序（`.rbs-order`，不加序号字段）
+
+- **存储**：归类容器目录放 `.rbs-order`（每行一个子目录名），discover 读取——
+  列出的排前面（按文件序），未列出的字母序随后。不用动每个工程的 project.yaml
+  （搬家/改名序号含义失效、兄弟全部重编号），CLI 与 GUI 共用 discover 自动同序；
+  无文件的容器维持字母序。写盘 tmp+rename 原子化。
+- **树**：工程折叠头可拖拽（拖源 + 放置目标，蓝线指示插入位置），仅**同父级**
+  （归类链一致，None = 根容器）可放；释放后写顺序文件、reload、保持选中。
+  顺序文件写**全量子目录名**（含子容器）——只写工程名会让子容器全部沉底。
+- **作用**：跨工程项目运行（🗂 右键 → ▶ 运行项目）按树中顺序展平串行，
+  拖完即生效；确认门预览（👁）可直接核对新顺序。
+
+## 2026-11-13 第七轮全面自查（引擎执行语义 / 传输存储 / UI 边界）
+
+> 覆盖：引擎执行语义（重点深审）、传输与存储层、UI 层（含上一轮新改代码边界复查）。
+> 共修复 22 项（1 P0 / 4 P1 / 17 P2），每项均经代码核实；遗留清单见末尾。
+
+### ✅ P0：on_failure: retry 丢 handlers/outputs 状态（本轮最重要）
+
+- `notified`（notify 登记）与 `ctx`（outputs 捕获）都在 `run_job_inner` 内、每次
+  尝试重建，而重试循环在外层 `run_job`。部署场景实锤链：
+  ① 第 1 次尝试上传新 jar（登记 notify「重启」）→ 后续步骤失败 → 重试；
+  ② 第 2 次上传 sha256 命中跳过 → changed=false → **handlers 整块跳过 → 最终
+  Success 但重启从未执行**（jar 已传）；
+  ③ handler 自身失败 → Failed 可重试 → 第 2 次无变更 → handlers 跳过 → 绿灯洗白；
+  ④ 第 1 次捕获的 outputs 第 2 次丢失（下游引用 ${{ env.VERSION }} 落空）。
+- 修复：`notified` / `carried_outputs` 提升到 `run_job` 循环层 `&mut` 传入
+  `run_job_inner` 跨尝试合并（任一尝试通知过即执行 handler；outputs 开头 seed 回
+  ctx.env）。handler 语义备注：最终尝试统一重跑全部已通知 handler（重启幂等）。
+
+### ✅ P1
+
+1. **russh 输出按 SSH Data 块解码**：多字节中文跨块切开 → UTF-8 失败落 GBK 兜底
+   成永久乱码，还会进 outputs 捕获。`LineBuffer` 改按字节累积、行边界整体解码
+   （0x0A 不会出现在多字节序列内部；与 local.rs read_until 同语义）。单测把
+   中文字符切半喂入锁行为。
+2. **russh exec 无条件整流缓冲 stdout**：log=Some 时收集后直接丢弃（捕获走
+   LogHandle）——几百 MB 的构建输出白占内存。改为仅 log=None（sha256/probe）收集。
+3. **Step.enabled 缺省 false**：手写 YAML 漏写 `enabled:` 步骤被**静默跳过**。
+   改缺省 true（serde + Default 同口径，UI 生成的文件总显式写字段）。
+4. **本地 `cmd /C` 引号吞字**：`arg()` 按 MSVCRT 规则转义内部引号为 `\"`，
+   cmd.exe 不认——`git commit -m "fix bug"` 类含引号命令拆错参数。
+   local.rs / run_local_check 改 `raw_arg` 原样拼接。
+
+### ✅ P2（健壮性 / UX / 性能）
+
+| # | 问题 | 修复 |
+|---|---|---|
+| 1 | 步骤超时完全静默（不知哪步/按哪个限） | 返回 Timeout 前发 Error 事件（步骤号 + 作业级/步骤级来源） |
+| 2 | handler 失败报不存在的"Step N"；notify 拼错 handler 名静默丢弃 | HANDLER_STEP 哨兵（short() 不再编造步骤号）；未匹配定义的 notify 发 ⚠ |
+| 3 | outputs 正则编译失败被 `.ok()` 吞成"无匹配" | 编译失败单独报"正则无效: {e}" |
+| 4 | outputs 捕获缓冲无上限（GB 级日志全量进内存） | 1MB 截断（outputs 只取首个匹配，尾部无用） |
+| 5 | pack 直接写目标：残缺包被 creates 永久跳过、sha256 校验误判一致 | .tmp + rename（进程号后缀），失败清理；通配源跨目录同名条目报错 |
+| 6 | russh download 中途失败留残缺文件 | 同上 tmp + rename，失败清理 |
+| 7 | watch 自动重跑不复查 confirm（监听期间加 confirm 仍无门直跑） | auto_rerun 按当前配置复查，有门走 start_run 弹门；门取消复位 trigger=watch |
+| 8 | 新建流程窗口在运行中仍可写盘 + reload | create_job 补运行守卫 |
+| 9 | 运行锁文件名净化碰撞（dev:h5 ≡ dev_h5 互杀） | 锁名追加原始名 sha256 短哈希 |
+| 10 | 两个进程同时 acquire 同项目：互相见外来 run_id 一起自杀 | 锁原子写（tmp+rename）+ 写后复核归属，抢不到显式失败 |
+| 11 | 树上看不到归类错位 ⚠（第六轮修复缺口） | 树上把 category Warning 琥珀色常显（其他 Warning 仍只在编辑器） |
+| 12 | launch_run 自动保存后 ● 未保存 误亮 | 自动保存成功即重置 dirty 基线 |
+| 13 | russh upload_dir 跟随目录符号链接（自引用源 = 无限递归 + 取消失灵） | file_type() 不跟随链接 + 64 层深度上限（对齐 pack.rs 防环） |
+| 14 | 日志文件逐行无缓冲写（每行一次 syscall，阻塞在 async 转发任务） | app.rs / group.rs 转发改 BufWriter，事件流收尾 flush |
+| 15 | HashMap 序列化键序随机：project.yaml 跨会话首存重排（git diff 噪声）、sqlite 快照不稳、变量表显示随机 | yaml 可见 map 字段（variables/tools/targets/tools_require/vars/env/outputs/secret_env 等）全链路换 BTreeMap |
+| 16 | save_yaml 可预测 tmp 名（GUI+CLI 并发互写）+ 无 fsync（掉电留零长度 yaml） | tmp 带进程号；rename 前 sync_all；delete_project 的 tmp 清理同步放宽 |
+| 17 | notify PowerShell 管道只在退出后读：输出写满 64KB 死锁 → 假"15s 超时" | stdout/stderr 各起一线排空（putty probe 同款） |
+| 18 | discover 回填不净化 + 手写 `category: ""` 误报错位；容器目录里的 .git/node_modules 全量下钻 | 回填/比对统一 sanitize 归一；空白 category 归一为平铺；发现剪枝 .git/node_modules |
+| 19 | russh CONNECT_TIMEOUT 只罩 connect 不罩 authenticate（认证挂死无限等） | connect + authenticate 同罩 10s |
+| 20 | 空命令 + work_root 拼出 `cd 'dir' && ` 远端语法错误；`work_root: ~` 被单引号阻止展开 | `compose_remote_command` 统一（russh/putty 共用）：空命令报错、~ 前缀不加引号 |
+| 21 | version_check 首词按空白拆：带引号含空格 exe 路径拆错 | `split_check_command` 引号感知 |
+| 22 | upload 映射只填一侧漏到传输层深处报"路径无权限？" | parse_upload_mappings 解析期指到行 |
+
+### 遗留（确认过、暂不动）
+
+- runlock watcher 500ms 同步 read；步骤里零散小 fs 调用在 async（可并入
+  spawn_blocking 批处理）；RunLockGuard drop 的 read-then-remove TOCTOU（微秒窗，
+  并发 acquire 已有复核兜底）；陈旧锁 PID 重启后重用误报"已有运行中"（仅文案）；
+- pack 不保留空目录（tar -C 语义未完全复刻）；传输步骤 outputs 可匹配引擎自身行
+  （1MB 截断后影响有限）；Windows 纯大小写改名被 exists 误拦；
+- validation/git_repos/git_branches 缓存按工程名键（重名工程已有告警）；
+- settings 自定义 putty 目录在窗口开启期每帧两次 exists()；
+- 2 个 `timeout_zero` 引擎测试在本沙盒环境性失败（干净树同样失败，真机待验）。
+
 ## 2026-11-12 三连修复（归类错位 bug / 步骤置顶置底 / 每帧开销清理）
 
 ### ✅ bug：工程「归到项目」后配置文件不在项目目录下、树却显示正常

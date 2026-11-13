@@ -31,11 +31,13 @@ pub enum TreeMoveTarget {
     RenameCategory(String),
 }
 
-/// 项目树拖拽排序载荷（分组名 / 流程名，项目内唯一）
+/// 项目树拖拽排序载荷（分组名 / 流程名 / 工程名，项目内唯一）
 #[derive(Clone)]
 enum TreeDrag {
     Group(String),
     Job(String),
+    /// 工程排序（同父级/同归类容器内）：持久化到容器目录的 `.rbs-order`
+    Project(String),
 }
 
 /// 右键菜单的改名目标（分组用名字定位：列表里的名字在 reload 后仍稳定）。
@@ -260,7 +262,7 @@ fn render_category_node(
 fn render_project(main: &mut MainState, ui: &mut egui::Ui, pi: usize) {
     {
         // 预取需要的不可变数据并立刻结束借用：右键菜单闭包要 &mut main
-        let (header, error_msgs, hover) = {
+        let (header, error_msgs, cat_warnings, hover) = {
             let entry = &main.projects[pi];
             // 校验结果读缓存：每帧 stat 目录 + .git 在网络盘/死路径上会卡住整个 UI
             let issues = main
@@ -272,6 +274,20 @@ fn render_project(main: &mut MainState, ui: &mut egui::Ui, pi: usize) {
                 .iter()
                 .filter_map(|i| match i {
                     crate::models::ValidationIssue::Error { message, .. } => Some(message.clone()),
+                    _ => None,
+                })
+                .collect();
+            // 归类错位 ⚠ 单独带出树上：其他 Warning（如"不是 git 仓库"）是常态
+            // 不算病，渲染出来反而到处都是黄字；category 不一致 = 文件位置与
+            // 树显示脱钩，必须在树上指路（编辑器里也能看到全量校验）
+            let cat_warnings: Vec<String> = issues
+                .iter()
+                .filter_map(|i| match i {
+                    crate::models::ValidationIssue::Warning { field, message }
+                        if field == "category" =>
+                    {
+                        Some(message.clone())
+                    }
                     _ => None,
                 })
                 .collect();
@@ -314,6 +330,7 @@ fn render_project(main: &mut MainState, ui: &mut egui::Ui, pi: usize) {
                     if !msgs.is_empty() { " ⚠" } else { "" }
                 ),
                 msgs,
+                cat_warnings,
                 hover,
             )
         };
@@ -472,10 +489,23 @@ fn render_project(main: &mut MainState, ui: &mut egui::Ui, pi: usize) {
 
         // 项目头悬停：git 仓库 / 本地目录 + 代码目录与配置目录（#23 提示）
         body.header_response.clone().on_hover_text(&hover);
-        // 折叠头下方显示阻断性错误（§9.4 目录不存在提示）
-        if body.body_response.is_some() || !error_msgs.is_empty() {
+        // 工程拖拽排序：头既是拖拽源也是放置目标（同父级/同归类容器内），
+        // 顺序写容器目录的 .rbs-order——跨工程项目运行按此序串行执行
+        let entry_name = main.projects[pi].project.name.clone();
+        dnd_project_header(main, ui, pi, &entry_name, &body.header_response);
+        // 折叠头下方显示阻断性错误（§9.4 目录不存在提示）与归类错位 ⚠
+        if body.body_response.is_some()
+            || !error_msgs.is_empty()
+            || !cat_warnings.is_empty()
+        {
             for message in &error_msgs {
                 ui.colored_label(Color32::from_rgb(220, 120, 90), format!("⚠ {message}"));
+            }
+            for message in &cat_warnings {
+                ui.colored_label(
+                    Color32::from_rgb(230, 180, 80),
+                    format!("⚠ {message}"),
+                );
             }
         }
 
@@ -1029,6 +1059,103 @@ fn dnd_group_header(
     }
 }
 
+/// 工程头拖拽：既是拖拽源也是放置目标（工程排序）。
+/// 仅同父级（归类链一致，None = 根容器）可放；顺序写容器目录的 `.rbs-order`
+fn dnd_project_header(
+    main: &mut MainState,
+    ui: &egui::Ui,
+    _pi: usize,
+    name: &str,
+    header: &egui::Response,
+) {
+    let ctx = ui.ctx();
+    if header.drag_started() {
+        egui::DragAndDrop::set_payload(ctx, TreeDrag::Project(name.to_string()));
+    }
+    if !header.contains_pointer() || !egui::DragAndDrop::has_payload_of_type::<TreeDrag>(ctx) {
+        return;
+    }
+    let Some(payload) = egui::DragAndDrop::payload::<TreeDrag>(ctx) else {
+        return;
+    };
+    let TreeDrag::Project(dragged) = payload.as_ref() else {
+        return;
+    };
+    if dragged == name {
+        return;
+    }
+    // 同父级约束：两工程的归类链一致才可放（跨容器移动走「移入项目」菜单）
+    let cat_of = |n: &str| {
+        main.projects
+            .iter()
+            .find(|e| e.project.name == n)
+            .and_then(|e| e.project.category.clone())
+    };
+    if cat_of(dragged) != cat_of(name) {
+        return;
+    }
+    let before = ctx
+        .pointer_hover_pos()
+        .map(|p| p.y < header.rect.center().y)
+        .unwrap_or(true);
+    paint_drop_marker(ui, header.rect, before);
+    if header.dnd_release_payload::<TreeDrag>().is_some() {
+        reorder_projects(main, dragged, name, before);
+    }
+}
+
+/// 工程排序（拖拽释放）：同父级容器内的顺序持久化到 `.rbs-order`。
+/// 顺序文件写**全量子目录名**（含子归类容器）——只写工程名会让未列出的
+/// 容器全部沉到工程后面；容器相对位置保持。discover 读取后树显示与
+/// 跨工程项目运行的串行序随之生效。
+fn reorder_projects(main: &mut MainState, dragged: &str, target: &str, before: bool) {
+    if busy_guard(main) {
+        return;
+    }
+    if dragged == target {
+        return;
+    }
+    let selected = main
+        .selected_project
+        .and_then(|i| main.projects.get(i))
+        .map(|e| e.project.name.clone());
+    let Some(entry) = main
+        .projects
+        .iter()
+        .find(|e| e.project.name == target)
+    else {
+        return;
+    };
+    let chain = crate::config::sanitize_category_chain(entry.project.category.as_deref());
+    let mut container = main.projects_root.clone();
+    for seg in &chain {
+        container = container.join(seg);
+    }
+    // 容器当前实际子目录顺序（discover 同款），拖动工程在其中换位
+    let mut order: Vec<String> = crate::storage::files::ordered_subdirs(&container)
+        .iter()
+        .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+        .collect();
+    let (Some(dpos), Some(_)) = (
+        order.iter().position(|n| n == dragged),
+        order.iter().position(|n| n == target),
+    ) else {
+        return;
+    };
+    let dragged_dir = order.remove(dpos);
+    let tpos_after = order.iter().position(|n| n == target).unwrap_or(0);
+    order.insert(if before { tpos_after } else { tpos_after + 1 }, dragged_dir);
+    if let Err(e) = crate::storage::files::save_order(&container, &order) {
+        main.status_msg = Some(format!("排序保存失败: {e}"));
+        return;
+    }
+    main.reload();
+    if let Some(n) = &selected {
+        main.select_project_by_name(n);
+    }
+    main.status_msg = Some("工程顺序已保存（容器目录 .rbs-order）".to_string());
+}
+
 /// 层内成员按新顺序回填全量槽位：全量列表中属于该层的位置依次填入 subset，
 /// 其他层成员原位保留（reorder_job_layer 的纯逻辑部分）
 fn refill_layer_order(full: Vec<String>, flags: Vec<bool>, subset: Vec<String>) -> Vec<String> {
@@ -1390,11 +1517,11 @@ fn delete_project(main: &mut MainState, pi: usize) {
     let (dir, name) = (entry.dir.clone(), entry.project.name.clone());
     let mut files: Vec<std::path::PathBuf> = vec![dir.join("project.yaml")];
     files.extend(entry.jobs.iter().map(|je| je.path.clone()));
-    // save_yaml 原子写中途崩溃会留下 *.yaml.tmp，一并清理
+    // save_yaml 原子写中途崩溃会留下 *.tmp（tmp 名带进程号），一并清理
     if let Ok(rd) = std::fs::read_dir(&dir) {
         for p in rd.flatten().map(|e| e.path()) {
             if p.file_name()
-                .map(|n| n.to_string_lossy().ends_with(".yaml.tmp"))
+                .map(|n| n.to_string_lossy().ends_with(".tmp"))
                 == Some(true)
             {
                 files.push(p);

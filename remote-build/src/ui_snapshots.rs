@@ -35,7 +35,7 @@ use crate::storage::files::JobEntry;
 use accesskit::Role;
 use eframe::egui;
 use egui_kittest::kittest::{By, Queryable};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 /// 与真实 app 相同的字体（msyh 等 CJK），首帧装进无头 Context。
@@ -278,7 +278,7 @@ fn test_main_state() -> MainState {
     // 模拟项目：长项目名（测标题截断）+ 四种目标形态
     let mut project = crate::models::Project::default();
     project.name = "电商中台交付项目-spring-cloud-微服务发布系统".to_string();
-    let mut targets = HashMap::new();
+    let mut targets = BTreeMap::new();
     targets.insert(
         "local".to_string(),
         Target {

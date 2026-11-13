@@ -317,12 +317,26 @@ fn find_in_path(exe: &str) -> Option<PathBuf> {
     None
 }
 
+/// version_check 命令串拆首词：exe 路径可能带引号且含空格
+/// （`"C:\Program Files\Java\bin\java.exe" -version`），split_whitespace
+/// 会把带引号路径拆错成 `C:\Program`。带引号按闭合引号取首词，否则按空白拆
+fn split_check_command(cmd: &str) -> Option<(&str, Vec<&str>)> {
+    let cmd = cmd.trim();
+    if let Some(rest) = cmd.strip_prefix('"') {
+        let end = rest.find('"')?;
+        let exe = &rest[..end];
+        Some((exe, rest[end + 1..].split_whitespace().collect()))
+    } else {
+        let mut parts = cmd.split_whitespace();
+        let exe = parts.next()?;
+        Some((exe, parts.collect()))
+    }
+}
+
 /// 执行 version_check 命令字符串（如 "java -version"），返回第一条非空输出行。
 /// 用于设置页的「验证」按钮；超时 3s / 找不到命令 / 无输出 → None。
 pub fn run_version_check(cmd: &str) -> Option<String> {
-    let mut parts = cmd.split_whitespace();
-    let exe = parts.next()?;
-    let args: Vec<&str> = parts.collect();
+    let (exe, args) = split_check_command(cmd)?;
     probe(exe, &args)
 }
 
@@ -331,9 +345,7 @@ pub fn run_version_check(cmd: &str) -> Option<String> {
 /// 的 with_path_prepended / merged_env）。否则裸名命令解析到系统 PATH 上的同名程序，
 /// 验出来的版本可能与工具实际指向不符（例：java-25 验出系统 PATH 的 jdk-17）。
 pub fn run_version_check_for_tool(check: &str, tool: &crate::models::Tool) -> Option<String> {
-    let mut parts = check.split_whitespace();
-    let exe = parts.next()?;
-    let args: Vec<&str> = parts.collect();
+    let (exe, args) = split_check_command(check)?;
 
     let mut env = tool.env.clone();
     let path_like = tool.command.contains('\\') || tool.command.contains('/');
@@ -352,7 +364,7 @@ pub(crate) fn probe(exe: &str, args: &[&str]) -> Option<String> {
     probe_with(exe, args, &Default::default())
 }
 
-fn probe_with(exe: &str, args: &[&str], env: &std::collections::HashMap<String, String>) -> Option<String> {
+fn probe_with(exe: &str, args: &[&str], env: &std::collections::BTreeMap<String, String>) -> Option<String> {
     const TIMEOUT: Duration = Duration::from_secs(3);
 
     let mut cmd = build_probe_command(exe, args, env);
@@ -430,7 +442,7 @@ pub(crate) fn probe_command_exists(command: &str) -> bool {
 pub(crate) fn build_probe_command(
     exe: &str,
     args: &[&str],
-    env: &std::collections::HashMap<String, String>,
+    env: &std::collections::BTreeMap<String, String>,
 ) -> Command {
     let resolved = resolve_probe_exe(exe, env);
     let is_batch = |p: &str| {
@@ -467,7 +479,7 @@ pub(crate) fn build_probe_command(
 /// 路径形态原样返回（存在性不在此校验，spawn 失败由 probe 统一返回 None）。
 pub(crate) fn resolve_probe_exe(
     exe: &str,
-    env: &std::collections::HashMap<String, String>,
+    env: &std::collections::BTreeMap<String, String>,
 ) -> Option<String> {
     let looks_like_path = exe.contains('\\') || exe.contains('/');
     if looks_like_path {
@@ -576,7 +588,7 @@ mod tests {
         std::fs::write(tmp.join("fakebatch.cmd"), "@echo off\r\necho hi\r\n").unwrap();
         std::fs::write(tmp.join("plain.exe"), b"MZ").unwrap(); // 只测解析，不真跑
 
-        let mut env = std::collections::HashMap::new();
+        let mut env = std::collections::BTreeMap::new();
         env.insert("PATH".to_string(), tmp.to_string_lossy().to_string());
 
         if cfg!(windows) {
@@ -635,5 +647,19 @@ mod tests {
                 "gradle -v 应输出 Gradle 版本: {line}"
             );
         }
+    }
+
+    /// version_check 首词拆分：带引号的含空格路径不再拆错成 C:\Program
+    #[test]
+    fn split_check_command_handles_quoted_paths() {
+        let (exe, args) = split_check_command(
+            r#""C:\Program Files\Java\bin\java.exe" -version"#,
+        )
+        .unwrap();
+        assert_eq!(exe, r"C:\Program Files\Java\bin\java.exe");
+        assert_eq!(args, vec!["-version"]);
+        let (exe, args) = split_check_command("java -version").unwrap();
+        assert_eq!(exe, "java");
+        assert_eq!(args, vec!["-version"]);
     }
 }

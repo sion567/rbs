@@ -42,7 +42,7 @@ pub struct ToolMenu {
     /// 全局 tools.yaml 的键（排除已被项目覆盖的），已排序
     pub global: Vec<String>,
     /// 合并后的解析表（项目覆盖全局），用于徽标与悬停显示实际地址
-    pub merged: std::collections::HashMap<String, Tool>,
+    pub merged: std::collections::BTreeMap<String, Tool>,
 }
 
 impl ToolMenu {
@@ -1053,6 +1053,12 @@ pub fn show_new_job_window(ctx: &egui::Context, main: &mut MainState) {
 }
 
 fn create_job(main: &mut MainState) {
+    // 运行中禁改盘（引擎正按路径读写）：编辑器内的入口已被禁用，
+    // 这里兜住窗口路径（窗口开着时启动运行，创建按钮仍可点）
+    if main.run_active() {
+        main.new_job.message = Some((false, "⚠ 有流程运行中，先停止再新建流程".to_string()));
+        return;
+    }
     let Some(pi) = main.selected_project else { return };
     let display = main.new_job.name.trim().to_string();
     if display.is_empty() {
@@ -3129,7 +3135,7 @@ mod tests {
         let tool_menu = ToolMenu {
             project: vec!["java".to_string()],
             global: Vec::new(),
-            merged: std::collections::HashMap::new(),
+            merged: std::collections::BTreeMap::new(),
         };
         let target_names = vec![
             "prod".to_string(),

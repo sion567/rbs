@@ -6,7 +6,7 @@
 //! CPU 密集或大文件 IO 一律 `spawn_blocking`，不阻塞 async worker。
 
 use crate::transport::{self, LogHandle, RemoteTransport};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::broadcast;
@@ -53,7 +53,7 @@ pub(crate) async fn check_creates_exists(
             crate::transport::putty::escape_posix_single_quote(&path)
         );
         let st = transport
-            .exec(target_dummy(target), &cmd, "", &HashMap::new(), log, cancel_rx)
+            .exec(target_dummy(target), &cmd, "", &BTreeMap::new(), log, cancel_rx)
             .await?;
         Ok(st.success)
     } else {
@@ -152,6 +152,11 @@ pub(crate) fn parse_upload_mappings(command: &str) -> anyhow::Result<Vec<(String
         // 空映射行（UI 编辑器加行的 "-> " 占位）与空白行一样跳过
         if l.is_empty() && r.is_empty() {
             continue;
+        }
+        // 只填了一侧 = 表单没写完：与其让传输层在深处报"路径无权限？"这类
+        // 费解错误，不如在解析时就指到行
+        if l.is_empty() || r.is_empty() {
+            anyhow::bail!("upload 映射缺少远端或本地路径: {line}（每行：<本地路径> -> <远端路径>）");
         }
         out.push((l.to_string(), r.to_string()));
     }
@@ -422,5 +427,16 @@ mod tests {
         assert!(local_creates_exists(&dir, "target"));
         assert!(!local_creates_exists(&dir, "no_such_thing"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 只填一侧的映射行在解析时就报错（此前漏到传输层深处报"路径无权限？"）
+    #[test]
+    fn upload_mapping_rejects_one_sided_lines() {
+        assert!(parse_upload_mappings("target/a.jar -> /opt/a.jar").is_ok());
+        assert!(parse_upload_mappings("-> /opt/a.jar").is_err(), "缺本地路径");
+        assert!(parse_upload_mappings("target/a.jar ->").is_err(), "缺远端路径");
+        // 双侧皆空 = UI 占位行，跳过（跳完后 out 为空才报"命令为空"）
+        let r = parse_upload_mappings("# 注释\n-> ");
+        assert!(r.is_err() && r.err().unwrap().to_string().contains("命令为空"));
     }
 }

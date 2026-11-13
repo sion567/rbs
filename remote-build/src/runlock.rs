@@ -14,6 +14,7 @@
 
 use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use tokio::sync::broadcast;
 
@@ -27,10 +28,11 @@ struct LockContent {
 }
 
 pub fn lock_path(dir: &Path, project: &str) -> PathBuf {
-    dir.join(format!(
-        "{}.lock",
-        crate::config::sanitize_filename(project)
-    ))
+    // 原始名短哈希后缀：文件名净化会折叠非法字符（dev:h5 → dev_h5），两个
+    // 不同的合法工程名可能折到同一锁文件互杀——哈希后缀让它们各归各位
+    let digest = Sha256::digest(project.as_bytes());
+    let hash: String = digest[..4].iter().map(|b| format!("{b:02x}")).collect();
+    dir.join(format!("{}-{hash}.lock", crate::config::sanitize_filename(project)))
 }
 
 fn read_lock(path: &Path) -> Option<LockContent> {
@@ -45,7 +47,12 @@ fn write_lock(path: &Path, run_id: &str, job: &str) -> anyhow::Result<()> {
         job: job.to_string(),
         started_at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
     };
-    std::fs::write(path, yaml_serde::to_string(&content)?)
+    // tmp + rename 原子落盘：并发 reader（接管方/旧 watcher）不会读到半截
+    // YAML 而误判"锁丢了"触发自取消
+    let tmp = path.with_extension(format!("lock.{}.tmp", std::process::id()));
+    std::fs::write(&tmp, yaml_serde::to_string(&content)?)
+        .with_context(|| format!("写入运行锁失败: {}", tmp.display()))?;
+    std::fs::rename(&tmp, path)
         .with_context(|| format!("写入运行锁失败: {}", path.display()))?;
     Ok(())
 }
@@ -115,6 +122,11 @@ pub fn acquire(
     };
 
     write_lock(&path, run_id, job_name)?;
+    // 并发启动冲突兜底：两个进程同时 acquire 会互相写锁——写完复核归属，
+    // 抢不到的显式失败（否则双方 watcher 都见到外来 run_id，一起自杀）
+    if !is_mine(&path, run_id) {
+        anyhow::bail!("同项目并发启动冲突：运行锁被其他运行抢先（{project}），请稍后重试");
+    }
     Ok((RunLockGuard { path: path.clone(), run_id: run_id.to_string() }, warning))
 }
 
@@ -205,5 +217,29 @@ mod tests {
         assert!(lock_path(&dir, "alpha").exists());
         drop(gb);
         assert!(lock_path(&dir, "alpha").exists(), "beta 释放不应影响 alpha");
+    }
+
+    /// 锁文件名带原始名短哈希：净化折叠非法字符后，两个不同工程名不再共享
+    /// 同一锁文件互杀（dev:h5 与 dev_h5 此前都折成 dev_h5.lock）
+    #[test]
+    fn lock_names_differ_for_sanitizing_collisions() {
+        let dir = tmp_dir("hash");
+        assert_ne!(
+            lock_path(&dir, "dev:h5"),
+            lock_path(&dir, "dev_h5"),
+            "净化折叠名的两个工程锁文件必须不同"
+        );
+    }
+
+    /// 写锁原子化：锁文件是合法 YAML（tmp+rename 保证不会读到半截）
+    #[test]
+    fn lock_file_is_valid_yaml_after_write() {
+        let dir = tmp_dir("atomic");
+        let (_g, _) = acquire(&dir, "proj", "run-1", "build").unwrap();
+        let content = std::fs::read_to_string(lock_path(&dir, "proj")).unwrap();
+        let parsed: Option<LockContent> = yaml_serde::from_str(&content).ok();
+        assert!(parsed.is_some(), "锁文件应可完整解析: {content}");
+        assert_eq!(parsed.unwrap().run_id, "run-1");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

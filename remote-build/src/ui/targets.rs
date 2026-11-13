@@ -22,6 +22,9 @@ pub struct TargetEditorState {
     pub open: bool,
     /// 当前选中目标（project.yaml targets 表的键）
     pub selected: Option<String>,
+    /// 窗口绑定哪个项目：程序化切换选中项目（如 watch 自动重跑）时表单缓冲
+    /// 与新项目对不上——置空选择，与 settings 的 ToolEditorState 同款防线
+    pub bound_project: Option<String>,
     /// 名称输入缓冲（重命名用）
     pub name_buf: String,
     pub kind_idx: usize,
@@ -33,8 +36,9 @@ pub struct TargetEditorState {
     pub password_buf: String,
     /// Credential Manager 里是否已存密码
     pub password_saved: bool,
-    /// 连接测试（后台线程）
-    pub test_rx: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
+    /// 连接测试（后台线程）。载荷带发起时的目标名：测试在途时切换目标，
+    /// 迟到的结果属于旧主机——不带名会渲染到新目标名下，指纹还会误登记
+    pub test_rx: Option<std::sync::mpsc::Receiver<(String, Result<String, String>)>>,
     pub test_result: Option<(bool, String)>,
     /// 本次测试失败输出里提取到的服务器指纹（TOFU 首连 / 指纹更换场景）；
     /// 「📌 一键登记指纹」回填进「主机键指纹」字段，免手动拖选 43 位串
@@ -53,13 +57,13 @@ pub struct TargetEditorState {
 /// 当前项目的目标表（可变）；未选项目返回 None
 fn scope_map_mut(
     main: &mut MainState,
-) -> Option<&mut std::collections::HashMap<String, Target>> {
+) -> Option<&mut std::collections::BTreeMap<String, Target>> {
     let pi = main.selected_project?;
     Some(&mut main.projects[pi].project.targets)
 }
 
 /// 当前项目的目标表（只读）
-fn scope_map_ref(main: &MainState) -> Option<&std::collections::HashMap<String, Target>> {
+fn scope_map_ref(main: &MainState) -> Option<&std::collections::BTreeMap<String, Target>> {
     main.selected_project
         .and_then(|pi| main.projects.get(pi))
         .map(|p| &p.project.targets)
@@ -76,19 +80,40 @@ fn cred_key_for(main: &MainState, name: &str) -> String {
 }
 
 pub fn show(ctx: &egui::Context, main: &mut MainState) {
-    // 回收连接测试结果
+    // 窗口绑定项目检查：程序化切换选中项目（watch 自动重跑会改 selected_project）
+    // 后，表单缓冲（名称/类型下拉/凭据状态）还挂着旧项目的目标——置空选择重走
+    // 默认选中，缓冲随 load_buffers 重新加载
+    let project_name = main
+        .selected_project
+        .and_then(|pi| main.projects.get(pi))
+        .map(|p| p.project.name.clone());
+    if main.target_editor.bound_project != project_name {
+        main.target_editor.bound_project = project_name;
+        main.target_editor.selected = None;
+        main.target_editor.unsaved = false;
+        main.target_editor.test_rx = None;
+        main.target_editor.test_result = None;
+        main.target_editor.seen_fp = None;
+        main.target_editor.password_buf.clear();
+    }
+    // 回收连接测试结果：载荷带发起目标名，切换目标后迟到的结果直接丢弃
+    // （否则渲染到新目标名下，指纹还会被一键登记进错误的目标）
     if let Some(rx) = &main.target_editor.test_rx {
         match rx.try_recv() {
-            Ok(Ok(line)) => {
-                main.target_editor.test_result = Some((true, line));
-                main.target_editor.seen_fp = None;
+            Ok((origin, Ok(line))) => {
+                if main.target_editor.selected.as_deref() == Some(origin.as_str()) {
+                    main.target_editor.test_result = Some((true, line));
+                    main.target_editor.seen_fp = None;
+                }
                 main.target_editor.test_rx = None;
             }
-            Ok(Err(e)) => {
-                // TOFU 场景提取服务器指纹，供「📌 一键登记指纹」回填
-                main.target_editor.seen_fp =
-                    crate::transport::putty::extract_fingerprint(&e);
-                main.target_editor.test_result = Some((false, e));
+            Ok((origin, Err(e))) => {
+                if main.target_editor.selected.as_deref() == Some(origin.as_str()) {
+                    // TOFU 场景提取服务器指纹，供「📌 一键登记指纹」回填
+                    main.target_editor.seen_fp =
+                        crate::transport::putty::extract_fingerprint(&e);
+                    main.target_editor.test_result = Some((false, e));
+                }
                 main.target_editor.test_rx = None;
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {}
@@ -301,35 +326,42 @@ fn target_list_and_form(ui: &mut egui::Ui, main: &mut MainState) {
         }
         if ui.button("🗑 删除").clicked() {
             if let Some(name) = main.target_editor.selected.take() {
-                // 引用检查：仍有流程引用时只提醒、不清除引用——
-                // 静默回退（None = 本地执行）会让发布步骤跑错机器，宁可运行/预览时明确报错
-                let referencing: Vec<String> = main
-                    .selected_project
-                    .and_then(|pi| main.projects.get(pi))
-                    .map(|entry| {
-                        entry
-                            .jobs
-                            .iter()
-                            .filter(|je| {
-                                je.job.target.as_deref() == Some(name.as_str())
-                                    || je.job.steps.iter().any(|s| {
-                                        s.target.as_deref() == Some(name.as_str())
-                                    })
-                            })
-                            .map(|je| je.job.name.clone())
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                if let Some(map) = scope_map_mut(main) {
-                    map.remove(&name);
-                }
-                crate::secrets::delete_password(&cred_key_for(main, &name));
-                main.target_editor.unsaved = true;
-                if !referencing.is_empty() {
-                    main.status_msg = Some(format!(
-                        "⚠ 目标「{name}」已删除，但仍有流程引用它（预览/运行会报「目标未定义」）：{}",
-                        referencing.join("、")
-                    ));
+                // local 是每个项目自带的本机目标（流程 target: local 依赖它）：
+                // 误删后 UI 无法重建（添加只出 SSH/K8s），直接拒绝
+                if name == "local" {
+                    main.target_editor.selected = Some(name);
+                    main.status_msg = Some("⚠ local（本机）是固定目标，不可删除".to_string());
+                } else {
+                    // 引用检查：仍有流程引用时只提醒、不清除引用——
+                    // 静默回退（None = 本地执行）会让发布步骤跑错机器，宁可运行/预览时明确报错
+                    let referencing: Vec<String> = main
+                        .selected_project
+                        .and_then(|pi| main.projects.get(pi))
+                        .map(|entry| {
+                            entry
+                                .jobs
+                                .iter()
+                                .filter(|je| {
+                                    je.job.target.as_deref() == Some(name.as_str())
+                                        || je.job.steps.iter().any(|s| {
+                                            s.target.as_deref() == Some(name.as_str())
+                                        })
+                                })
+                                .map(|je| je.job.name.clone())
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    if let Some(map) = scope_map_mut(main) {
+                        map.remove(&name);
+                    }
+                    crate::secrets::delete_password(&cred_key_for(main, &name));
+                    main.target_editor.unsaved = true;
+                    if !referencing.is_empty() {
+                        main.status_msg = Some(format!(
+                            "⚠ 目标「{name}」已删除，但仍有流程引用它（预览/运行会报「目标未定义」）：{}",
+                            referencing.join("、")
+                        ));
+                    }
                 }
             }
         }
@@ -360,7 +392,17 @@ fn target_list_and_form(ui: &mut egui::Ui, main: &mut MainState) {
             ui.add(egui::Spinner::new().size(14.0));
             ui.weak("测试中…");
         }
-        if ui.button("💾 保存 project.yaml").clicked() {
+        // 运行中禁改盘（引擎正按路径读写 project.yaml）：工具栏入口已禁用，
+        // 这里兜住 watch 自动重跑在窗口开着时启动运行的情况（同 💾 保存守卫）
+        if ui
+            .add_enabled(!main.run_active(), egui::Button::new("💾 保存 project.yaml"))
+            .on_hover_text(if main.run_active() {
+                "有流程运行中，暂停保存"
+            } else {
+                "保存当前项目的目标配置"
+            })
+            .clicked()
+        {
             let result = match main.selected_project {
                 Some(pi) => {
                     let entry = &main.projects[pi];
@@ -412,20 +454,22 @@ fn target_list_and_form(ui: &mut egui::Ui, main: &mut MainState) {
                         .on_hover_text(format!("把 {fp} 写入「主机键指纹」字段（TOFU 信任登记）"))
                         .clicked()
                     {
-                        if let Some(t) =
-                            scope_map_mut(main).and_then(|m| m.get_mut(&name))
-                        {
-                            if let TargetType::Ssh { host_key, .. } = &mut t.target_type {
-                                *host_key = Some(fp.clone());
+                        // 结果带发起目标名（show 顶部已过滤迟到结果），这里再核
+                        // 一次当前选中仍是同一目标，防登记进别的目标的字段
+                        if main.target_editor.selected.as_deref() == Some(name.as_str()) {
+                            if let Some(t) = scope_map_mut(main).and_then(|m| m.get_mut(&name)) {
+                                if let TargetType::Ssh { host_key, .. } = &mut t.target_type {
+                                    *host_key = Some(fp.clone());
+                                }
                             }
+                            main.target_editor.seen_fp = None;
+                            main.target_editor.unsaved = true;
+                            main.status_msg = Some(
+                                "📌 指纹已回填到「主机键指纹」——点「💾 保存」落盘，\
+                                 再点「🔌 测试连接」验证"
+                                    .to_string(),
+                            );
                         }
-                        main.target_editor.seen_fp = None;
-                        main.target_editor.unsaved = true;
-                        main.status_msg = Some(
-                            "📌 指纹已回填到「主机键指纹」——点「💾 保存」落盘，\
-                             再点「🔌 测试连接」验证"
-                                .to_string(),
-                        );
                     }
                     ui.weak(format!("服务器指纹：{fp}"));
                 });
@@ -637,13 +681,13 @@ fn edit_form(ui: &mut egui::Ui, main: &mut MainState) {
                         main.target_editor.unsaved = true;
                     }
                     ui.end_row();
-                    if option_text_row(ui, "context:", context, 180.0) {
+                    if crate::ui::option_text_row(ui, "context:", context, 180.0) {
                         main.target_editor.unsaved = true;
                     }
-                    if option_text_row(ui, "namespace:", namespace, 180.0) {
+                    if crate::ui::option_text_row(ui, "namespace:", namespace, 180.0) {
                         main.target_editor.unsaved = true;
                     }
-                    if option_text_row(ui, "registry:", registry, 220.0) {
+                    if crate::ui::option_text_row(ui, "registry:", registry, 220.0) {
                         main.target_editor.unsaved = true;
                     }
                     ui.label("");
@@ -714,7 +758,7 @@ fn edit_form(ui: &mut egui::Ui, main: &mut MainState) {
                 // 注意：一行只能占 Grid 的两格（label + 值控件）。此前在外面多加了
                 // 「远端根目录:」label，把值控件挤到第 2 列、推出可视区（点 ＋ 后
                 // 输入框只露一半），现在 label 直接由 option_text_row 渲染
-                if option_text_row(ui, "远端根目录:", &mut target.work_root, 220.0) {
+                if crate::ui::option_text_row(ui, "远端根目录:", &mut target.work_root, 220.0) {
                     main.target_editor.unsaved = true;
                 }
                 ui.label("");
@@ -723,14 +767,20 @@ fn edit_form(ui: &mut egui::Ui, main: &mut MainState) {
 
                 ui.label("主机键指纹:");
                 if let TargetType::Ssh { host_key, .. } = &mut target.target_type {
-                    // 固定宽度（同上：Grid 单元格里 available_width 未约束）
+                    // 固定宽度（同上：Grid 单元格里 available_width 未约束）。
+                    // 用本地缓冲渲染：get_or_insert_default() 会让"看过一眼"的
+                    // 目标落盘 host_key: ''（持久 YAML 噪声）——仅用户真的输入
+                    // 非空内容才回写字段
+                    let mut buf = host_key.clone().unwrap_or_default();
                     let resp = ui.add(
-                        egui::TextEdit::singleline(host_key.get_or_insert_default())
+                        egui::TextEdit::singleline(&mut buf)
                             .desired_width(360.0)
                             .font(egui::TextStyle::Monospace)
                             .hint_text("SHA256:...（连接测试失败时输出会给出，复制填入）"),
                     );
                     if resp.changed() {
+                        let trimmed = buf.trim().to_string();
+                        *host_key = (!trimmed.is_empty()).then_some(trimmed);
                         main.target_editor.unsaved = true;
                     }
                 }
@@ -781,6 +831,22 @@ fn edit_form(ui: &mut egui::Ui, main: &mut MainState) {
                 }
             }
             if !job_updates.is_empty() {
+                // 同步把流程 yaml（含流程编辑器里未保存的改动）一并落盘了：
+                // 以这些内容为新基线，否则未保存指示会一直亮着指向已落盘的状态
+                let fp = crate::app::config_fingerprint(
+                    &main.projects[pi].project,
+                    main.projects[pi].jobs.get(main.selected_job.unwrap_or(0)).map(|j| &j.job),
+                );
+                main.dirty_baseline = Some((
+                    main.projects[pi].project.name.clone(),
+                    main.projects[pi]
+                        .jobs
+                        .get(main.selected_job.unwrap_or(0))
+                        .map(|j| j.job.name.clone())
+                        .unwrap_or_default(),
+                    fp,
+                ));
+                main.dirty_last_probe = None;
                 let names = job_updates
                     .iter()
                     .map(|(_, j)| j.name.clone())
@@ -974,45 +1040,6 @@ fn text_row(ui: &mut egui::Ui, value: &mut String, width: f32) -> bool {
     ui.add(egui::TextEdit::singleline(value).desired_width(width)).changed()
 }
 
-/// Option<String> 字段编辑行（调用方需处于 Grid 中），返回是否修改
-fn option_text_row(
-    ui: &mut egui::Ui,
-    label: &str,
-    value: &mut Option<String>,
-    width: f32,
-) -> bool {
-    let mut changed = false;
-    ui.label(label);
-    match value {
-        Some(v) => {
-            let mut clear = false;
-            ui.horizontal(|ui| {
-                changed |= ui
-                    .add(egui::TextEdit::singleline(v).desired_width(width))
-                    .changed();
-                if ui.small_button("🗑").clicked() {
-                    clear = true;
-                }
-            });
-            if clear {
-                *value = None;
-                changed = true;
-            }
-        }
-        None => {
-            ui.horizontal(|ui| {
-                ui.weak("—");
-                if ui.small_button("＋").clicked() {
-                    *value = Some(String::new());
-                    changed = true;
-                }
-            });
-        }
-    }
-    ui.end_row();
-    changed
-}
-
 fn load_buffers(main: &mut MainState, name: &str) {
     main.target_editor.name_buf = name.to_string();
     // 切换目标：上一次测试提取的指纹属于旧主机，作废防止误回填
@@ -1114,6 +1141,7 @@ fn start_test(main: &mut MainState) {
                 }
                 text
             });
-        let _ = tx.send(res);
+        // 载荷带发起目标名：测试在途时切换目标，迟到的结果按名丢弃不渲染
+        let _ = tx.send((name, res));
     });
 }
